@@ -639,6 +639,7 @@ rewrite-parity() {
 
 # pip 真实下载 + 安装 + import 验证（pypi 经 squid）
 tool-pip() {
+    ensure_pip || { echo "❌ pip 不可用且 bootstrap 失败"; return 1; }
     local dl="$RESULTS_DIR/pip-dl"; rm -rf "$dl"; mkdir -p "$dl"
     python3 -m pip download --no-deps --timeout 60 -d "$dl" 'requests==2.32.3' \
         > "$RESULTS_DIR/tool-pip.log" 2>&1 || { echo "❌ pip download 失败（tail: $(tail -2 "$RESULTS_DIR/tool-pip.log" | tr '\n' ' ')）"; return 1; }
@@ -668,14 +669,24 @@ pip_install() {
         || python3 -m pip install --quiet --timeout 60 --break-system-packages "$@"
 }
 
+# 极简 runner 镜像可能无 pip：ensurepip 优先，失败则 apt 装 python3-pip（本身是真实 apt 重写链路）
+ensure_pip() {
+    python3 -m pip --version >/dev/null 2>&1 && return 0
+    python3 -m ensurepip --default-pip >/dev/null 2>&1 && return 0
+    apt-get install -y -qq python3-pip >/dev/null 2>&1 \
+        || sudo apt-get install -y -qq python3-pip >/dev/null 2>&1
+    python3 -m pip --version >/dev/null 2>&1
+}
+
 # 清理含只读文件（go modcache 等设置 444）的目录
 rmrf() { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }
 
-# tool-02 apt：官方源零换源 update+install（重写规则6）
+# tool-02 apt：官方源零换源 update+install（重写规则6）；容器层 root 无 sudo → sudo 可选
 tool-apt() {
     need apt-get || return 2
-    sudo apt-get update -qq > "$RESULTS_DIR/tool-apt.log" 2>&1 \
-        && sudo apt-get install -y -qq jq >> "$RESULTS_DIR/tool-apt.log" 2>&1 \
+    local SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO=sudo
+    $SUDO apt-get update -qq > "$RESULTS_DIR/tool-apt.log" 2>&1 \
+        && $SUDO apt-get install -y -qq jq >> "$RESULTS_DIR/tool-apt.log" 2>&1 \
         || { echo "❌ apt update/install 失败（tail: $(tail -2 "$RESULTS_DIR/tool-apt.log" | tr '\n' ' ')）"; return 1; }
     jq --version || { echo "❌ jq 不可用"; return 1; }
     echo "✅ apt 官方源零换源经 squid 通过"
@@ -704,6 +715,7 @@ tool-pnpm() {
 
 # tool-12 uv：pip bootstrap + uv pip install（默认官方 index）
 tool-uv() {
+    ensure_pip || { echo "❌ pip 不可用且 bootstrap 失败"; return 1; }
     pip_install uv > "$RESULTS_DIR/tool-uv.log" 2>&1
     { uv pip install --system --quiet pyyaml || uv pip install --system --quiet --break-system-packages pyyaml; } \
         >> "$RESULTS_DIR/tool-uv.log" 2>&1 \
@@ -715,9 +727,9 @@ tool-uv() {
 # tool-04 goproxy：go 缺失则官方 tarball bootstrap（规则5 tarball），go mod download（规则5 goproxy）
 tool-goproxy() {
     if ! command -v go >/dev/null 2>&1; then
-        echo "runner 无 go → 官方 tarball bootstrap（同时验证规则5 tarball 重写）"
-        curl -sSL --max-time 300 -o /tmp/go.tgz https://go.dev/dl/go1.26.1.linux-amd64.tar.gz \
-            || { echo "❌ go tarball 下载失败"; return 1; }
+        echo "runner 无 go → 官方 tarball bootstrap（同时验证规则5 tarball 重写 + squid 大文件下载）"
+        curl -sSL --max-time 600 -o /tmp/go.tgz https://go.dev/dl/go1.26.1.linux-amd64.tar.gz \
+            || { echo "❌ go tarball 下载失败（exit=$?，>10min 未完成）"; return 1; }
         mkdir -p "$RESULTS_DIR/goroot" && tar -C "$RESULTS_DIR/goroot" -xzf /tmp/go.tgz
         export PATH="$RESULTS_DIR/goroot/go/bin:$PATH"
     fi
@@ -746,9 +758,9 @@ tool-gitlfs() {
     if command -v git-lfs >/dev/null 2>&1; then
         git lfs version && { echo "✅ git-lfs 现成可用（$(git lfs version)）"; return 0; }
     fi
-    echo "runner 无 git-lfs → 官方 release bootstrap（验证规则3 工具链自举）"
+    echo "runner 无 git-lfs → 官方 release bootstrap（验证规则3 工具链自举；极简镜像无 wget 用 curl）"
     local d="$RESULTS_DIR/gitlfs"; rm -rf "$d"; mkdir -p "$d"
-    wget -q --timeout=120 -O "$d/lfs.tar.gz" \
+    curl -sSL --max-time 300 -o "$d/lfs.tar.gz" \
         https://github.com/git-lfs/git-lfs/releases/download/v3.7.0/git-lfs-linux-amd64-v3.7.0.tar.gz \
         || { echo "❌ git-lfs release 下载失败"; return 1; }
     tar -C "$d" -xzf "$d/lfs.tar.gz"
@@ -830,6 +842,7 @@ EOF
 
 # tool-18 pre-commit：pip bootstrap + gitleaks hook 官方 repo（自举编译，最重）
 tool-precommit() {
+    ensure_pip || { echo "❌ pip 不可用且 bootstrap 失败"; return 1; }
     pip_install pre-commit > "$RESULTS_DIR/tool-precommit.log" 2>&1
     local d="$RESULTS_DIR/precommit-proj"; rm -rf "$d"; mkdir -p "$d"
     cat > "$d/.pre-commit-config.yaml" <<'EOF'
@@ -847,6 +860,7 @@ EOF
 
 # modelscope 真实 CLI 下载（vllm-ascend CI 首选通道，天然 302→CDN）
 tool-modelscope() {
+    ensure_pip || { echo "❌ pip 不可用且 bootstrap 失败"; return 1; }
     pip_install 'modelscope<1.38' > "$RESULTS_DIR/tool-modelscope.log" 2>&1
     local dir="$RESULTS_DIR/ms-model"; rm -rf "$dir"
     modelscope download --model Qwen/Qwen2.5-0.5B config.json generation_config.json \
