@@ -1,8 +1,8 @@
 # =============================================================================
 # test-squid —— squid 代理功能 + 并发测试（GitHub Actions runner）
 #
-# 前提：runner（默认 linux-amd64-cpu-4）已由 pod 注入 squid 代理
-#       （HTTP(S)_PROXY + MITM CA），workflow 内【不配置任何代理】。
+# 前提：runner（默认 linux-amd64-cpu-2, gy-006，多标签 AND）已由 pod 注入
+#       squid 代理（HTTP(S)_PROXY + MITM CA），workflow 内【不配置任何代理】。
 #
 # 结构（对应 META.md 功能面拆解）：
 #   function    —— 元自检、基本代理/CONNECT/MITM、域名矩阵、缓存 MISS→HIT、
