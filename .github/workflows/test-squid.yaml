@@ -77,9 +77,51 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  container-function:
+    name: 容器层·功能测试（CANN 镜像）
+    # container: 形态 —— 验证 squid 注入在用户镜像内同样生效（env 传递 + CA 灌库）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行功能测试（容器层）
+        run: bash test-squid/run-suite.sh --mode function --container
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-container-function
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  container-concurrency:
+    name: 容器层·并发测试（CANN 镜像）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行并发测试（容器层）
+        run: |
+          LADDER="${{ github.event_name == 'pull_request' && '1 4 8 16' || inputs.ladder }}" \
+          HEAVY="${{ github.event_name == 'pull_request' && '0' || inputs.heavy }}" \
+          bash test-squid/run-suite.sh --mode concurrency --container
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-container-concurrency
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   summary:
     name: 汇总
-    needs: [function, concurrency]
+    needs: [function, concurrency, container-function, container-concurrency]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -93,7 +135,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency; do
+          for d in test-squid-function test-squid-concurrency test-squid-container-function test-squid-container-concurrency; do
             if [ -f "$d/timings.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"

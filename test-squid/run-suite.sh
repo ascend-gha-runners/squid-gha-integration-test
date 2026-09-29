@@ -29,7 +29,14 @@
 set -uo pipefail
 
 MODE="function"
-[ "${1:-}" = "--mode" ] && MODE="${2:-function}"
+LAYER="runner"   # runner = job 直接跑在 runner pod；container = job 跑进 container: 镜像
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mode)      MODE="${2:-function}"; shift 2 ;;
+        --container) LAYER="container"; shift ;;
+        *) echo "未知参数: $1（用法: run-suite.sh --mode function|concurrency [--container]）" >&2; exit 2 ;;
+    esac
+done
 
 RESULTS_DIR="${RESULTS_DIR:-/tmp/test-squid-results}"
 LADDER="${LADDER:-1 4 8 16}"
@@ -98,17 +105,18 @@ env-snapshot() {
     } | tee "$RESULTS_DIR/env.txt"
 }
 
-# 元自检：响应头必须带 squid 专属证据（X-Cache-Lookup 头，或 Via 含 squid 标识），
-# 否则整套测试无效。注意不能用任意 Via/X-Cache 判定——ISP/CDN 缓存也会带这些头
+# 元自检：响应头必须带 squid 专属证据——Cache-Status: <id>(squid 7.x, RFC 9211) /
+# X-Cache-Lookup（老式）/ Via 含 squid 标识，否则整套测试无效。
+# 注意不能用任意 Via/X-Cache 判定——ISP/CDN 缓存也会带这些头
 # （本地实测电信缓存 via: CHN-...-CACHE 即假阳性）
 meta-trace() {
     local headers
     headers=$(curl -sS -L --max-time 30 -o /dev/null -D - "$URL_SMALL")
     echo "$headers" | head -20
-    if echo "$headers" | grep -qiE '^x-cache-lookup:|^x-squid-error:|via:.*squid'; then
-        echo "✅ squid 专属痕迹存在（X-Cache-Lookup / Via(squid)）——流量确实经过 squid"
+    if echo "$headers" | grep -qiE '^cache-status:.*squid|^x-cache-lookup:|^x-squid-error:|via:.*squid'; then
+        echo "✅ squid 专属痕迹存在（Cache-Status(squid) / X-Cache-Lookup / Via(squid)）——流量确实经过 squid"
     else
-        echo "❌ 响应头无 squid 专属痕迹（X-Cache-Lookup / Via(squid)）——流量未经过 squid，整套测试无效"
+        echo "❌ 响应头无 squid 专属痕迹——流量未经过 squid，整套测试无效"
         echo "   （若 Via/X-Cache 来自其他缓存层，属假阳性，同样判无效）"
         return 1
     fi
@@ -158,19 +166,36 @@ cache-hitmiss() {
     t0=$(date +%s)
     h2=$(curl -sS -L --max-time 120 -o "$RESULTS_DIR/cache-r2.bin" -D "$RESULTS_DIR/cache-r2.headers" "$URL_MED")
     ms2=$(( $(date +%s) - t0 ))
-    s1=$(grep -i '^x-cache-lookup:' "$RESULTS_DIR/cache-r1.headers" | tail -1 | tr -d '\r' || true)
-    s2=$(grep -i '^x-cache-lookup:' "$RESULTS_DIR/cache-r2.headers" | tail -1 | tr -d '\r' || true)
+    # squid 7.x 发 Cache-Status（RFC 9211, detail=miss/hit/mismatch…），
+    # 老式 squid 发 X-Cache-Lookup：两种都抓
+    s1=$(grep -iE '^(x-cache-lookup|cache-status):' "$RESULTS_DIR/cache-r1.headers" | tail -1 | tr -d '\r' || true)
+    s2=$(grep -iE '^(x-cache-lookup|cache-status):' "$RESULTS_DIR/cache-r2.headers" | tail -1 | tr -d '\r' || true)
     echo "第一发(${ms1}s): ${s1:-无缓存头}"
     echo "第二发(${ms2}s): ${s2:-无缓存头}"
     echo "耗时对照: MISS=${ms1}s HIT=${ms2}s"
-    if echo "$s2" | grep -qi HIT; then
+    if echo "$s2" | grep -qiE 'detail=hit|x-cache-lookup:.*hit'; then
         echo "✅ MISS→HIT 闭环成立"
     elif [ -z "$s1$s2" ]; then
-        echo "⚠️ 响应无 X-Cache 头（可能 TUNNEL 未 bump 或缓存头被抑制）——记录数据，不判失败"
+        echo "⚠️ 响应无 Cache-Status/X-Cache 头（可能 TUNNEL 未 bump 或缓存头被抑制）——记录数据，不判失败"
         return 2   # run_timed 记为 SKIP 语义（exit 非 0/1 之外的标记，见汇总口径）
     else
         echo "⚠️ 未呈现 MISS→HIT（$s1 → $s2）——记录数据，不判失败"
         return 2
+    fi
+}
+
+# 容器层专属：验证用户镜像内 squid CA 信任生效（postStart 灌库三条路径之一）
+ca-trust() {
+    echo "--- 系统信任库盘点 ---"
+    for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+        [ -f "$f" ] && echo "$f: $(grep -c 'BEGIN CERTIFICATE' "$f" 2>/dev/null) 个证书"
+    done
+    echo "--- MITM 链验证（curl 无 -k，失败即 CA 未灌入容器信任库）---"
+    if curl -sS --max-time 30 -o /dev/null "$URL_SMALL"; then
+        echo "✅ 容器内信任库已含 squid CA（curl 无 -k 验证通过）"
+    else
+        echo "❌ 容器内 MITM CA 未被信任（postStart 灌库未生效或镜像无 ca-certificates）"
+        return 1
     fi
 }
 
@@ -201,7 +226,8 @@ failure-face() {
     local t0 d1
     echo "--- 不可解析域名（预期 ≤30s 快速失败）---"
     t0=$(date +%s)
-    curl -sS -o /dev/null --max-time 30 "https://no-such-domain-squid-it.invalid/" 2>&1
+    # -f 必须：squid 对坏域回 502 错误页，无 -f 时 curl rc=0（HTTP 事务"成功"）属误判
+    curl -sS -f -o /dev/null --max-time 30 "https://no-such-domain-squid-it.invalid/" 2>&1
     d1=$?
     echo "rc=$d1 用时=$(( $(date +%s) - t0 ))s"
     [ "$d1" -ne 0 ] || { echo "❌ 坏域名竟然成功？"; return 1; }
@@ -285,20 +311,35 @@ conc-distinct() {
 }
 
 # 并发-混合工具：pip / git / wget / curl 四类并行（真实 CI 形态）
+# 容器内工具可能缺失：缺失记 ⚪ SKIP，不算失败
+have() { command -v "$1" >/dev/null 2>&1; }
+
 conc-mixed() {
     local wd="$RESULTS_DIR/mixed"; rm -rf "$wd"; mkdir -p "$wd"
     local pids=() rc=0
     # 1 pip：下载小轮子（走真实 index）
-    ( python3 -m pip download --no-deps --no-cache-dir -d "$wd/pip" zstandard >"$wd/pip.log" 2>&1 \
-        && echo "✅ pip" >>"$wd/verdict" || echo "❌ pip" >>"$wd/verdict" ) & pids+=($!)
+    if have python3 && python3 -m pip --version >/dev/null 2>&1; then
+        ( python3 -m pip download --no-deps --no-cache-dir -d "$wd/pip" zstandard >"$wd/pip.log" 2>&1 \
+            && echo "✅ pip" >>"$wd/verdict" || echo "❌ pip" >>"$wd/verdict" ) & pids+=($!)
+    else
+        echo "⚪ pip SKIP（镜像无 pip）" >>"$wd/verdict"
+    fi
     # 2 git：ls-remote + 浅克隆
-    ( git ls-remote https://github.com/octocat/Hello-World.git HEAD >"$wd/git-ls.log" 2>&1 \
-        && git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git "$wd/clone" >"$wd/git-clone.log" 2>&1 \
-        && echo "✅ git" >>"$wd/verdict" || echo "❌ git" >>"$wd/verdict" ) & pids+=($!)
+    if have git; then
+        ( git ls-remote https://github.com/octocat/Hello-World.git HEAD >"$wd/git-ls.log" 2>&1 \
+            && git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git "$wd/clone" >"$wd/git-clone.log" 2>&1 \
+            && echo "✅ git" >>"$wd/verdict" || echo "❌ git" >>"$wd/verdict" ) & pids+=($!)
+    else
+        echo "⚪ git SKIP（镜像无 git）" >>"$wd/verdict"
+    fi
     # 3 wget：直链下载
-    ( wget -q -O "$wd/wget.out" "$URL_SMALL" >"$wd/wget.log" 2>&1 \
-        && echo "✅ wget" >>"$wd/verdict" || echo "❌ wget" >>"$wd/verdict" ) & pids+=($!)
-    # 4 curl：API 形态
+    if have wget; then
+        ( wget -q -O "$wd/wget.out" "$URL_SMALL" >"$wd/wget.log" 2>&1 \
+            && echo "✅ wget" >>"$wd/verdict" || echo "❌ wget" >>"$wd/verdict" ) & pids+=($!)
+    else
+        echo "⚪ wget SKIP（镜像无 wget）" >>"$wd/verdict"
+    fi
+    # 4 curl：API 形态（套件本身依赖 curl，缺失则整体早退，这里不判 SKIP）
     ( curl -sS --max-time 60 "https://pypi.org/pypi/zstandard/json" -o "$wd/curl.json" >"$wd/curl.log" 2>&1 \
         && grep -q '"name"' "$wd/curl.json" \
         && echo "✅ curl" >>"$wd/verdict" || echo "❌ curl" >>"$wd/verdict" ) & pids+=($!)
@@ -307,7 +348,7 @@ conc-mixed() {
     cat "$wd/verdict"
     grep -q '❌' "$wd/verdict" && return 1
     [ $rc -eq 0 ] || return 1
-    echo "✅ 四类工具并行全绿（互不干扰）"
+    echo "✅ 可用工具并行全绿（互不干扰；⚪ 为镜像缺工具，不计失败）"
 }
 
 # =============================================================================
@@ -316,23 +357,32 @@ conc-mixed() {
 log "== test-squid run-suite mode=$MODE =="
 
 if [ "$MODE" = "function" ]; then
-    run_timed env-snapshot   function env-snapshot
-    run_timed meta-trace     function meta-trace
-    run_timed basic-proxy    function basic-proxy
-    run_timed domain-matrix  function domain-matrix
-    run_timed cache-hitmiss  function cache-hitmiss
-    run_timed integrity      function integrity
-    run_timed failure-face   function failure-face
+    run_timed env-snapshot   "$LAYER" env-snapshot
+    run_timed meta-trace     "$LAYER" meta-trace
+    run_timed basic-proxy    "$LAYER" basic-proxy
+    [ "$LAYER" = "container" ] && run_timed ca-trust "$LAYER" ca-trust
+    run_timed domain-matrix  "$LAYER" domain-matrix
+    run_timed cache-hitmiss  "$LAYER" cache-hitmiss
+    run_timed integrity      "$LAYER" integrity
+    run_timed failure-face   "$LAYER" failure-face
 elif [ "$MODE" = "concurrency" ]; then
-    run_timed env-snapshot     concurrency env-snapshot
-    run_timed conc-same-object concurrency conc-same-object
-    run_timed conc-distinct    concurrency conc-distinct
-    run_timed conc-mixed       concurrency conc-mixed
+    run_timed env-snapshot     "$LAYER" env-snapshot
+    run_timed conc-same-object "$LAYER" conc-same-object
+    run_timed conc-distinct    "$LAYER" conc-distinct
+    run_timed conc-mixed       "$LAYER" conc-mixed
 else
     echo "未知 mode: $MODE（可选 function | concurrency）" >&2
     exit 2
 fi
 
-log "== 汇总（$MODE）=="
+log "== 汇总（$MODE/$LAYER）=="
 cat "$TSV"
-log "完成。结果目录: $RESULTS_DIR"
+
+# 退出码 gate：存在 status=1 的阶段 → 套件非零退出（job 结论必须反映失败，
+# 禁止"阶段红 job 绿"；SKIP/数据记录不阻断）
+if awk -F'\t' 'NR>1 && $3=="1"{found=1} END{exit found?1:0}' "$TSV"; then
+    log "完成。结果目录: $RESULTS_DIR"
+else
+    log "❌ 存在失败阶段，套件判 FAIL（明细见上 / $RESULTS_DIR）"
+    exit 1
+fi
