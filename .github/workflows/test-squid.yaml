@@ -47,6 +47,19 @@ jobs:
       - name: 运行功能测试
         run: bash test-squid/run-suite.sh --mode function
 
+      - name: 生成测试载荷（artifact 下载场景用，自产自销）
+        run: |
+          head -c 1048576 /dev/urandom > /tmp/squid-payload.bin
+          sha256sum /tmp/squid-payload.bin | awk '{print $1}' > /tmp/squid-payload.sha256
+
+      - name: 上传测试载荷
+        uses: actions/upload-artifact@v4
+        with:
+          name: squid-test-payload
+          path: |
+            /tmp/squid-payload.bin
+            /tmp/squid-payload.sha256
+
       - name: 上传结果
         if: always()
         uses: actions/upload-artifact@v4
@@ -79,15 +92,31 @@ jobs:
 
   container-function:
     name: 容器层·功能测试（CANN 镜像）
+    needs: function
     # container: 形态 —— 验证 squid 注入在用户镜像内同样生效（env 传递 + CA 灌库）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
     steps:
+      # CANN 镜像 insteadOf 重写 github.com → gh-proxy 是环境正道，gitconfig 保留。
+      # 仓库已转 public：gh-proxy 匿名可拉，无需额外凭据（此前 401 系私有仓库所致）
       - uses: actions/checkout@v4
 
       - name: 运行功能测试（容器层）
         run: bash test-squid/run-suite.sh --mode function --container
+
+      # 场景 artifact-download：GHA artifact 下载流量经 squid（dawidd6 走
+      # github API + 对象存储；needs: function 保证载荷已上传，无竞态）
+      - name: 场景 artifact-download（dawidd6/action-download-artifact）
+        uses: dawidd6/action-download-artifact@v9
+        with:
+          github_token: ${{ github.token }}
+          run_id: ${{ github.run_id }}
+          name: squid-test-payload
+          path: payload-download
+
+      - name: 校验 artifact 完整性
+        run: echo "$(cat payload-download/squid-payload.sha256)  payload-download/squid-payload.bin" | sha256sum -c -
 
       - name: 上传结果
         if: always()
@@ -99,6 +128,7 @@ jobs:
 
   container-concurrency:
     name: 容器层·并发测试（CANN 镜像）
+    needs: function
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12

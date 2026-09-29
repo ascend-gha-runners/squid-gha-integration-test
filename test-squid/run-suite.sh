@@ -324,11 +324,15 @@ conc-mixed() {
     else
         echo "⚪ pip SKIP（镜像无 pip）" >>"$wd/verdict"
     fi
-    # 2 git：ls-remote + 浅克隆
+    # 2 git：ls-remote + 浅克隆（容器内 insteadOf 重写 gh-proxy 需认证时，
+    #   属环境路由问题非 squid 层问题 → 降级 SKIP）
     if have git; then
         ( git ls-remote https://github.com/octocat/Hello-World.git HEAD >"$wd/git-ls.log" 2>&1 \
             && git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git "$wd/clone" >"$wd/git-clone.log" 2>&1 \
-            && echo "✅ git" >>"$wd/verdict" || echo "❌ git" >>"$wd/verdict" ) & pids+=($!)
+            && echo "✅ git" >>"$wd/verdict" \
+            || { grep -q "could not read Username" "$wd/git-ls.log" "$wd/git-clone.log" 2>/dev/null \
+                && echo "⚪ git SKIP（insteadOf 重写 gh-proxy 需认证，环境路由问题非 squid 层）" >>"$wd/verdict" \
+                || echo "❌ git" >>"$wd/verdict"; } ) & pids+=($!)
     else
         echo "⚪ git SKIP（镜像无 git）" >>"$wd/verdict"
     fi

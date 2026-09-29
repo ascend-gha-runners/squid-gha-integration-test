@@ -87,3 +87,4 @@ summary job 汇总进 GITHUB_STEP_SUMMARY，artifact 一并上传。
 | squid 7.7.2 发 `Cache-Status: squid-cache;detail=…`（RFC 9211），不发老式 `X-Cache-Lookup` | cache-hitmiss 解析改为 Cache-Status 优先 |
 | squid 对坏域回 502 错误页，curl 无 `-f` 时 rc=0 | failure-face 一律加 `-f` |
 | 阶段 FAIL 后 job 仍 success | run-suite.sh 末尾加 TSV 汇总退出码 |
+| **容器层发现**：CANN 镜像自带 `/root/.gitconfig`，全局 `insteadOf` 把 github.com 重写到 `gh-proxy.test.osinfra.cn`；checkout 失败根因是 token extraheader 挂在 `http.https://github.com/` 上，重写后 URL 不匹配 → gh-proxy 收到匿名请求 → 401（run 36538608282 实锤）。**gh-proxy 是环境正道，gitconfig 保留、不需要 gh-proxy 专属凭据** | checkout 前给重写目标挂同一份 token：`HOME=/root git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic …"`；另加独立场景 `artifact-download`：runner 层上传随机载荷，容器层用 `dawidd6/action-download-artifact@v9` 按 `run_id` 下载并 sha256 校验（GHA artifact 流量经 squid） |
