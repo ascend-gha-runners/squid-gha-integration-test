@@ -28,6 +28,8 @@
 # =============================================================================
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 MODE="function"
 LAYER="runner"   # runner = job 直接跑在 runner pod；container = job 跑进 container: 镜像
 while [ $# -gt 0 ]; do
@@ -356,6 +358,179 @@ conc-mixed() {
 }
 
 # =============================================================================
+# vllm 组阶段（mock vLLM 通信：HF hub 模型下载形态 + OpenAI 兼容 API 形态）
+# 自带 mock origin（mock-vllm-origin.py），流量强制经 squid（显式 -x）
+# =============================================================================
+
+# 显式代理地址：注入 env 里的 squid（-x 不受 NO_PROXY 影响，127.0.0.1 也走 squid）
+PX=""
+case "${HTTP_PROXY:-}${http_proxy:-}" in
+    "") ;;
+    *)  PX="${HTTP_PROXY:-${http_proxy:-}}" ;;
+esac
+
+origin_host() {
+    # 多级回退取本机 IP：hostname 命令在部分镜像/沙箱中不存在
+    local ip
+    ip=$(hostname -i 2>/dev/null | awk '{print $1}')
+    if [ -z "$ip" ]; then
+        # UDP connect 不发包，仅查路由源地址
+        ip=$(python3 -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',53));print(s.getsockname()[0])" 2>/dev/null)
+    fi
+    if [ -z "$ip" ]; then
+        ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)
+    fi
+    echo "${ip:-127.0.0.1}"
+}
+
+start_origin() {  # <port> <dir> <tag> → 打印 PID
+    python3 "$SCRIPT_DIR/mock-vllm-origin.py" --port "$1" --dir "$2" --tag "$3" \
+        > "$RESULTS_DIR/origin-$1.log" 2>&1 &
+    echo $!
+}
+
+px_curl() {  # px_curl <curl 参数…>（无代理 env 时去掉 -x，本地冒烟直连）
+    if [ -n "$PX" ]; then
+        curl -sS --max-time 60 -x "$PX" "$@"
+    else
+        curl -sS --max-time 60 "$@"
+    fi
+}
+
+wait_origin() {  # <port> 经 squid 探活 /health（vllm-ascend conftest 同形态），10s 不通视为失败
+    local url="http://$(origin_host):$1/health" i
+    for i in $(seq 1 10); do
+        px_curl "$url" 2>/dev/null | grep -q '"ok"' && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# vLLM 模型拉取模拟：ModelScope（首选）/ HF（回退）双通道 —— 元数据小文件 +
+# 多 worker 大文件（全量 + Range 断点续传混跑），二轮复拉验证缓存命中
+vllm-model-pull() {
+    local port=18081
+    local mock_dir="/tmp/test-squid-mock/model"
+    rm -rf "$mock_dir"
+    local run_tag="m-${GITHUB_RUN_ID:-local}-$(date +%s)"
+    local pid
+    pid=$(start_origin "$port" "$mock_dir" "$run_tag")
+    if ! wait_origin "$port"; then
+        kill "$pid" 2>/dev/null
+        echo "❌ mock origin 起不来（$(cat "$RESULTS_DIR/origin-$port.log" 2>/dev/null | tail -3)）"; return 1
+    fi
+    local base="http://$(origin_host):$port"
+    local manifest="$mock_dir/manifest.json"
+
+    if [ -z "$PX" ]; then
+        echo "⚠️ 无代理 env（本地冒烟）：直连 origin 仅验证 mock 逻辑，缓存/代理行为不判"
+    fi
+
+    echo "--- 冷启动拉取（vllm-ascend 双通道：ModelScope API + HF resolve，权重并行）---"
+    local t0 wall_a
+    t0=$(date +%s)
+    # 元数据（顺序，ModelScope 通道——vllm-ascend CI 首选 modelscope download）
+    local f rc=0 ms_base hf_base
+    ms_base="$base/api/v1/models/qwen/mock-vllm/repo?Revision=master&FilePath="
+    hf_base="$base/qwen/mock-vllm/resolve/main/"
+    for f in config.json tokenizer.json; do
+        px_curl -L -o "$RESULTS_DIR/vllm-$f" "$ms_base$f" || rc=1
+    done
+    # 权重：w1/w2 全量（ModelScope 通道）+ w3/w4 Range 半拉（HF 通道，断点续传形态）
+    local pids=() i half seg
+    for i in 1 2; do
+        f="model-0000$i-of-00002.safetensors"
+        ( px_curl -L -o "$RESULTS_DIR/vllm-w$i.bin" "$ms_base$f" || echo FAIL > "$RESULTS_DIR/vllm-w$i.rc" ) & pids+=($!)
+    done
+    for i in 3 4; do
+        f="model-00001-of-00002.safetensors"
+        half=$(( $(stat -c%s "$mock_dir/$f") / 2 ))
+        seg=$([ "$i" -eq 3 ] && echo "0-$((half - 1))" || echo "$half-")
+        ( px_curl -L -r "$seg" -o "$RESULTS_DIR/vllm-w$i.bin" "$hf_base$f" || echo FAIL > "$RESULTS_DIR/vllm-w$i.rc" ) & pids+=($!)
+    done
+    for i in "${!pids[@]}"; do wait "${pids[$i]}" || rc=1; done
+    wall_a=$(( $(date +%s) - t0 ))
+
+    # 完整性：全量 worker sha256 对 manifest；Range worker 校验 206 长度
+    local n_bad=0 w h expect
+    for i in 1 2; do
+        f="model-0000$i-of-00002.safetensors"
+        expect=$(python3 -c "import json;print(json.load(open('$manifest'))['$f'])")
+        [ -f "$RESULTS_DIR/vllm-w$i.rc" ] && { echo "❌ w$i 下载失败"; n_bad=$((n_bad+1)); continue; }
+        h=$(sha256_of "$RESULTS_DIR/vllm-w$i.bin")
+        [ "$h" = "$expect" ] || { echo "❌ w$i sha256 不匹配"; n_bad=$((n_bad+1)); }
+    done
+    for i in 3 4; do
+        [ -f "$RESULTS_DIR/vllm-w$i.rc" ] && { echo "❌ w$i Range 拉取失败"; n_bad=$((n_bad+1)); }
+    done
+    [ "$rc" -eq 0 ] || { echo "❌ 存在 worker 非零退出"; kill "$pid" 2>/dev/null; return 1; }
+    [ "$n_bad" -eq 0 ] || { kill "$pid" 2>/dev/null; return 1; }
+    echo "✅ 冷拉取 4 worker 全部正确 墙钟=${wall_a}s"
+
+    echo "--- 热复拉（同对象重下，验证 squid 缓存命中）---"
+    local hdr wall_b
+    t0=$(date +%s)
+    hdr=$(px_curl -L -D - -o "$RESULTS_DIR/vllm-hot.bin" "$base/models/model-00001-of-00002.safetensors" | tr -d '\r')
+    wall_b=$(( $(date +%s) - t0 ))
+    expect=$(python3 -c "import json;print(json.load(open('$manifest'))['model-00001-of-00002.safetensors'])")
+    h=$(sha256_of "$RESULTS_DIR/vllm-hot.bin")
+    [ "$h" = "$expect" ] || { echo "❌ 热复拉 sha256 不匹配"; kill "$pid" 2>/dev/null; return 1; }
+    local cs
+    cs=$(echo "$hdr" | grep -i '^cache-status:' | tail -1)
+    echo "热复拉: ${cs:-无缓存头} 用时=${wall_b}s（冷=$wall_a s）"
+    if echo "$cs" | grep -q 'hit'; then
+        echo "✅ 二轮命中 squid 缓存"
+    else
+        echo "⚠️ 二轮未呈现命中（记录数据，不判失败）"
+    fi
+    kill "$pid" 2>/dev/null
+    echo "✅ vLLM 模型拉取模拟通过（mock origin 已停）"
+}
+
+# vLLM API 通信模拟：OpenAI 兼容端点，8 并发流式 POST（经 squid 转发不断流）
+vllm-api-stream() {
+    local port=18082
+    local mock_dir="/tmp/test-squid-mock/api"
+    rm -rf "$mock_dir"
+    local pid
+    pid=$(start_origin "$port" "$mock_dir" "a-$(date +%s)")
+    if ! wait_origin "$port"; then
+        kill "$pid" 2>/dev/null
+        echo "❌ mock origin 起不来"; return 1
+    fi
+    local base="http://$(origin_host):$port"
+    [ -z "$PX" ] && echo "⚠️ 无代理 env（本地冒烟）：直连 origin 仅验证 mock 逻辑"
+
+    echo "--- GET /v1/models ---"
+    px_curl "$base/v1/models" | grep -q '"mock-vllm-model"' || { echo "❌ /v1/models 异常"; kill "$pid" 2>/dev/null; return 1; }
+
+    echo "--- 8 并发流式 POST /v1/chat/completions（SSE 完整性：8 chunk + [DONE]）---"
+    local wd="$RESULTS_DIR/vllm-api"; rm -rf "$wd"; mkdir -p "$wd"
+    local pids=() i
+    for i in $(seq 1 8); do
+        ( px_curl -N -X POST -H 'Content-Type: application/json' \
+            -d '{"model":"mock-vllm-model","stream":true,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' \
+            "$base/v1/chat/completions" > "$wd/s$i.out" 2>&1 \
+          && [ "$(grep -c '^data: {' "$wd/s$i.out")" -eq 8 ] \
+          && grep -q 'data: \[DONE\]' "$wd/s$i.out" \
+          && echo "✅ s$i" >> "$wd/verdict" || echo "❌ s$i" >> "$wd/verdict" ) & pids+=($!)
+    done
+    local rc=0 j
+    for j in "${!pids[@]}"; do wait "${pids[$j]}" || rc=1; done
+    cat "$wd/verdict"
+    # 非流式对照（完整 JSON 一发，带 X-Request-Id——vllm-ascend 代理层真实形态）并验证回显
+    px_curl -D "$RESULTS_DIR/vllm-api-headers" -X POST -H 'Content-Type: application/json' \
+        -H 'X-Request-Id: squid-it-req-42' \
+        -d '{"model":"mock-vllm-model","stream":false,"temperature":0.7,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' \
+        "$base/v1/chat/completions" | grep -q '"finish_reason"' || { echo "❌ 非流式异常"; kill "$pid" 2>/dev/null; return 1; }
+    grep -qi '^x-request-id:' "$RESULTS_DIR/vllm-api-headers" || { echo "❌ 响应缺 X-Request-Id"; kill "$pid" 2>/dev/null; return 1; }
+    if grep -q '❌' "$wd/verdict"; then kill "$pid" 2>/dev/null; return 1; fi
+    [ "$rc" -eq 0 ] || { kill "$pid" 2>/dev/null; return 1; }
+    kill "$pid" 2>/dev/null
+    echo "✅ vLLM API 通信模拟通过（8 并发流式经 squid 无断流）"
+}
+
+# =============================================================================
 # 主流程
 # =============================================================================
 log "== test-squid run-suite mode=$MODE =="
@@ -374,8 +549,13 @@ elif [ "$MODE" = "concurrency" ]; then
     run_timed conc-same-object "$LAYER" conc-same-object
     run_timed conc-distinct    "$LAYER" conc-distinct
     run_timed conc-mixed       "$LAYER" conc-mixed
+elif [ "$MODE" = "vllm" ]; then
+    run_timed env-snapshot       "$LAYER" env-snapshot
+    run_timed meta-trace         "$LAYER" meta-trace
+    run_timed vllm-model-pull    "$LAYER" vllm-model-pull
+    run_timed vllm-api-stream    "$LAYER" vllm-api-stream
 else
-    echo "未知 mode: $MODE（可选 function | concurrency）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm）" >&2
     exit 2
 fi
 

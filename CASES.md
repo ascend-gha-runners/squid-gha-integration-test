@@ -66,6 +66,22 @@ summary job 汇总进 GITHUB_STEP_SUMMARY，artifact 一并上传。
 | `conc-distinct` | F5 | URL 池 + query 变体绕缓存键，聚合吞吐 | 全部 exit=0=PASS | R8.2、R10 |
 | `conc-mixed` | F5 | pip download / git / wget / curl 四类并行 | 四类全绿=PASS | R8.3、R7 |
 
+### vllm 组（mock vLLM 通信）
+
+模拟 vLLM 生命周期两类真实通信形态，origin 为套件自带 mock（`mock-vllm-origin.py`，
+纯标准库，确定性生成模型文件），流量**显式 `-x` 走 squid**（不受 NO_PROXY 影响）；
+两层各跑一遍（`--mode vllm [--container]`）。
+
+| 阶段 | 面 | 场景 | 判定 | 规则 |
+|---|---|---|---|---|
+| `meta-trace` | — | 同功能组元自检（mock 流量同样必须经 squid） | FAIL 整套作废 | R11、R3 |
+| `vllm-model-pull` | F5/F3 | **HF hub 下载形态**：元数据顺序拉（config/tokenizer）+ 4 worker 并行权重（2 全量 sha256 对 manifest + 2 Range 半拉断点续传）；热复拉验缓存命中 | 完整性一票否决=PASS/FAIL；命中仅记录 | R8、R2、R4 |
+| `vllm-api-stream` | F5/F1 | **OpenAI 兼容 API 形态**：8 并发流式 POST（SSE 8 chunk + [DONE] 完整性）+ 非流式 + /v1/models；验证 squid 转发 POST/SSE 不断流不缓存 | 全绿=PASS | R8.3、R1、R7 |
+
+mock 说明：模型文件按 tag+块序号哈希确定性生成（16MB+8MB 权重），每 run 用
+`$GITHUB_RUN_ID` 唯一 tag → 冷拉必 MISS、热复拉可观测 HIT；origin 服务在阶段内
+起停（失败不传染，R7）。本地无代理 env 时自动直连并记 SKIP（只验 mock 逻辑）。
+
 ### container 层追加检查
 
 | 阶段 | 面 | 场景 | 判定 |

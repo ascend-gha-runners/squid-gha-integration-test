@@ -149,9 +149,46 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  vllm:
+    name: vllm 通信模拟（runner 层）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行 vLLM 通信模拟
+        run: bash test-squid/run-suite.sh --mode vllm
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-vllm
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  container-vllm:
+    name: vllm 通信模拟（CANN 镜像）
+    needs: function
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行 vLLM 通信模拟（容器层）
+        run: bash test-squid/run-suite.sh --mode vllm --container
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-container-vllm
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   summary:
     name: 汇总
-    needs: [function, concurrency, container-function, container-concurrency]
+    needs: [function, concurrency, vllm, container-function, container-concurrency, container-vllm]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -165,7 +202,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-container-function test-squid-container-concurrency; do
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-container-function test-squid-container-concurrency test-squid-container-vllm; do
             if [ -f "$d/timings.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
