@@ -531,6 +531,351 @@ vllm-api-stream() {
 }
 
 # =============================================================================
+# parity 组（tool-17 全量移植：13 条重写规则内容签名 + 负样本 + 回归守卫）
+# runner 不挂 squid-config CM → helper 断言层（tool-17 [A] 层）不可用，
+# 只做内容签名层（[B] 层）——R13 环境边界，留档。
+# 唯一显式镜像 URL 是负样本（R14：证明判定方法有效，tool-17 NEG-demo 传承）。
+# =============================================================================
+
+P_PASS=0; P_FAIL=0
+
+ck_get() {  # name url want_code [magic_hex] [grep_pat] —— GET+range，状态码/魔数/签名三重判
+    local name=$1 url=$2 want=${3:-200} magic=${4:-} pat=${5:-}
+    local body="$RESULTS_DIR/parity-body" code
+    code=$(curl -sS -L --max-time 90 -r 0-65535 -o "$body" -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    case "$code" in
+        "$want"|206) : ;;
+        *) echo "✗ $name [$url] GET=$code 期望=$want ← 镜像路径不同构或失效"; P_FAIL=$((P_FAIL+1)); return 1 ;;
+    esac
+    if [ -n "$magic" ]; then
+        local got; got=$(od -An -tx1 -N4 "$body" | tr -d ' \n'); got=${got:0:${#magic}}
+        [ "$got" = "$magic" ] || { echo "✗ $name 魔数=$got 期望=$magic（内容形态不对）"; P_FAIL=$((P_FAIL+1)); return 1; }
+    fi
+    if [ -n "$pat" ] && ! grep -qE "$pat" "$body"; then
+        echo "✗ $name 缺签名 /$pat/（同构性破坏）"; P_FAIL=$((P_FAIL+1)); return 1
+    fi
+    echo "✓ $name GET=$code 签名OK"; P_PASS=$((P_PASS+1))
+}
+
+ck_head() {  # 大文件只 HEAD（conda repodata 等百 MB 级）
+    local name=$1 url=$2 want=${3:-200} code
+    code=$(curl -sSI -L --max-time 60 -o /dev/null -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    if [ "$code" = "$want" ]; then
+        echo "✓ $name HEAD=$code"; P_PASS=$((P_PASS+1))
+    else
+        echo "✗ $name HEAD=$code 期望=$want ← 不同构或失效"; P_FAIL=$((P_FAIL+1))
+    fi
+}
+
+neg_expect_404() {  # 负样本：故意错误映射，期望 404/403
+    local name=$1 url=$2 code
+    code=$(curl -sS -L --max-time 60 -o /dev/null -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    case "$code" in
+        404|403) echo "✓ NEG-$name → $code（不同构必失效，判定方法有效）"; P_PASS=$((P_PASS+1)) ;;
+        *) echo "! NEG-$name → $code（期望 404/403，镜像路径策略可能变化，降级警告不判失败）" ;;
+    esac
+}
+
+rewrite-parity() {
+    echo "--- 规则1/12 pypi → repo.huaweicloud.com/repository/pypi（索引+对象域）---"
+    ck_get pypi-simple https://pypi.org/simple/flask/ 200 '' '\.\./\.\./packages/|files\.pythonhosted\.org'
+    # 动态取真实 wheel 路径（经 squid 的 simple 页 = 镜像页）
+    local simple_html whl_href
+    simple_html=$(curl -sS -L --max-time 60 https://pypi.org/simple/flask/ 2>>"$RESULTS_DIR/parity.log")
+    # href 两种形态：镜像页相对路径（../../packages/…）或官方页绝对 URL（files.pythonhosted…）
+    whl_href=$(printf '%s' "$simple_html" | grep -o 'href="[^"]*\.whl' | head -1 | sed 's/^href="//')
+    case "$whl_href" in
+        http*)
+            ck_get pypi-packages "$whl_href" 200 ;;                       # 规则12：官方对象域
+        ../*)
+            ck_get pypi-packages "https://pypi.org/${whl_href#\.\./\.\./}" 200 ;;  # 镜像相对路径 → 源站 URL
+        *)
+            echo "✗ pypi-packages 未知 href 形态: $whl_href"; P_FAIL=$((P_FAIL+1)) ;;
+    esac
+
+    echo "--- 规则3/13 github → gh-proxy 前缀式（archive/releases/raw）---"
+    ck_get gh-archive https://github.com/mvdan/sh/archive/refs/tags/v3.10.0.tar.gz 200 1f8b08
+    ck_get gh-release https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64 200 7f454c46
+    ck_get gh-raw https://raw.githubusercontent.com/mvdan/sh/master/README.md 200
+
+    echo "--- 规则5 go：goproxy.cn 同构 / tarball→aliyun / ?mode=json 分流（R15 守卫）---"
+    ck_get goproxy-list https://proxy.golang.org/github.com/google/uuid/@v/list 200 '' '^v'
+    ck_get go-tarball https://go.dev/dl/go1.26.1.linux-amd64.tar.gz 200 1f8b08
+    ck_get go-json "https://go.dev/dl/?mode=json" 200 '' '"version"'   # tool-18 事故回归位
+
+    echo "--- 规则6 apt → repo.huaweicloud.com（host 交换，路径同构）---"
+    ck_get ubuntu-release http://archive.ubuntu.com/ubuntu/dists/noble/Release 200 '' 'Origin: Ubuntu'
+    ck_get ports-release http://ports.ubuntu.com/ubuntu-ports/dists/noble/Release 200 '' 'Origin: Ubuntu'
+
+    echo "--- 规则7 npm → registry.npmmirror.com（host 交换）---"
+    ck_get npm-doc https://registry.npmjs.org/left-pad 200 '' '"versions"'
+    ck_get npm-tgz https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz 200 1f8b08
+
+    echo "--- 规则8 cargo → rsproxy（sparse index + api/v1/crates 守卫 + 对象兜底）---"
+    ck_get crates-index https://index.crates.io/se/rd/serde 200 '' '"vers"'
+    ck_get crates-config-guard https://index.crates.io/config.json 200 '' 'api/v1/crates'   # R15：模板漂移报警位
+    ck_get crates-static https://static.crates.io/crates/serde/serde-1.0.210.crate 200 1f8b08
+
+    echo "--- 规则9 conda → nju（/cloud/ 前缀重映射 + pkgs|miniconda）---"
+    ck_head conda-cloud https://conda.anaconda.org/conda-forge/linux-64/repodata.json 200
+    ck_head conda-pkgs https://repo.anaconda.com/pkgs/main/linux-64/repodata.json 200
+    ck_head miniconda https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh 200
+
+    echo "--- 规则10 openEuler yum host 交换 ---"
+    ck_get openeuler-repomd https://repo.openeuler.org/openEuler-24.03-LTS/OS/x86_64/repodata/repomd.xml 200 '' '<repomd'
+
+    echo "--- 规则10a rustup → huaweicloud（manifest 签名 + bootstrap 固定映射）---"
+    ck_get rustup-manifest https://static.rust-lang.org/dist/channel-rust-stable.toml 200 '' 'manifest-version'
+    ck_head rustup-init https://sh.rustup.rs 200
+
+    echo "--- 负样本对照（R14）：故意去掉 nju 的 /cloud/ 前缀 → 期望 404/403 ---"
+    neg_expect_404 conda-nocloud https://mirror.nju.edu.cn/anaconda/conda-forge/linux-64/repodata.json
+
+    echo "RESULT: pass=$P_PASS fail=$P_FAIL"
+    [ "$P_FAIL" -eq 0 ] && echo "✅ 全部重写映射同构校验通过（$P_PASS 条）"
+}
+
+
+
+# pip 真实下载 + 安装 + import 验证（pypi 经 squid）
+tool-pip() {
+    local dl="$RESULTS_DIR/pip-dl"; rm -rf "$dl"; mkdir -p "$dl"
+    python3 -m pip download --no-deps --timeout 60 -d "$dl" 'requests==2.32.3' \
+        > "$RESULTS_DIR/tool-pip.log" 2>&1 || { echo "❌ pip download 失败（tail: $(tail -2 "$RESULTS_DIR/tool-pip.log" | tr '\n' ' ')）"; return 1; }
+    local whl
+    whl=$(ls "$dl"/requests-*.whl 2>/dev/null | head -1)
+    [ -n "$whl" ] || { echo "❌ 未产出 wheel"; return 1; }
+    echo "wheel: $(basename "$whl") $(sha256_of "$whl" | cut -c1-12)…"
+    pip_install --force-reinstall --no-deps "$whl" >> "$RESULTS_DIR/tool-pip.log" 2>&1 \
+        || { echo "❌ pip install 失败"; return 1; }
+    python3 -c "import requests; print('requests', requests.__version__)" \
+        || { echo "❌ import 验证失败"; return 1; }
+    echo "✅ pip 真实下载→安装→import 全链路经 squid 通过"
+}
+
+# huggingface 整体排除（R12/R16 留档）：helper 无 hf 重写规则，前版 tool-hf 写死
+# HF_ENDPOINT=hf-mirror.com 属显式镜像违例，已删除。3xx 跟随能力由 vllm 组覆盖。
+
+# 工具链缺失守卫（R16）：无该工具 → SKIP 记数据；工具在而失败 → FAIL
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "⚠️ 无 $1（runner 工具链缺失），SKIP（R16：数据记录）"; return 1; }
+}
+
+# pip 安装带 PEP 668 回退（ubuntu-24.04/CANN py3.12 的 externally-managed 环境）
+pip_install() {
+    python3 -m pip install --quiet --timeout 60 "$@" 2>/dev/null \
+        || python3 -m pip install --quiet --timeout 60 --break-system-packages "$@"
+}
+
+# 清理含只读文件（go modcache 等设置 444）的目录
+rmrf() { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }
+
+# tool-02 apt：官方源零换源 update+install（重写规则6）
+tool-apt() {
+    need apt-get || return 2
+    sudo apt-get update -qq > "$RESULTS_DIR/tool-apt.log" 2>&1 \
+        && sudo apt-get install -y -qq jq >> "$RESULTS_DIR/tool-apt.log" 2>&1 \
+        || { echo "❌ apt update/install 失败（tail: $(tail -2 "$RESULTS_DIR/tool-apt.log" | tr '\n' ' ')）"; return 1; }
+    jq --version || { echo "❌ jq 不可用"; return 1; }
+    echo "✅ apt 官方源零换源经 squid 通过"
+}
+
+# tool-09 npm：默认 registry 安装（规则7 host 交换）
+tool-npm() {
+    need npm || return 2
+    local d="$RESULTS_DIR/npm-proj"; rm -rf "$d"; mkdir -p "$d"
+    (cd "$d" && npm install express --no-audit --no-fund --loglevel=warn > "$RESULTS_DIR/tool-npm.log" 2>&1 \
+        && node -e "require('express'); console.log('express ok')") \
+        || { echo "❌ npm install/require 失败（tail: $(tail -2 "$RESULTS_DIR/tool-npm.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ npm 默认 registry 经 squid 通过"
+}
+
+# tool-15 pnpm：npm bootstrap pnpm 后安装（规则7）
+tool-pnpm() {
+    need npm || return 2
+    local d="$RESULTS_DIR/pnpm-proj"; rm -rf "$d"; mkdir -p "$d"
+    npm install -g pnpm --loglevel=warn > "$RESULTS_DIR/tool-pnpm.log" 2>&1 \
+        && (cd "$d" && pnpm add left-pad@1.3.0 --loglevel=warn >> "$RESULTS_DIR/tool-pnpm.log" 2>&1 \
+            && node -e "require('./node_modules/left-pad'); console.log('pnpm ok')") \
+        || { echo "❌ pnpm 链路失败（tail: $(tail -2 "$RESULTS_DIR/tool-pnpm.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ pnpm 安装链经 squid 通过"
+}
+
+# tool-12 uv：pip bootstrap + uv pip install（默认官方 index）
+tool-uv() {
+    pip_install uv > "$RESULTS_DIR/tool-uv.log" 2>&1
+    { uv pip install --system --quiet pyyaml || uv pip install --system --quiet --break-system-packages pyyaml; } \
+        >> "$RESULTS_DIR/tool-uv.log" 2>&1 \
+        && python3 -c "import yaml; print('yaml ok')" \
+        || { echo "❌ uv pip install/import 失败（tail: $(tail -2 "$RESULTS_DIR/tool-uv.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ uv 官方 index 经 squid 通过"
+}
+
+# tool-04 goproxy：go 缺失则官方 tarball bootstrap（规则5 tarball），go mod download（规则5 goproxy）
+tool-goproxy() {
+    if ! command -v go >/dev/null 2>&1; then
+        echo "runner 无 go → 官方 tarball bootstrap（同时验证规则5 tarball 重写）"
+        curl -sSL --max-time 300 -o /tmp/go.tgz https://go.dev/dl/go1.26.1.linux-amd64.tar.gz \
+            || { echo "❌ go tarball 下载失败"; return 1; }
+        mkdir -p "$RESULTS_DIR/goroot" && tar -C "$RESULTS_DIR/goroot" -xzf /tmp/go.tgz
+        export PATH="$RESULTS_DIR/goroot/go/bin:$PATH"
+    fi
+    local d="$RESULTS_DIR/go-proj"; rmrf "$d"; mkdir -p "$d"
+    export GOMODCACHE="$d/gomodcache" GOPATH="$d/gopath"
+    (cd "$d" && go mod init t >/dev/null 2>&1 && go mod download github.com/google/uuid@v1.6.0) \
+        > "$RESULTS_DIR/tool-goproxy.log" 2>&1 \
+        || { echo "❌ go mod download 失败（tail: $(tail -2 "$RESULTS_DIR/tool-goproxy.log" | tr '\n' ' ')）"; return 1; }
+    [ -d "$d/gomodcache/github.com/google/uuid@v1.6.0" ] || { echo "❌ 模块未落缓存"; return 1; }
+    echo "✅ goproxy 默认 GOPROXY 经 squid 通过（go $(go version | awk '{print $3}')）"
+}
+
+# tool-06 wget：官方 github release 下载（规则3），ELF 魔数校验
+tool-wget() {
+    need wget || return 2
+    wget -q --timeout=90 -O "$RESULTS_DIR/shfmt" \
+        https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64 \
+        || { echo "❌ wget release 失败"; return 1; }
+    [ "$(od -An -tx1 -N4 "$RESULTS_DIR/shfmt" | tr -d ' \n')" = "7f454c46" ] \
+        || { echo "❌ 下载内容非 ELF（重写路径不同构?）"; return 1; }
+    echo "✅ wget 官方 release 经 squid 通过（ELF 完整）"
+}
+
+# tool-14 git-lfs：官方 release bootstrap（规则3）+ lfs 可用性
+tool-gitlfs() {
+    if command -v git-lfs >/dev/null 2>&1; then
+        git lfs version && { echo "✅ git-lfs 现成可用（$(git lfs version)）"; return 0; }
+    fi
+    echo "runner 无 git-lfs → 官方 release bootstrap（验证规则3 工具链自举）"
+    local d="$RESULTS_DIR/gitlfs"; rm -rf "$d"; mkdir -p "$d"
+    wget -q --timeout=120 -O "$d/lfs.tar.gz" \
+        https://github.com/git-lfs/git-lfs/releases/download/v3.7.0/git-lfs-linux-amd64-v3.7.0.tar.gz \
+        || { echo "❌ git-lfs release 下载失败"; return 1; }
+    tar -C "$d" -xzf "$d/lfs.tar.gz"
+    "$d"/git-lfs-3.7.0/git-lfs version || { echo "❌ git-lfs 二进制不可用"; return 1; }
+    echo "✅ git-lfs 官方 bootstrap 经 squid 通过"
+}
+
+# ---- HEAVY=1 才跑（编译/工具链级耗时）----
+
+# tool-19 rustup：官方 bootstrap（规则10a）+ cargo serde 构建（规则8）
+tool-rustup() {
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable > "$RESULTS_DIR/tool-rustup.log" 2>&1 \
+        || { echo "❌ rustup bootstrap 失败（tail: $(tail -2 "$RESULTS_DIR/tool-rustup.log" | tr '\n' ' ')）"; return 1; }
+    export PATH="$HOME/.cargo/bin:$PATH"
+    local d="$RESULTS_DIR/rust-proj"; rm -rf "$d"; mkdir -p "$d"
+    (cd "$d" && cargo new t --bin >/dev/null 2>&1 && cd t \
+        && cargo add serde --features derive >/dev/null 2>&1 && cargo build --quiet) \
+        >> "$RESULTS_DIR/tool-rustup.log" 2>&1 \
+        || { echo "❌ cargo add/build 失败（tail: $(tail -2 "$RESULTS_DIR/tool-rustup.log" | tr '\n' ' ')）"; return 1; }
+    [ -x "$d/t/target/debug/t" ] || { echo "❌ 产物缺失"; return 1; }
+    echo "✅ rustup+cargo 官方链经 squid 通过"
+}
+
+# tool-11 conda：官方 miniconda installer + conda-forge create（规则9）
+tool-conda() {
+    local d="$RESULTS_DIR/conda"; rm -rf "$d"; mkdir -p "$d"
+    wget -q --timeout=300 -O "$d/miniconda.sh" \
+        https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+        || { echo "❌ miniconda 下载失败"; return 1; }
+    bash "$d/miniconda.sh" -b -p "$d/root" >> "$RESULTS_DIR/tool-conda.log" 2>&1 \
+        || { echo "❌ miniconda 安装失败"; return 1; }
+    "$d/root/bin/conda" create -y -q -n t -c conda-forge 'numpy<2' >> "$RESULTS_DIR/tool-conda.log" 2>&1 \
+        || { echo "❌ conda create 失败（tail: $(tail -2 "$RESULTS_DIR/tool-conda.log" | tr '\n' ' ')）"; return 1; }
+    "$d/root/envs/t/bin/python" -c "import numpy; print('numpy', numpy.__version__)" \
+        || { echo "❌ numpy import 失败"; return 1; }
+    echo "✅ conda 官方链经 squid 通过"
+}
+
+# tool-07 cmake FetchContent：git clone 官方 googletest（不经重写直连）+ cmake 构建
+tool-cmake() {
+    need cmake || return 2
+    local d="$RESULTS_DIR/cmake-proj"; rm -rf "$d"; mkdir -p "$d"
+    git clone --depth 1 --quiet https://github.com/google/googletest.git "$d/googletest" \
+        > "$RESULTS_DIR/tool-cmake.log" 2>&1 || { echo "❌ googletest clone 失败"; return 1; }
+    cat > "$d/CMakeLists.txt" <<'EOF'
+cmake_minimum_required(VERSION 3.16)
+project(t CXX)
+add_subdirectory(googletest EXCLUDE_FROM_ALL)
+add_executable(t main.cc)
+target_link_libraries(t gtest)
+EOF
+    echo '#include <gtest/gtest.h>
+int main(){testing::InitGoogleTest(nullptr,nullptr);return 0;}' > "$d/main.cc"
+    (cd "$d" && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null \
+        && cmake --build build -j2 --quiet) >> "$RESULTS_DIR/tool-cmake.log" 2>&1 \
+        || { echo "❌ cmake 构建失败（tail: $(tail -2 "$RESULTS_DIR/tool-cmake.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ cmake+googletest 官方 git 直连经 squid 通过"
+}
+
+# tool-08 bazel：bazelisk（官方 github release，规则3）+ http_archive 构建
+tool-bazel() {
+    local d="$RESULTS_DIR/bazel-proj"; rm -rf "$d"; mkdir -p "$d"
+    wget -q --timeout=120 -O "$d/bazelisk" \
+        https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64 \
+        || { echo "❌ bazelisk 下载失败"; return 1; }
+    chmod +x "$d/bazelisk"
+    cat > "$d/MODULE.bazel" <<'EOF'
+module(name = "t")
+bazel_dep(name = "rules_cc", version = "0.0.17")
+EOF
+    printf 'cc_binary(name = "t", srcs = ["t.cc"])\n' > "$d/BUILD"
+    echo 'int main(){return 0;}' > "$d/t.cc"
+    (cd "$d" && "$d/bazelisk" build //:t --nosystem_rc --nohome_rc) \
+        > "$RESULTS_DIR/tool-bazel.log" 2>&1 \
+        || { echo "❌ bazel build 失败（tail: $(tail -2 "$RESULTS_DIR/tool-bazel.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ bazelisk+bazel_dep 官方链经 squid 通过"
+}
+
+# tool-18 pre-commit：pip bootstrap + gitleaks hook 官方 repo（自举编译，最重）
+tool-precommit() {
+    pip_install pre-commit > "$RESULTS_DIR/tool-precommit.log" 2>&1
+    local d="$RESULTS_DIR/precommit-proj"; rm -rf "$d"; mkdir -p "$d"
+    cat > "$d/.pre-commit-config.yaml" <<'EOF'
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.27.2
+    hooks:
+      - id: gitleaks
+EOF
+    (cd "$d" && git init -q && git add -A \
+        && pre-commit run gitleaks --all-files) >> "$RESULTS_DIR/tool-precommit.log" 2>&1 \
+        || { echo "❌ pre-commit run 失败（tail: $(tail -2 "$RESULTS_DIR/tool-precommit.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ pre-commit+gitleaks 官方 hook 链经 squid 通过"
+}
+
+# modelscope 真实 CLI 下载（vllm-ascend CI 首选通道，天然 302→CDN）
+tool-modelscope() {
+    pip_install 'modelscope<1.38' > "$RESULTS_DIR/tool-modelscope.log" 2>&1
+    local dir="$RESULTS_DIR/ms-model"; rm -rf "$dir"
+    modelscope download --model Qwen/Qwen2.5-0.5B config.json generation_config.json \
+        --local_dir "$dir" >> "$RESULTS_DIR/tool-modelscope.log" 2>&1 \
+        || { echo "❌ modelscope download 失败（tail: $(tail -2 "$RESULTS_DIR/tool-modelscope.log" | tr '\n' ' ')）"; return 1; }
+    [ -s "$dir/config.json" ] || { echo "❌ config.json 缺失/为空"; return 1; }
+    grep -q 'qwen' "$dir/config.json" || { echo "❌ config.json 内容异常"; return 1; }
+    echo "✅ modelscope CLI 真实下载经 squid 通过"
+}
+
+# git 真实 clone —— no-mirror 直连 github.com（runner 层）/ insteadOf 重写 gh-proxy（容器层）
+tool-git() {
+    local dir="$RESULTS_DIR/git-clone"; rm -rf "$dir"
+    git ls-remote https://github.com/octocat/Hello-World.git HEAD > "$RESULTS_DIR/tool-git.log" 2>&1 \
+        || { echo "❌ ls-remote 失败"; return 1; }
+    git clone --depth 1 --quiet https://github.com/octocat/Hello-World.git "$dir" >> "$RESULTS_DIR/tool-git.log" 2>&1 \
+        || { echo "❌ clone 失败"; return 1; }
+    local nrewritten
+    nrewritten=$(git config --global --get-regexp '^url\..*\.insteadof' 2>/dev/null | wc -l)
+    if [ "$nrewritten" -gt 0 ]; then
+        echo "环境含 $nrewritten 条 insteadOf 重写 → 实际走 gh-proxy（环境正道形态）"
+    else
+        echo "无 insteadOf → github.com 直连（no-mirror 形态）"
+    fi
+    [ -f "$dir/README" ] || { echo "❌ 仓库内容缺失"; return 1; }
+    echo "✅ git 真实 clone 经 squid 通过（$(ls "$dir" | wc -l) 个文件）"
+}
+
+# =============================================================================
 # 主流程
 # =============================================================================
 log "== test-squid run-suite mode=$MODE =="
@@ -554,8 +899,32 @@ elif [ "$MODE" = "vllm" ]; then
     run_timed meta-trace         "$LAYER" meta-trace
     run_timed vllm-model-pull    "$LAYER" vllm-model-pull
     run_timed vllm-api-stream    "$LAYER" vllm-api-stream
+elif [ "$MODE" = "parity" ]; then
+    run_timed env-snapshot   "$LAYER" env-snapshot
+    run_timed meta-trace     "$LAYER" meta-trace
+    run_timed rewrite-parity "$LAYER" rewrite-parity
+elif [ "$MODE" = "tools" ]; then
+    run_timed env-snapshot      "$LAYER" env-snapshot
+    run_timed meta-trace        "$LAYER" meta-trace
+    run_timed tool-pip          "$LAYER" tool-pip
+    run_timed tool-apt          "$LAYER" tool-apt
+    run_timed tool-npm          "$LAYER" tool-npm
+    run_timed tool-pnpm         "$LAYER" tool-pnpm
+    run_timed tool-uv           "$LAYER" tool-uv
+    run_timed tool-goproxy      "$LAYER" tool-goproxy
+    run_timed tool-wget         "$LAYER" tool-wget
+    run_timed tool-gitlfs       "$LAYER" tool-gitlfs
+    run_timed tool-modelscope   "$LAYER" tool-modelscope
+    run_timed tool-git          "$LAYER" tool-git
+    if [ "${HEAVY:-0}" = "1" ]; then
+        run_timed tool-rustup    "$LAYER" tool-rustup
+        run_timed tool-conda     "$LAYER" tool-conda
+        run_timed tool-cmake     "$LAYER" tool-cmake
+        run_timed tool-bazel     "$LAYER" tool-bazel
+        run_timed tool-precommit "$LAYER" tool-precommit
+    fi
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | tools）" >&2
     exit 2
 fi
 

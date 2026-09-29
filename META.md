@@ -68,6 +68,32 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   电信缓存 `via: CHN-...-CACHE` 即假阳性），必须是 squid 专属形态。
   如果关掉/绕开 squid 测试还是全绿，说明测试没打中被测对象。
 
+## 五点五、透明重写维度（源自 no-mirror-test，2026-09-29 增补）
+
+> 背景：gy-006 的 squid 启用了 `url_rewrite_program`（rewrite-helper.sh，squid-config CM），
+> 客户端零镜像配置、官方 URL 进，服务端透明重写到镜像站。此前套件完全没测这个维度
+> （所有"直连官方域名"的阶段实际已被重写却在盲跑）。
+
+- **R12 no-mirror 公理**：测试脚本零镜像配置——客户端一律官方默认 URL
+  （pypi.org / github.com / registry.npmjs.org / repo.openeuler.org …）。
+  加速只能来自 squid 服务端 url_rewrite；任何 case 显式写镜像 URL 即违例
+  （前车之鉴：tool-hf 曾写死 HF_ENDPOINT=hf-mirror.com，已删；huggingface
+  无重写规则，按原套件决策整体排除）。
+- **R13 同构性守护**：每条重写规则都用「官方 URL 经 squid → 验证响应内容形态」
+  校验（签名判定：JSON 关键字段 / gzip 魔数 1f8b08 / ELF 魔数 7f454c46 /
+  `Origin: Ubuntu` / `<repomd`）。镜像路径不同构（404/错内容）→ FAIL。
+  GHA runner 不挂 squid-config CM，helper 断言层（tool-17 [A] 层）不可用，
+  只做内容签名层（[B] 层）——留档为环境边界。
+- **R14 负样本对照**：至少一条故意错误映射（期望 404/403），证明签名判定方法
+  本身有效（tool-17 的 NEG-demo 传承）。
+- **R15 回归守卫**：已知事故形态作固定断言——`go.dev/dl?mode=json` 必须返回
+  JSON 不能是目录页（tool-18 事故）；crates 下载必须走 `rsproxy.cn/api/v1/crates`
+  （tool-17 实测修复的旧映射 404）。helper 回退即报警。
+- **R16 工具 e2e 零改写移植**：no-mirror-test 的 tool-* 真实工具用例移植到 GHA
+  时，只剥环境壳（k8s Job → workflow step），**业务命令零镜像配置原样保留**；
+  工具链缺失（runner 无该工具）记 SKIP（数据），工具在而执行失败记 FAIL。
+  环境不可行的用例（yum 需 openEuler、buildkit 需服务端）排除并留档。
+
 ## 六、与两份前作的关系
 
 | 前作 | 复用什么 | 本套件差异 |
