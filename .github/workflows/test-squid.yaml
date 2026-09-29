@@ -1,0 +1,109 @@
+# =============================================================================
+# test-squid —— squid 代理功能 + 并发测试（GitHub Actions runner）
+#
+# 前提：runner（默认 linux-amd64-cpu-4）已由 pod 注入 squid 代理
+#       （HTTP(S)_PROXY + MITM CA），workflow 内【不配置任何代理】。
+#
+# 结构（对应 META.md 功能面拆解）：
+#   function    —— 元自检、基本代理/CONNECT/MITM、域名矩阵、缓存 MISS→HIT、
+#                  完整性 sha256、失败面
+#   concurrency —— 同对象阶梯并发、异对象并发、混合工具并行
+#   summary     —— 拉回两 job 的 timings/probes，输出汇总表
+# =============================================================================
+name: test-squid
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签（逗号分隔多标签=AND，需已注入 squid 代理）'
+        required: false
+        default: 'linux-amd64-cpu-2, gy-006'
+      ladder:
+        description: '并发度阶梯（空格分隔）'
+        required: false
+        default: '1 4 8 16'
+      heavy:
+        description: '1=启用大载荷（~146MB wheel）'
+        required: false
+        default: '0'
+  pull_request:
+    paths:
+      - 'test-squid/**'
+      - '.github/workflows/test-squid.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  function:
+    name: squid 功能测试
+    # 多标签 = AND 匹配（runner 必须同时带两个标签）
+    runs-on: ${{ github.event_name == 'pull_request' && 'linux-amd64-cpu-2, gy-006' || inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行功能测试
+        run: bash test-squid/run-suite.sh --mode function
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-function
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  concurrency:
+    name: squid 并发测试
+    runs-on: ${{ github.event_name == 'pull_request' && 'linux-amd64-cpu-2, gy-006' || inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行并发测试
+        # PR 事件无 inputs：阶梯/大载荷走默认值（heavy=0，见 REPORT 教训：
+        # PR 事件下 inputs.* 为空字符串，不能直接引用）
+        run: |
+          LADDER="${{ github.event_name == 'pull_request' && '1 4 8 16' || inputs.ladder }}" \
+          HEAVY="${{ github.event_name == 'pull_request' && '0' || inputs.heavy }}" \
+          bash test-squid/run-suite.sh --mode concurrency
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-concurrency
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  summary:
+    name: 汇总
+    needs: [function, concurrency]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取结果
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-squid-*
+          merge-multiple: false
+
+      - name: 汇总表
+        if: always()
+        run: |
+          echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
+          for d in test-squid-function test-squid-concurrency; do
+            if [ -f "$d/timings.tsv" ]; then
+              echo "### $d" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              cat "$d/timings.tsv" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          if [ -f test-squid-function/probes.tsv ]; then
+            echo "### 域名探测" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat test-squid-function/probes.tsv >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          cat "$GITHUB_STEP_SUMMARY"
