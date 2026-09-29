@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'runner 标签（逗号分隔多标签=AND，需已注入 squid 代理）'
+        description: 'runner 标签（JSON 数组字符串，多标签=AND；需已注入 squid 代理）'
         required: false
-        default: 'linux-amd64-cpu-2, gy-006'
+        default: '["linux-amd64-cpu-2", "gy-006"]'
       ladder:
         description: '并发度阶梯（空格分隔）'
         required: false
@@ -38,8 +38,9 @@ permissions:
 jobs:
   function:
     name: squid 功能测试
-    # 多标签 = AND 匹配（runner 必须同时带两个标签）
-    runs-on: ${{ github.event_name == 'pull_request' && 'linux-amd64-cpu-2, gy-006' || inputs.runner }}
+    # 多标签必须用 JSON 数组：表达式里的逗号字符串不会被拆成多标签（会变成
+    # 一个字面标签，永远匹配不到 → job 永久 queued）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +57,7 @@ jobs:
 
   concurrency:
     name: squid 并发测试
-    runs-on: ${{ github.event_name == 'pull_request' && 'linux-amd64-cpu-2, gy-006' || inputs.runner }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
       - uses: actions/checkout@v4
 
