@@ -88,6 +88,53 @@ mock 说明：模型文件按 tag+块序号哈希确定性生成（16MB+8MB 权�
 |---|---|---|---|
 | `ca-trust` | F4 | 容器内系统信任库是否含 squid CA（`update-ca-trust`/`update-ca-certificates`/raw bundle 三条路径之一生效） | 校验 openssl 验证链无错=PASS |
 
+### parity 组（透明重写同构校验，源自 no-mirror-test tool-17 全量移植）
+
+gy-006 的 squid 启用 `url_rewrite_program`：客户端零镜像配置，官方 URL 服务端透明
+重写到镜像站。该组在 runner 层单独跑（重写是 squid 服务端行为，与客户端环境无关，
+无需容器层重复）。**内容签名层**判定（runner 不挂 squid-config CM，helper 断言层
+不可用——R13 环境边界）；脚本内唯一显式镜像 URL 是负样本（R14）。
+
+| 检查点 | 规则 | 判定（状态码 + 魔数/内容签名） |
+|---|---|---|
+| pypi-simple / pypi-packages（动态取真实 wheel） | 规则1/12：索引页 + files.pythonhosted 对象域 | 200/206 + 相对路径或官方 URL |
+| gh-archive / gh-release / gh-raw | 规则3/13：gh-proxy 前缀式 | gzip 魔数 `1f8b08` / ELF 魔数 `7f454c46` / 200 |
+| goproxy-list / go-tarball / go-json | 规则5：goproxy.cn 同构 / aliyun tarball / `?mode=json` 分流 | `^v` / gzip / `"` version` JSON（tool-18 事故回归位，R15） |
+| ubuntu-release / ports-release | 规则6：apt host 交换 | `Origin: Ubuntu` |
+| npm-doc / npm-tgz | 规则7：registry.npmmirror host 交换 | `"versions"` / gzip |
+| crates-index / crates-config / crates-static | 规则8：rsproxy sparse index | `"vers"` / `api/v1/crates` 模板漂移守卫（R15）/ gzip |
+| conda-cloud / conda-pkgs / miniconda | 规则9：nju `/cloud/` 前缀重映射 | HEAD 200（repodata 百 MB 级只探头） |
+| openeuler-repomd | 规则10：yum host 交换 | `<repomd` |
+| rustup-manifest / rustup-init | 规则10a：huaweicloud 固定映射 | `manifest-version` / HEAD 200 |
+| NEG conda-nocloud（故意错映射，直连镜像） | R14 负样本 | 期望 404/403：证明判定方法有效 |
+
+### tools 组（真实工具链 e2e，no-mirror 形态移植）
+
+no-mirror-test tool-* 用例剥环境壳移植（R16：业务命令零镜像配置原样保留）。
+工具链缺失记 SKIP（数据），在而失败记 FAIL。`HEAVY=1` 追加编译/工具链级重场景。
+runner 与 CANN 容器层各跑一遍。
+
+| 阶段 | 对应原用例 | 场景（零镜像配置） | 规则 |
+|---|---|---|---|
+| `tool-pip` | tool-01 | pip 官方 index 下载→安装→import（极简 runner 缺 pip 时 ensurepip/apt 兜底，兜底本身也是真实 apt 链路） | R12、R13 |
+| `tool-apt` | tool-02 | 官方源零换源 `apt-get update && install jq` | 规则6 |
+| `tool-npm` / `tool-pnpm` | tool-09/15 | 默认 registry 安装 express / bootstrap pnpm 后安装 | 规则7 |
+| `tool-uv` | tool-12 | pip bootstrap uv + uv pip install | 规则1 |
+| `tool-goproxy` | tool-04 | go 缺失时官方 tarball bootstrap（squid 大文件下载）+ `go mod download` | 规则5 |
+| `tool-wget` | tool-06 | 官方 github release wget + ELF 魔数 | 规则3 |
+| `tool-gitlfs` | tool-14 | git-lfs 官方 release bootstrap（curl，极简镜像无 wget） | 规则3 |
+| `tool-modelscope` | —（vllm-ascend 增补） | modelscope CLI 官方源下载 Qwen config（天然 302→CDN） | R12 |
+| `tool-git` | tool-03 | github.com 直连 clone（runner 层 no-mirror 形态；容器层 insteadOf 走 gh-proxy，两形态都记录） | R12 |
+| `tool-rustup`（heavy） | tool-19 | sh.rustup.rs bootstrap + cargo serde 构建 | 规则10a、8 |
+| `tool-conda`（heavy） | tool-11 | miniconda 官方 installer + conda-forge numpy | 规则9 |
+| `tool-cmake`（heavy） | tool-07 | googletest 直连 clone + cmake 构建 | R12 |
+| `tool-bazel`（heavy） | tool-08 | bazelisk（官方 release）+ bazel_dep 构建 | 规则3 |
+| `tool-precommit`（heavy） | tool-18 | pre-commit + gitleaks 官方 hook repo | 规则3 |
+
+排除留档（R16）：tool-13 huggingface（helper 无 hf 规则，前版显式 hf-mirror 违例已删）、
+tool-16 yum（GHA/CANN 均 ubuntu，无 openEuler 基底）、tool-17 docker-pull 与
+tool-20 buildkit（需 docker/buildkitd 服务端，机制不同归 e2e 平台测试）。
+
 ## 结论口径
 
 - **PASS**：判定项全部达标（缓存 MISS→HIT 无缓存头等"数据记录"场景不阻断结论，但计入数据）。

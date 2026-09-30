@@ -669,12 +669,15 @@ pip_install() {
         || python3 -m pip install --quiet --timeout 60 --break-system-packages "$@"
 }
 
-# 极简 runner 镜像可能无 pip：ensurepip 优先，失败则 apt 装 python3-pip（本身是真实 apt 重写链路）
+# 极简 runner 镜像可能无 pip：ensurepip 优先，失败则 apt 装 python3-pip（本身是真实 apt 重写链路）。
+# 注意：极简镜像包列表可能为空，必须先 apt-get update（run 36571660908 实测：跳过 update
+# 导致 install "Unable to locate package" 失败）；runner 非 root，sudo 可选。
 ensure_pip() {
     python3 -m pip --version >/dev/null 2>&1 && return 0
     python3 -m ensurepip --default-pip >/dev/null 2>&1 && return 0
-    apt-get install -y -qq python3-pip >/dev/null 2>&1 \
-        || sudo apt-get install -y -qq python3-pip >/dev/null 2>&1
+    local SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO=sudo
+    $SUDO apt-get update -qq >/dev/null 2>&1
+    $SUDO apt-get install -y -qq python3-pip >/dev/null 2>&1
     python3 -m pip --version >/dev/null 2>&1
 }
 
@@ -728,8 +731,10 @@ tool-uv() {
 tool-goproxy() {
     if ! command -v go >/dev/null 2>&1; then
         echo "runner 无 go → 官方 tarball bootstrap（同时验证规则5 tarball 重写 + squid 大文件下载）"
-        curl -sSL --max-time 600 -o /tmp/go.tgz https://go.dev/dl/go1.26.1.linux-amd64.tar.gz \
-            || { echo "❌ go tarball 下载失败（exit=$?，>10min 未完成）"; return 1; }
+        # squid 大文件冷下载实测 ~96KB/s（66.8MB 需 ~720s），600s 会超时（run 36571660908），
+        # 放宽到 1200s；若 squid 已缓存则秒回
+        curl -sSL --max-time 1200 -o /tmp/go.tgz https://go.dev/dl/go1.26.1.linux-amd64.tar.gz \
+            || { echo "❌ go tarball 下载失败（exit=$?，>20min 未完成）"; return 1; }
         mkdir -p "$RESULTS_DIR/goroot" && tar -C "$RESULTS_DIR/goroot" -xzf /tmp/go.tgz
         export PATH="$RESULTS_DIR/goroot/go/bin:$PATH"
     fi
@@ -918,6 +923,8 @@ elif [ "$MODE" = "parity" ]; then
     run_timed meta-trace     "$LAYER" meta-trace
     run_timed rewrite-parity "$LAYER" rewrite-parity
 elif [ "$MODE" = "tools" ]; then
+    # pip --user 装的 CLI（uv/modelscope 等）落 ~/.local/bin，极简镜像 PATH 默认不含
+    export PATH="$HOME/.local/bin:$PATH"
     run_timed env-snapshot      "$LAYER" env-snapshot
     run_timed meta-trace        "$LAYER" meta-trace
     run_timed tool-pip          "$LAYER" tool-pip

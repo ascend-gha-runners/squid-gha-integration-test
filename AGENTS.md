@@ -56,8 +56,10 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 | `squid 功能测试` | 元自检、基本代理/CONNECT/MITM、域名矩阵、缓存 MISS→HIT、sha256 完整性、失败面、artifact 下载 |
 | `squid 并发测试` | 同对象阶梯并发、异对象并发、混合工具并行 |
 | `vllm 通信模拟` | ModelScope/HF 双通道模型下载 + OpenAI API 8 并发 SSE（自带 mock origin） |
-| `容器层·*（CANN 镜像）` | 以上三组在 `cann:9.0.0-a3-ubuntu22.04-py3.12` 容器里各跑一遍（多验 CA 信任路径） |
-| `汇总` | 聚合六 job 结果表到 GITHUB_STEP_SUMMARY |
+| `透明重写同构校验` | no-mirror tool-17 全量移植：13 条重写规则内容签名 + 负样本 + 回归守卫（runner 层 only） |
+| `真实工具链 e2e` | 真实客户端工具（pip/apt/npm/uv/go/wget/git-lfs/modelscope/git）零镜像配置跑通；`heavy=1` 追加 rustup/conda/cmake/bazel/precommit |
+| `容器层·*（CANN 镜像）` | 以上五组在 `cann:9.0.0-a3-ubuntu22.04-py3.12` 容器里各跑一遍（多验 CA 信任路径） |
+| `汇总` | 聚合九 job 结果表到 GITHUB_STEP_SUMMARY |
 
 ## 四、看结果
 
