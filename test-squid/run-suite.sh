@@ -647,7 +647,9 @@ tool-pip() {
     whl=$(ls "$dl"/requests-*.whl 2>/dev/null | head -1)
     [ -n "$whl" ] || { echo "❌ 未产出 wheel"; return 1; }
     echo "wheel: $(basename "$whl") $(sha256_of "$whl" | cut -c1-12)…"
-    pip_install --force-reinstall --no-deps "$whl" >> "$RESULTS_DIR/tool-pip.log" 2>&1 \
+    # 不用 --no-deps：极简镜像缺 requests 依赖（urllib3 等），import 必挂；
+    # 依赖解析本身也是真实 pip→squid 流量（run 36655296843 实测）
+    pip_install --force-reinstall "$whl" >> "$RESULTS_DIR/tool-pip.log" 2>&1 \
         || { echo "❌ pip install 失败"; return 1; }
     python3 -c "import requests; print('requests', requests.__version__)" \
         || { echo "❌ import 验证失败"; return 1; }
@@ -716,15 +718,18 @@ tool-pnpm() {
     echo "✅ pnpm 安装链经 squid 通过"
 }
 
-# tool-12 uv：pip bootstrap + uv pip install（默认官方 index）
+# tool-12 uv：pip bootstrap + uv venv 安装（默认官方 index）。
+# 不用 --system：runner 层非 root 写 /usr/local/lib 被拒（run 36655296843 实测）；
+# uv venv 是标准用法，两层通用且天然绕开 PEP 668。
 tool-uv() {
     ensure_pip || { echo "❌ pip 不可用且 bootstrap 失败"; return 1; }
     pip_install uv > "$RESULTS_DIR/tool-uv.log" 2>&1
-    { uv pip install --system --quiet pyyaml || uv pip install --system --quiet --break-system-packages pyyaml; } \
-        >> "$RESULTS_DIR/tool-uv.log" 2>&1 \
-        && python3 -c "import yaml; print('yaml ok')" \
-        || { echo "❌ uv pip install/import 失败（tail: $(tail -2 "$RESULTS_DIR/tool-uv.log" | tr '\n' ' ')）"; return 1; }
-    echo "✅ uv 官方 index 经 squid 通过"
+    local d="$RESULTS_DIR/uv-venv"; rmrf "$d"
+    uv venv "$d" >> "$RESULTS_DIR/tool-uv.log" 2>&1 \
+        && uv pip install --python "$d/bin/python" --quiet pyyaml >> "$RESULTS_DIR/tool-uv.log" 2>&1 \
+        && "$d/bin/python" -c "import yaml; print('yaml ok')" \
+        || { echo "❌ uv venv/pip install/import 失败（tail: $(tail -2 "$RESULTS_DIR/tool-uv.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ uv 官方 index 经 squid 通过（uv venv）"
 }
 
 # tool-04 goproxy：go 缺失则官方 tarball bootstrap（规则5 tarball），go mod download（规则5 goproxy）
