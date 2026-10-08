@@ -903,63 +903,92 @@ tool-git() {
 # upstream 组 —— 上游通道健康（R17，源自 cn12-001 runbook 诊断）
 #   背景：cn12-001 单 pod 6h 内 17 次 TIMEDOUT，53% 集中在 GitHub Actions
 #   构件通道（出口固有抖动），gh-proxy test 实例 4 次且 p50 3.2s（可修）。
-#   判定原则：单次/零散失败仅记录（2/3 带 ⚠️），单域集中失败（≤1/3 应答）才
-#   FAIL；延迟超预算 FAIL。可达=2xx–4xx，5xx（squid 错误页）不算应答。
+#   判定原则（A/B 对照）：同通道走 squid 与直连各 5 次，squid 成功率 ≥ 直连
+#   且延迟不劣 → PASS；squid 比直连差 → FAIL（代理必须证明自己没让链路变差）。
+#   可达=2xx–4xx，5xx（squid 错误页）不算应答。
 # =============================================================================
 
-# 单域集中探测：N 次请求。可达判据：2xx–4xx（未认证 4xx 属预期，说明出口+TLS+上游全通）。
-# 5xx 不算应答——经代理时 5xx 主要是 squid 生成的错误页（上游不可达），与 000/超时同属失败（R17）
-# probe_conc <域名> <URL> <探测次数>
-probe_conc() {
-    local host="$1" url="$2" n="${3:-3}"
-    local ok=0 i out code t
-    for i in $(seq 1 "$n"); do
-        out=$(curl -sS -o /dev/null -m 15 -w '%{http_code} %{time_total}' "$url" 2>>"$RESULTS_DIR/upstream-channels.log") \
-            && code=${out%% *} t=${out##* } || { code=ERR t=0; }
-        # curl 失败时 out 为空，补记
-        [ -n "$out" ] || { code=ERR; t=0; }
-        printf '%s\t%s\t%s\t%s\n' "$host" "$code" "$t" "$(date '+%H:%M:%S')" >> "$RESULTS_DIR/upstream-probes.tsv"
-        case "$code" in 2*|3*|4*) ok=$((ok+1)) ;; esac   # 5xx/000/ERR 均不计
+# A/B 探测：同 URL 走 squid（默认 env）与直连（剥代理 env + --noproxy）各 N 次。
+# 成功判据：2xx–4xx（未认证 4xx 属预期，说明出口+TLS+上游全通）；
+# 5xx 不算——经代理时 5xx 主要是 squid 生成的错误页（上游不可达），与超时同属失败。
+# probe_ab <域名> <URL> <每路探测次数>  →  stdout: "squid_ok squid_p50 direct_ok direct_p50"
+# （TSV 头由调用方初始化，本函数只追加；squid 路响应体落 ab-body 供内容抽查）
+probe_ab() {
+    local host="$1" url="$2" n="${3:-5}"
+    local mid=$(( (n + 1) / 2 ))
+    local path ok times=() i out code t
+    for path in squid direct; do
+        ok=0; times=()
+        for i in $(seq 1 "$n"); do
+            if [ "$path" = squid ]; then
+                out=$(curl -sS -o "$RESULTS_DIR/ab-body" -m 15 -w '%{http_code} %{time_total}' "$url" 2>>"$RESULTS_DIR/upstream-channels.log")
+            else
+                # 直连：剥代理 env + --noproxy '*' 双保险（绕开 squid，同出口对比）
+                out=$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+                      curl -sS --noproxy '*' -o /dev/null -m 15 -w '%{http_code} %{time_total}' "$url" \
+                      2>>"$RESULTS_DIR/upstream-channels.log")
+            fi
+            if [ -n "$out" ]; then code=${out%% *} t=${out##* }; else code=ERR; t=15; fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$host" "$path" "$code" "$t" "$(date '+%H:%M:%S')" >> "$RESULTS_DIR/upstream-probes.tsv"
+            case "$code" in 2*|3*|4*) ok=$((ok+1)); times+=("$t") ;; esac
+        done
+        if [ ${#times[@]} -gt 0 ]; then
+            eval "p50_$path=\$(printf '%s\n' \"\${times[@]}\" | sort -n | sed -n ${mid}p)"
+        else
+            eval "p50_$path=15"
+        fi
+        eval "ok_$path=$ok"
     done
-    echo "$ok"
+    echo "$ok_squid ${p50_squid:-15} $ok_direct ${p50_direct:-15}"
+}
+
+# A/B 判定：squid 成功率 ≥ 直连 且 p50 不劣于直连（×1.5 噪声容差）→ PASS，否则 FAIL
+ab_verdict() {   # ab_verdict <host> <s_ok> <s_p50> <d_ok> <d_p50>
+    local host="$1" s_ok="$2" s_p50="$3" d_ok="$4" d_p50="$5"
+    if [ "$s_ok" -lt "$d_ok" ]; then
+        echo "❌ $host：squid 成功 $s_ok/5 < 直连 $d_ok/5 —— 代理引入失败（R17 A/B）"; return 1
+    fi
+    awk -v s="$s_p50" -v d="$d_p50" 'BEGIN{exit !(s <= d*1.5 + 0.1)}' || {
+        echo "❌ $host：squid p50=${s_p50}s 显著劣于直连 p50=${d_p50}s（>1.5×，R17 A/B）"; return 1
+    }
+    if [ "$d_ok" -eq 0 ]; then
+        echo "✅ $host：squid $s_ok/5 p50=${s_p50}s；直连 0/5（出口策略封直连，squid 是唯一通路）"
+    else
+        echo "✅ $host：squid $s_ok/5 p50=${s_p50}s 不劣于直连 $d_ok/5 p50=${d_p50}s（R17 A/B）"
+    fi
+    return 0
 }
 
 # Actions 构件上传/下载通道：productionresultssa3(Azure blob) + results-receiver(GitHub)
 actions-channels() {
     : > "$RESULTS_DIR/upstream-channels.log"
-    printf 'host\tcode\tseconds\tat\n' > "$RESULTS_DIR/upstream-probes.tsv"
-    local fail=0 h ok
+    printf 'host\tpath\tcode\tseconds\tat\n' > "$RESULTS_DIR/upstream-probes.tsv"
+    local fail=0 h r
     for h in productionresultssa3.blob.core.windows.net results-receiver.actions.githubusercontent.com; do
-        ok=$(probe_conc "$h" "https://$h/" 3)
-        case "$ok" in
-            3) echo "✅ $h 通道可达（3/3）" ;;
-            2) echo "⚠️ $h 通道可达但有失败（2/3，1/3 失败率留档怀疑——R17：零散抖动不判 FAIL，速率归 Prometheus）" ;;
-            *) echo "❌ $h 单域集中失败（仅 $ok/3 应答）——出口或上游黑洞（R17）"; fail=1 ;;
-        esac
+        r=$(probe_ab "$h" "https://$h/" 5)
+        ab_verdict "$h" $r || fail=1
     done
     return $fail
 }
 
-# gh-proxy 健康度：真实拉取 + 延迟预算（诊断实测 test 实例 p50 3.2s 已不健康，预算 5s）
+# gh-proxy 健康度：A/B 对照（诊断实测 test 实例 p50 3.2s 已不健康；
+# 同时保留 5s 绝对预算——直连也慢说明是 host 本身的问题，不是 squid 的）
 GHPROXY_URL="${GHPROXY_URL:-https://gh-proxy.test.osinfra.cn}"
 ghproxy-health() {
     # URL 形态对齐 CANN gitconfig insteadOf：<host>/https://github.com/...
     local url="$GHPROXY_URL/https://raw.githubusercontent.com/octocat/Hello-World/master/README"
-    local times=() i out code t ok=0
-    for i in 1 2 3; do
-        out=$(curl -sS -f -m 15 -o "$RESULTS_DIR/ghproxy-readme" -w '%{http_code} %{time_total}' "$url" 2>>"$RESULTS_DIR/ghproxy.log") \
-            && { code=${out%% *} t=${out##* }; } || { code=ERR t=15; }
-        printf 'gh-proxy\t%s\t%s\t%s\n' "$code" "$t" "$(date '+%H:%M:%S')" >> "$RESULTS_DIR/upstream-probes.tsv"
-        if [ "$code" = "200" ] && [ -s "$RESULTS_DIR/ghproxy-readme" ]; then
-            ok=$((ok+1)); times+=("$t")
-        fi
-    done
-    [ "$ok" -eq 3 ] || { echo "❌ gh-proxy 拉取集中失败（$ok/3 成功）——host: $GHPROXY_URL"; return 1; }
-    # p50 = 三次排序取中位
-    local p50=$(printf '%s\n' "${times[@]}" | sort -n | sed -n 2p)
-    awk -v t="$p50" 'BEGIN{exit !(t<=5.0)}' \
-        || { echo "❌ gh-proxy 延迟超预算（p50=${p50}s > 5s 预算）——host: $GHPROXY_URL（R17：test 实例不健康形态）"; return 1; }
-    echo "✅ gh-proxy 健康经 squid 通过（host: $GHPROXY_URL，p50=${p50}s ≤ 5s）"
+    : > "$RESULTS_DIR/ghproxy.log"
+    local r fail=0
+    r=$(probe_ab "gh-proxy" "$url" 5)
+    # 内容抽查：squid 路最后一次拉取物必须非空
+    [ -s "$RESULTS_DIR/ab-body" ] || { echo "❌ gh-proxy 拉取内容为空——host: $GHPROXY_URL"; return 1; }
+    ab_verdict "gh-proxy" $r || fail=1
+    # 绝对预算兜底：A/B 相对判定可能双双都慢（同走坏 host），绝对线防漏
+    local s_p50=$(echo "$r" | awk '{print $2}')
+    awk -v t="$s_p50" 'BEGIN{exit !(t<=5.0)}' || {
+        echo "❌ gh-proxy p50=${s_p50}s 超绝对预算 5s——host 本身不健康: $GHPROXY_URL（R17：test 实例形态）"; fail=1
+    }
+    return $fail
 }
 
 # 静默上游：TCP 可建立但永不响应 → 留档 squid read_timeout 实际形态（R17：数据不判结论）
