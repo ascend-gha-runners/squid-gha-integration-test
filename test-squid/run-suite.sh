@@ -903,10 +903,12 @@ tool-git() {
 # upstream 组 —— 上游通道健康（R17，源自 cn12-001 runbook 诊断）
 #   背景：cn12-001 单 pod 6h 内 17 次 TIMEDOUT，53% 集中在 GitHub Actions
 #   构件通道（出口固有抖动），gh-proxy test 实例 4 次且 p50 3.2s（可修）。
-#   判定原则：单次失败仅记录，单域集中失败（≥2/3）才 FAIL；延迟超预算 FAIL。
+#   判定原则：单次/零散失败仅记录（2/3 带 ⚠️），单域集中失败（≤1/3 应答）才
+#   FAIL；延迟超预算 FAIL。可达=2xx–4xx，5xx（squid 错误页）不算应答。
 # =============================================================================
 
-# 单域集中探测：N 次请求，任何 HTTP 应答（含 4xx）都算"通道可达"（R17：TLS+出口通即可）
+# 单域集中探测：N 次请求。可达判据：2xx–4xx（未认证 4xx 属预期，说明出口+TLS+上游全通）。
+# 5xx 不算应答——经代理时 5xx 主要是 squid 生成的错误页（上游不可达），与 000/超时同属失败（R17）
 # probe_conc <域名> <URL> <探测次数>
 probe_conc() {
     local host="$1" url="$2" n="${3:-3}"
@@ -917,7 +919,7 @@ probe_conc() {
         # curl 失败时 out 为空，补记
         [ -n "$out" ] || { code=ERR; t=0; }
         printf '%s\t%s\t%s\t%s\n' "$host" "$code" "$t" "$(date '+%H:%M:%S')" >> "$RESULTS_DIR/upstream-probes.tsv"
-        case "$code" in ERR|000) : ;; *) ok=$((ok+1)) ;; esac
+        case "$code" in 2*|3*|4*) ok=$((ok+1)) ;; esac   # 5xx/000/ERR 均不计
     done
     echo "$ok"
 }
@@ -929,13 +931,11 @@ actions-channels() {
     local fail=0 h ok
     for h in productionresultssa3.blob.core.windows.net results-receiver.actions.githubusercontent.com; do
         ok=$(probe_conc "$h" "https://$h/" 3)
-        # 未认证请求预期 400/403/404 —— 有 HTTP 应答即通道可达
-        if [ "$ok" -ge 2 ]; then
-            echo "✅ $h 通道可达（$ok/3 次 HTTP 应答）"
-        else
-            echo "❌ $h 单域集中失败（仅 $ok/3 次应答）——出口或上游黑洞（R17）"
-            fail=1
-        fi
+        case "$ok" in
+            3) echo "✅ $h 通道可达（3/3）" ;;
+            2) echo "⚠️ $h 通道可达但有失败（2/3，1/3 失败率留档怀疑——R17：零散抖动不判 FAIL，速率归 Prometheus）" ;;
+            *) echo "❌ $h 单域集中失败（仅 $ok/3 应答）——出口或上游黑洞（R17）"; fail=1 ;;
+        esac
     done
     return $fail
 }

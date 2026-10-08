@@ -144,7 +144,7 @@ GitHub Actions 构件通道（出口固有抖动，代理侧不可修）；gh-pr
 
 | 阶段 | 场景 | 判定 | 规则 |
 |---|---|---|---|
-| `actions-channels` | Actions 构件上传/下载通道各 3 次探测：`productionresultssa3.blob.core.windows.net`（Azure blob 下载）、`results-receiver.actions.githubusercontent.com`（CreateArtifact 上传） | 未认证请求有 HTTP 应答（含 400/403/404）即通道可达；单域 ≥2/3 应答=PASS，否则 FAIL（集中失败=出口/上游黑洞） | R17 |
+| `actions-channels` | Actions 构件上传/下载通道各 3 次探测：`productionresultssa3.blob.core.windows.net`（Azure blob 下载）、`results-receiver.actions.githubusercontent.com`（CreateArtifact 上传） | 可达=2xx–4xx 应答（未认证 4xx 属预期；**5xx 不算**——经代理时 5xx 主要是 squid 错误页，与超时同属失败）。3/3=PASS；2/3=PASS+⚠️（1/3 失败率留档，速率归 Prometheus）；≤1/3=FAIL（集中失败=出口/上游黑洞） | R17 |
 | `ghproxy-health` | gh-proxy（`GHPROXY_URL`，默认 gh-proxy.test.osinfra.cn）真实拉取 octocat README ×3（URL 形态对齐 CANN gitconfig insteadOf） | 3/3 成功且 p50 ≤ 5s=PASS；拉取集中失败或 p50 > 5s=FAIL（3.2s 已属不健康形态） | R17 |
 | `slow-upstream` | 静默上游：本机 python 监听 accept 后不响应，`-x` 强制走 squid 测 read_timeout 实际形态 | 仅数据留档不判结论（CI 时限内无法观测 30min 超时；若 squid 短超时内回 504 说明 fail-fast 已生效） | R17 |
 
