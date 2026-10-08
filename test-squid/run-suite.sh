@@ -346,7 +346,9 @@ conc-mixed() {
         echo "⚪ wget SKIP（镜像无 wget）" >>"$wd/verdict"
     fi
     # 4 curl：API 形态（套件本身依赖 curl，缺失则整体早退，这里不判 SKIP）
-    ( curl -sS --max-time 60 "https://pypi.org/pypi/zstandard/json" -o "$wd/curl.json" >"$wd/curl.log" 2>&1 \
+    #   超时 120s 对齐套件默认：本阶段测"并行互不干扰"非吞吐，
+    #   慢集群（如 cn12-001 出口 ~16KB/s）60s 会误杀近完成的下载
+    ( curl -sS --max-time 120 "https://pypi.org/pypi/zstandard/json" -o "$wd/curl.json" >"$wd/curl.log" 2>&1 \
         && grep -q '"name"' "$wd/curl.json" \
         && echo "✅ curl" >>"$wd/verdict" || echo "❌ curl" >>"$wd/verdict" ) & pids+=($!)
     local i
