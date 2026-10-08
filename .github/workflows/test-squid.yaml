@@ -10,6 +10,8 @@
 #   concurrency —— 同对象阶梯并发、异对象并发、混合工具并行
 #   parity      —— 透明重写同构校验（no-mirror-test tool-17 全量移植：13 规则
 #                  内容签名 + 负样本 + 回归守卫）
+#   upstream    —— 上游通道健康（META R17：Actions 构件通道单域集中失败判据、
+#                  gh-proxy 延迟预算、read_timeout 数据留档）
 #   tools       —— 真实工具链 e2e（no-mirror-test tool-* 移植：零镜像配置，
 #                  HEAVY=1 追加 rustup/conda/cmake/bazel/precommit）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
@@ -248,9 +250,28 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  upstream:
+    name: 上游通道健康（R17：Actions 构件/gh-proxy）
+    # runner 层 only：Actions 构件通道与 gh-proxy 是 runner 环境关心的事，
+    # 与执行层（容器/CA）无关；判定采用单域集中失败 + 延迟预算（META R17）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行上游通道健康检查
+        run: bash test-squid/run-suite.sh --mode upstream
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-upstream
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   summary:
     name: 汇总
-    needs: [function, concurrency, vllm, parity, tools, container-function, container-concurrency, container-vllm, container-tools]
+    needs: [function, concurrency, vllm, parity, tools, upstream, container-function, container-concurrency, container-vllm, container-tools]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -264,7 +285,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-tools \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-tools \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools; do
             if [ -f "$d/timings.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"

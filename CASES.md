@@ -135,6 +135,22 @@ runner 与 CANN 容器层各跑一遍。
 tool-16 yum（GHA/CANN 均 ubuntu，无 openEuler 基底）、tool-17 docker-pull 与
 tool-20 buildkit（需 docker/buildkitd 服务端，机制不同归 e2e 平台测试）。
 
+### upstream 组（上游通道健康，R17，runner 层 only）
+
+源自 cn12-001 runbook 诊断（2026-10-08）：单 pod 6h 内 17 次 TIMEDOUT，53% 集中在
+GitHub Actions 构件通道（出口固有抖动，代理侧不可修）；gh-proxy test 实例 4 次
+超时且实测 p50 3.2s（配置选择问题，可修）。本组把诊断判据固化为自动化测试——
+**单次失败仅记录，单域集中失败才 FAIL**（对齐告警降噪口径 `sum by (host) > 3`）。
+
+| 阶段 | 场景 | 判定 | 规则 |
+|---|---|---|---|
+| `actions-channels` | Actions 构件上传/下载通道各 3 次探测：`productionresultssa3.blob.core.windows.net`（Azure blob 下载）、`results-receiver.actions.githubusercontent.com`（CreateArtifact 上传） | 未认证请求有 HTTP 应答（含 400/403/404）即通道可达；单域 ≥2/3 应答=PASS，否则 FAIL（集中失败=出口/上游黑洞） | R17 |
+| `ghproxy-health` | gh-proxy（`GHPROXY_URL`，默认 gh-proxy.test.osinfra.cn）真实拉取 octocat README ×3（URL 形态对齐 CANN gitconfig insteadOf） | 3/3 成功且 p50 ≤ 5s=PASS；拉取集中失败或 p50 > 5s=FAIL（3.2s 已属不健康形态） | R17 |
+| `slow-upstream` | 静默上游：本机 python 监听 accept 后不响应，`-x` 强制走 squid 测 read_timeout 实际形态 | 仅数据留档不判结论（CI 时限内无法观测 30min 超时；若 squid 短超时内回 504 说明 fail-fast 已生效） | R17 |
+
+runner 层 only 的原因：Actions 构件通道与 gh-proxy 是 runner 环境关心的事，
+与执行层（容器 CA/工具链）无关；且 results-receiver 上传域在容器层无语义。
+
 ## 结论口径
 
 - **PASS**：判定项全部达标（缓存 MISS→HIT 无缓存头等"数据记录"场景不阻断结论，但计入数据）。

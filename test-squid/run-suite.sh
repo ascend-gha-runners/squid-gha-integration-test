@@ -900,6 +900,92 @@ tool-git() {
 }
 
 # =============================================================================
+# upstream 组 —— 上游通道健康（R17，源自 cn12-001 runbook 诊断）
+#   背景：cn12-001 单 pod 6h 内 17 次 TIMEDOUT，53% 集中在 GitHub Actions
+#   构件通道（出口固有抖动），gh-proxy test 实例 4 次且 p50 3.2s（可修）。
+#   判定原则：单次失败仅记录，单域集中失败（≥2/3）才 FAIL；延迟超预算 FAIL。
+# =============================================================================
+
+# 单域集中探测：N 次请求，任何 HTTP 应答（含 4xx）都算"通道可达"（R17：TLS+出口通即可）
+# probe_conc <域名> <URL> <探测次数>
+probe_conc() {
+    local host="$1" url="$2" n="${3:-3}"
+    local ok=0 i out code t
+    for i in $(seq 1 "$n"); do
+        out=$(curl -sS -o /dev/null -m 15 -w '%{http_code} %{time_total}' "$url" 2>>"$RESULTS_DIR/upstream-channels.log") \
+            && code=${out%% *} t=${out##* } || { code=ERR t=0; }
+        # curl 失败时 out 为空，补记
+        [ -n "$out" ] || { code=ERR; t=0; }
+        printf '%s\t%s\t%s\t%s\n' "$host" "$code" "$t" "$(date '+%H:%M:%S')" >> "$RESULTS_DIR/upstream-probes.tsv"
+        case "$code" in ERR|000) : ;; *) ok=$((ok+1)) ;; esac
+    done
+    echo "$ok"
+}
+
+# Actions 构件上传/下载通道：productionresultssa3(Azure blob) + results-receiver(GitHub)
+actions-channels() {
+    : > "$RESULTS_DIR/upstream-channels.log"
+    printf 'host\tcode\tseconds\tat\n' > "$RESULTS_DIR/upstream-probes.tsv"
+    local fail=0 h ok
+    for h in productionresultssa3.blob.core.windows.net results-receiver.actions.githubusercontent.com; do
+        ok=$(probe_conc "$h" "https://$h/" 3)
+        # 未认证请求预期 400/403/404 —— 有 HTTP 应答即通道可达
+        if [ "$ok" -ge 2 ]; then
+            echo "✅ $h 通道可达（$ok/3 次 HTTP 应答）"
+        else
+            echo "❌ $h 单域集中失败（仅 $ok/3 次应答）——出口或上游黑洞（R17）"
+            fail=1
+        fi
+    done
+    return $fail
+}
+
+# gh-proxy 健康度：真实拉取 + 延迟预算（诊断实测 test 实例 p50 3.2s 已不健康，预算 5s）
+GHPROXY_URL="${GHPROXY_URL:-https://gh-proxy.test.osinfra.cn}"
+ghproxy-health() {
+    # URL 形态对齐 CANN gitconfig insteadOf：<host>/https://github.com/...
+    local url="$GHPROXY_URL/https://raw.githubusercontent.com/octocat/Hello-World/master/README"
+    local times=() i out code t ok=0
+    for i in 1 2 3; do
+        out=$(curl -sS -f -m 15 -o "$RESULTS_DIR/ghproxy-readme" -w '%{http_code} %{time_total}' "$url" 2>>"$RESULTS_DIR/ghproxy.log") \
+            && { code=${out%% *} t=${out##* }; } || { code=ERR t=15; }
+        printf 'gh-proxy\t%s\t%s\t%s\n' "$code" "$t" "$(date '+%H:%M:%S')" >> "$RESULTS_DIR/upstream-probes.tsv"
+        if [ "$code" = "200" ] && [ -s "$RESULTS_DIR/ghproxy-readme" ]; then
+            ok=$((ok+1)); times+=("$t")
+        fi
+    done
+    [ "$ok" -eq 3 ] || { echo "❌ gh-proxy 拉取集中失败（$ok/3 成功）——host: $GHPROXY_URL"; return 1; }
+    # p50 = 三次排序取中位
+    local p50=$(printf '%s\n' "${times[@]}" | sort -n | sed -n 2p)
+    awk -v t="$p50" 'BEGIN{exit !(t<=5.0)}' \
+        || { echo "❌ gh-proxy 延迟超预算（p50=${p50}s > 5s 预算）——host: $GHPROXY_URL（R17：test 实例不健康形态）"; return 1; }
+    echo "✅ gh-proxy 健康经 squid 通过（host: $GHPROXY_URL，p50=${p50}s ≤ 5s）"
+}
+
+# 静默上游：TCP 可建立但永不响应 → 留档 squid read_timeout 实际形态（R17：数据不判结论）
+slow-upstream() {
+    local port=$((18080 + RANDOM % 2000))
+    python3 -c "
+import socket,time,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',$port)); s.listen(1)
+c,_=s.accept(); time.sleep(90)
+" > "$RESULTS_DIR/slow-upstream.log" 2>&1 &
+    local pid=$!
+    sleep 1
+    # 显式 -x + 清空 noproxy：127.0.0.1 必须走 squid 才能测到 squid 的 read_timeout
+    local out rc=0
+    out=$(curl -sS --noproxy '' -x "$PX" -m 60 -o /dev/null -w '%{http_code} %{time_total}' "http://127.0.0.1:$port/" 2>&1) || rc=$?
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    printf 'silent-upstream\t%s\t%s\n' "$out" "rc=$rc" >> "$RESULTS_DIR/upstream-probes.tsv"
+    case "$out" in
+        *4*)  echo "⚠️ squid ${out##* }s 内返回 $out（read_timeout 已调短，fail-fast 生效）" ;;
+        *)    echo "⚠️ 60s 内 squid 未裁决（客户端中止 rc=$rc）→ read_timeout 仍为长超时（cn12-001 30min 未调形态），仅留档" ;;
+    esac
+    return 0   # R17：CI 时限内无法观测完整 read_timeout，只做数据留档
+}
+
+# =============================================================================
 # 主流程
 # =============================================================================
 log "== test-squid run-suite mode=$MODE =="
@@ -927,6 +1013,13 @@ elif [ "$MODE" = "parity" ]; then
     run_timed env-snapshot   "$LAYER" env-snapshot
     run_timed meta-trace     "$LAYER" meta-trace
     run_timed rewrite-parity "$LAYER" rewrite-parity
+elif [ "$MODE" = "upstream" ]; then
+    # R17：上游通道健康（runner 层 only——Actions 构件通道/gh-proxy 是 runner 环境关心的事）
+    run_timed env-snapshot      "$LAYER" env-snapshot
+    run_timed meta-trace        "$LAYER" meta-trace
+    run_timed actions-channels  "$LAYER" actions-channels
+    run_timed ghproxy-health    "$LAYER" ghproxy-health
+    run_timed slow-upstream     "$LAYER" slow-upstream
 elif [ "$MODE" = "tools" ]; then
     # pip --user 装的 CLI（uv/modelscope 等）落 ~/.local/bin，极简镜像 PATH 默认不含
     export PATH="$HOME/.local/bin:$PATH"
@@ -950,7 +1043,7 @@ elif [ "$MODE" = "tools" ]; then
         run_timed tool-precommit "$LAYER" tool-precommit
     fi
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | tools）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | tools）" >&2
     exit 2
 fi
 

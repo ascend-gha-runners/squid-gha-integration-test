@@ -93,6 +93,12 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   时，只剥环境壳（k8s Job → workflow step），**业务命令零镜像配置原样保留**；
   工具链缺失（runner 无该工具）记 SKIP（数据），工具在而执行失败记 FAIL。
   环境不可行的用例（yum 需 openEuler、buildkit 需服务端）排除并留档。
+- **R17 上游通道集中失败判据**（2026-10-08，源自 cn12-001 runbook 诊断）：
+  零散上游超时（如 GitHub Actions 构件通道 9/17 次）是出口固有抖动，单次探测
+  失败不得判 FAIL；判 FAIL 只看**单域集中失败**（同域 N 次探测 ≥2/3 失败，
+  对齐告警降噪口径 `sum by (host) > 3`）。通道健康度带延迟预算（gh-proxy
+  p50 > 5s 判 FAIL——test 实例 3.2s 已属不健康）。无法在 CI 时限内观测的
+  squid 行为（read_timeout 30min）只做数据留档不判结论。
 
 ## 六、与两份前作的关系
 
