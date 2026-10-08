@@ -49,6 +49,34 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 3. **仓库 public**：CANN 镜像自带的 gitconfig 会把 github.com 重写到 gh-proxy
    （这是环境正道，保留），public 仓库匿名即可拉取，无需额外凭据。
 
+## 二点五、生产 runner 批量验证
+
+除 gy-006（测试集群）外，其余 runner set 都在生产集群。集群侧注入
+（caNamespaces / env / CA 卷 / postStart）由平台侧维护；验证用批量脚本
+**不需要 kubeconfig**，纯 `gh` 逐个触发 test-squid：
+
+```bash
+# 全部生产 runner 顺序测（每个一个 run，盯完出汇总表，任一非绿退出码 1）
+./test-squid/test-production-runners.sh
+
+# 只测一个 / 只列注册表 / 只触发不等结果
+./test-squid/test-production-runners.sh --only cpu-2-hk001
+./test-squid/test-production-runners.sh --list
+./test-squid/test-production-runners.sh --no-watch
+```
+
+生产 runner 注册表（脚本内 `RUNNERS` 数组维护，单标签数组；多标签是 AND）：
+
+| 标签 | 集群 | 注入状态 |
+|---|---|---|
+| `cpu-2-aiframe` | aiframework | caNamespaces 已有 |
+| `cpu-2-gy003` | gy-003 | caNamespaces 已有，仅注入 |
+| `cpu-2-hk001` | hk-001 | 新增 postStart（原无 lifecycle）；CM 在 `ascend-gha-runners-hk-001` ns |
+| `cpu-2-mind-third` | mind-third-ci | caNamespaces + ascend-gha-runners |
+| `cpu-4-gy004` | gy-004 | caNamespaces 已有，仅注入 |
+| `cpu-8-gy005` | gy-005 | 保留 karpenter 注解；caNamespaces + ascend-gha-runners |
+| `linux-amd64-cpu-4-cn12-001` | cn12-001 | 已注入（2026-10-08，workflow pod 实测 env/CA 卷齐全） |
+
 ## 三、job 结构
 
 | job | 内容 |
