@@ -22,7 +22,7 @@ set -uo pipefail
 
 REPO="${REPO:-ascend-gha-runners/squid-gha-integration-test}"
 WF="test-squid.yaml"
-WATCH_TIMEOUT="${WATCH_TIMEOUT:-2400}"   # 单个 run 最长等待秒数（tools 阶段慢集群可到 ~20min）
+WATCH_TIMEOUT="${WATCH_TIMEOUT:-5400}"   # 单个 run 最长等待秒数（生产集群容器层慢，90min 兜底）
 POLL_INTERVAL=30
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,8 @@ trigger_one() {  # trigger_one <标签> → stdout: run_id
     sleep 10   # 等 GitHub 登记新 run
     after=$(gh run list --repo "$REPO" --workflow "$WF" --limit 30 \
                 --json databaseId --jq '.[].databaseId' 2>/dev/null | sort)
-    id=$(comm -13 <(echo "$before" | tr ',' '\n' | sort) <(echo "$after") | head -1)
+    id=$(comm -13 <(echo "$before" | tr ',' '\n' | sort) <(echo "$after") \
+            | grep -oE '^[0-9]+$' | head -1)   # 只认纯数字 id，防串入其它输出
     [ -n "$id" ] && { echo "$id"; return 0; }
     echo "TRIGGER_FAIL"
     return 1
@@ -173,7 +174,7 @@ for i in "${!LABELS[@]}"; do
         echo "❌ $label  触发失败"
     else
         jobs_summary=$(gh run view "${IDS[$i]}" --repo "$REPO" --json jobs \
-            -q '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .name+"("+.conclusion+")"] | join(", ")' 2>/dev/null)
+            -q '[.jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped") | .name+"("+.conclusion+")"] | join(", ")' 2>/dev/null)
         echo "❌ $label  conclusion=$c  非绿 job: ${jobs_summary:-?}  $url"
         FAIL_COUNT=$((FAIL_COUNT+1))
     fi
