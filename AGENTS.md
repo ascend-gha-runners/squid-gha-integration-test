@@ -65,16 +65,17 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 ./test-squid/test-production-runners.sh --no-watch
 ```
 
-生产 runner 注册表（脚本内 `RUNNERS` 数组维护，单标签数组；多标签是 AND）：
+生产 runner 注册表（脚本内 `RUNNERS` 数组维护；每个 runner 有 3 个可选标签，
+脚本统一用**全局唯一名**做单标签触发，避免多标签 AND 语义）：
 
 | 标签 | 集群 | 注入状态 |
 |---|---|---|
-| `cpu-2-aiframe` | aiframework | caNamespaces 已有 |
-| `cpu-2-gy003` | gy-003 | caNamespaces 已有，仅注入 |
-| `cpu-2-hk001` | hk-001 | 新增 postStart（原无 lifecycle）；CM 在 `ascend-gha-runners-hk-001` ns |
-| `cpu-2-mind-third` | mind-third-ci | caNamespaces + ascend-gha-runners |
-| `cpu-4-gy004` | gy-004 | caNamespaces 已有，仅注入 |
-| `cpu-8-gy005` | gy-005 | 保留 karpenter 注解；caNamespaces + ascend-gha-runners |
+| `linux-amd64-cpu-2-aiframe` | aiframework | caNamespaces 已有 |
+| `linux-amd64-cpu-2-gy003` | gy-003 | caNamespaces 已有，仅注入 |
+| `linux-amd64-cpu-2-hk001` | hk-001 | 新增 postStart（原无 lifecycle）；CM 在 `ascend-gha-runners-hk-001` ns |
+| `linux-amd64-cpu-2-mind-third` | mind-third-ci | caNamespaces + ascend-gha-runners |
+| `linux-amd64-cpu-4-gy004` | gy-004 | caNamespaces 已有，仅注入 |
+| `linux-amd64-cpu-8-gy005` | gy-005 | 保留 karpenter 注解；caNamespaces + ascend-gha-runners |
 | `linux-amd64-cpu-4-cn12-001` | cn12-001 | 已注入（2026-10-08，workflow pod 实测 env/CA 卷齐全） |
 
 ## 三、job 结构

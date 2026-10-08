@@ -26,16 +26,18 @@ WATCH_TIMEOUT="${WATCH_TIMEOUT:-2400}"   # 单个 run 最长等待秒数（tools
 POLL_INTERVAL=30
 
 # ---------------------------------------------------------------------------
-# 生产 runner 注册表（单标签 JSON 数组，多标签是 AND 语义）
+# 生产 runner 注册表。
+#   每个 runner 有 3 个可选标签（arch / 站点 / 全局唯一名），统一用全局
+#   唯一名做单标签触发（避免多标签 AND 语义踩坑）。
 #   标签 | 集群 | 注入状态备注（集群侧变更由平台侧维护，此处仅留档）
 # ---------------------------------------------------------------------------
 RUNNERS=(
-    "cpu-2-aiframe|aiframework|caNamespaces 已有"
-    "cpu-2-gy003|gy-003|caNamespaces 已有，仅注入"
-    "cpu-2-hk001|hk-001|新增 postStart（原无 lifecycle）；CM 在 ascend-gha-runners-hk-001 ns"
-    "cpu-2-mind-third|mind-third-ci|caNamespaces + ascend-gha-runners"
-    "cpu-4-gy004|gy-004|caNamespaces 已有，仅注入"
-    "cpu-8-gy005|gy-005|保留 karpenter 注解；caNamespaces + ascend-gha-runners"
+    "linux-amd64-cpu-2-aiframe|aiframework|caNamespaces 已有"
+    "linux-amd64-cpu-2-gy003|gy-003|caNamespaces 已有，仅注入"
+    "linux-amd64-cpu-2-hk001|hk-001|新增 postStart（原无 lifecycle）；CM 在 ascend-gha-runners-hk-001 ns"
+    "linux-amd64-cpu-2-mind-third|mind-third-ci|caNamespaces + ascend-gha-runners"
+    "linux-amd64-cpu-4-gy004|gy-004|caNamespaces 已有，仅注入"
+    "linux-amd64-cpu-8-gy005|gy-005|保留 karpenter 注解；caNamespaces + ascend-gha-runners"
     "linux-amd64-cpu-4-cn12-001|cn12-001|已注入（workflow pod 实测 env/CA 卷齐全）"
 )
 
