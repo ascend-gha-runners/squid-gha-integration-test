@@ -95,6 +95,15 @@ gy-006 的 squid 启用 `url_rewrite_program`：客户端零镜像配置，官�
 无需容器层重复）。**内容签名层**判定（runner 不挂 squid-config CM，helper 断言层
 不可用——R13 环境边界）；脚本内唯一显式镜像 URL 是负样本（R14）。
 
+**重写策略自适应**（R12 范围注记）：镜像重写是 CN 出口集群的策略；HK 等海外
+出口集群直连 origin 更快，**不配置重写属正常**。parity 用 crates `config.json`
+的 `api/v1/crates`（唯一无歧义的镜像特征，origin 上不存在）自探测本集群策略：
+
+- `rewrite`（CN）：`crates-config-guard` 正向断言——镜像特征必须在（模板漂移报警位，R15）
+- `direct`（HK）：`crates-config-guard` 反向断言——镜像特征必须**缺席**（谁错误地
+  给海外集群加了重写照样红）；其余检查点保持正向（验证直连内容完整性，魔数/共享
+  签名对 origin 同样成立）
+
 | 检查点 | 规则 | 判定（状态码 + 魔数/内容签名） |
 |---|---|---|
 | pypi-simple / pypi-packages（动态取真实 wheel） | 规则1/12：索引页 + files.pythonhosted 对象域 | 200/206 + 相对路径或官方 URL |
@@ -102,7 +111,7 @@ gy-006 的 squid 启用 `url_rewrite_program`：客户端零镜像配置，官�
 | goproxy-list / go-tarball / go-json | 规则5：goproxy.cn 同构 / aliyun tarball / `?mode=json` 分流 | `^v` / gzip / `"` version` JSON（tool-18 事故回归位，R15） |
 | ubuntu-release / ports-release | 规则6：apt host 交换 | `Origin: Ubuntu` |
 | npm-doc / npm-tgz | 规则7：registry.npmmirror host 交换 | `"versions"` / gzip |
-| crates-index / crates-config / crates-static | 规则8：rsproxy sparse index | `"vers"` / `api/v1/crates` 模板漂移守卫（R15）/ gzip |
+| crates-index / crates-config / crates-static | 规则8：rsproxy sparse index | `"vers"` / `api/v1/crates` 模板漂移守卫（R15，**策略自适应**：rewrite 正向 / direct 反向）/ gzip |
 | conda-cloud / conda-pkgs / miniconda | 规则9：nju `/cloud/` 前缀重映射 | HEAD 200（repodata 百 MB 级只探头） |
 | openeuler-repomd | 规则10：yum host 交换 | `<repomd` |
 | rustup-manifest / rustup-init | 规则10a：huaweicloud 固定映射 | `manifest-version` / HEAD 200 |

@@ -79,6 +79,10 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   加速只能来自 squid 服务端 url_rewrite；任何 case 显式写镜像 URL 即违例
   （前车之鉴：tool-hf 曾写死 HF_ENDPOINT=hf-mirror.com，已删；huggingface
   无重写规则，按原套件决策整体排除）。
+  **范围注记（2026-10-08 hk-001 实测修正）**：重写是 CN 出口集群的策略；
+  HK 等海外出口集群直连 origin 更快，不配置重写属正常。同构校验（R13/R15）
+  必须策略自适应：以唯一无歧义的镜像特征（crates `api/v1/crates`）自探测
+  rewrite/direct，direct 集群上该守卫位反向断言（镜像特征必须缺席）。
 - **R13 同构性守护**：每条重写规则都用「官方 URL 经 squid → 验证响应内容形态」
   校验（签名判定：JSON 关键字段 / gzip 魔数 1f8b08 / ELF 魔数 7f454c46 /
   `Origin: Ubuntu` / `<repomd`）。镜像路径不同构（404/错内容）→ FAIL。

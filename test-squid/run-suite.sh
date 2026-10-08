@@ -586,7 +586,30 @@ neg_expect_404() {  # 负样本：故意错误映射，期望 404/403
     esac
 }
 
+ck_get_inv() {  # name url want_code grep_pat —— direct 策略位：镜像特征必须【缺席】
+    local name=$1 url=$2 want=${3:-200} pat=${4:-}
+    local body="$RESULTS_DIR/parity-body" code
+    code=$(curl -sS -L --max-time 90 -r 0-65535 -o "$body" -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    case "$code" in
+        "$want"|206) : ;;
+        *) echo "✗ $name [$url] GET=$code（直连链路异常）"; P_FAIL=$((P_FAIL+1)); return 1 ;;
+    esac
+    if [ -n "$pat" ] && grep -qE "$pat" "$body"; then
+        echo "✗ $name 命中镜像签名 /$pat/（direct 策略下不应重写却重写了，策略漂移）"; P_FAIL=$((P_FAIL+1)); return 1
+    fi
+    echo "✓ $name GET=$code 无镜像签名（direct 直连策略符合预期）"; P_PASS=$((P_PASS+1))
+}
+
 rewrite-parity() {
+    # 策略自探测（R12 范围注记）：CN 出口集群配置镜像重写；HK 等海外出口
+    # 集群策略为 origin 直连（不重写）。crates config.json 的 api/v1/crates
+    # 是唯一无歧义的镜像特征（origin config.json 上不存在），以它判定策略。
+    local policy_code REWRITE_POLICY=rewrite
+    policy_code=$(curl -sS -L --max-time 60 -o "$RESULTS_DIR/parity-policy.json" -w '%{http_code}' \
+        "https://index.crates.io/config.json" 2>>"$RESULTS_DIR/parity.log")
+    grep -q 'api/v1/crates' "$RESULTS_DIR/parity-policy.json" 2>/dev/null || REWRITE_POLICY=direct
+    echo "--- 重写策略探测：$REWRITE_POLICY（config.json GET=$policy_code）---"
+
     echo "--- 规则1/12 pypi → repo.huaweicloud.com/repository/pypi（索引+对象域）---"
     ck_get pypi-simple https://pypi.org/simple/flask/ 200 '' '\.\./\.\./packages/|files\.pythonhosted\.org'
     # 动态取真实 wheel 路径（经 squid 的 simple 页 = 镜像页）
@@ -623,7 +646,12 @@ rewrite-parity() {
 
     echo "--- 规则8 cargo → rsproxy（sparse index + api/v1/crates 守卫 + 对象兜底）---"
     ck_get crates-index https://index.crates.io/se/rd/serde 200 '' '"vers"'
-    ck_get crates-config-guard https://index.crates.io/config.json 200 '' 'api/v1/crates'   # R15：模板漂移报警位
+    # R15 守卫位：rewrite 策略下镜像特征必须在，direct 策略下镜像特征必须不在
+    if [ "$REWRITE_POLICY" = direct ]; then
+        ck_get_inv crates-config-guard https://index.crates.io/config.json 200 'api/v1/crates'
+    else
+        ck_get crates-config-guard https://index.crates.io/config.json 200 '' 'api/v1/crates'
+    fi
     ck_get crates-static https://static.crates.io/crates/serde/serde-1.0.210.crate 200 1f8b08
 
     echo "--- 规则9 conda → nju（/cloud/ 前缀重映射 + pkgs|miniconda）---"
@@ -641,8 +669,8 @@ rewrite-parity() {
     echo "--- 负样本对照（R14）：故意去掉 nju 的 /cloud/ 前缀 → 期望 404/403 ---"
     neg_expect_404 conda-nocloud https://mirror.nju.edu.cn/anaconda/conda-forge/linux-64/repodata.json
 
-    echo "RESULT: pass=$P_PASS fail=$P_FAIL"
-    [ "$P_FAIL" -eq 0 ] && echo "✅ 全部重写映射同构校验通过（$P_PASS 条）"
+    echo "RESULT: pass=$P_PASS fail=$P_FAIL policy=$REWRITE_POLICY"
+    [ "$P_FAIL" -eq 0 ] && echo "✅ 重写同构校验通过（$P_PASS 条，策略=$REWRITE_POLICY）"
 }
 
 
