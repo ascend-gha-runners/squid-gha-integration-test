@@ -345,14 +345,22 @@ conc-mixed() {
     else
         echo "⚪ wget SKIP（镜像无 wget）" >>"$wd/verdict"
     fi
-    # 4 curl：API 形态（套件本身依赖 curl，缺失则整体早退，这里不判 SKIP）
-    #   超时 120s 对齐套件默认：本阶段测"并行互不干扰"非吞吐，
-    #   慢集群（如 cn12-001 出口 ~16KB/s）60s 会误杀近完成的下载
-    ( curl -sS --max-time 120 "https://pypi.org/pypi/zstandard/json" -o "$wd/curl.json" >"$wd/curl.log" 2>&1 \
-        && grep -q '"name"' "$wd/curl.json" \
+    # 4 curl：与 wget 并发拉同一对象 URL_SMALL（~200KB，稳定小载荷）。
+    #   不用 pypi JSON API：pypi host 上 /simple、/packages 是重写域而
+    #   /pypi/*/json 不是，语义易混淆，且 1.17MB 在慢出口上 flaky、覆盖与
+    #   pip worker 冗余。同对象并发（curl+wget）额外覆盖 R8 工具间同键并发，
+    #   结束后 sha256 互校（下方统一做）。
+    ( curl -sS --max-time 120 "$URL_SMALL" -o "$wd/curl.out" >"$wd/curl.log" 2>&1 \
+        && [ -s "$wd/curl.out" ] \
         && echo "✅ curl" >>"$wd/verdict" || echo "❌ curl" >>"$wd/verdict" ) & pids+=($!)
     local i
     for i in "${!pids[@]}"; do wait "${pids[$i]}" || rc=1; done
+    # curl/wget 同对象 sha256 互校（两工具都成功才有意义）
+    if [ -s "$wd/curl.out" ] && [ -s "$wd/wget.out" ] \
+        && [ "$(sha256_of "$wd/curl.out")" != "$(sha256_of "$wd/wget.out")" ]; then
+        echo "❌ curl/wget 同对象 sha256 不一致" >>"$wd/verdict"
+        rc=1
+    fi
     cat "$wd/verdict"
     grep -q '❌' "$wd/verdict" && return 1
     [ $rc -eq 0 ] || return 1
