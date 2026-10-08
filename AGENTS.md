@@ -56,7 +56,7 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 **不需要 kubeconfig**，纯 `gh` 逐个触发 test-squid：
 
 ```bash
-# 全部生产 runner 顺序测（每个一个 run，盯完出汇总表，任一非绿退出码 1）
+# 全部生产 runner 并行测（先全触发、再并行盯，汇总表，任一非绿退出码 1）
 ./test-squid/test-production-runners.sh
 
 # 只测一个 / 只列注册表 / 只触发不等结果

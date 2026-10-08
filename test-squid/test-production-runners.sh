@@ -101,47 +101,81 @@ watch_one() {  # watch_one <run_id>
 }
 
 # ---------------------------------------------------------------------------
-# 主流程：顺序测每个 runner（生产 runner 多为单实例，并行触发只会排队）
+# 主流程：两阶段并行。
+#   阶段 1 逐个触发（gh 调用本身很快）；阶段 2 并行盯所有 run——
+#   七个标签是七个不同集群，互不抢资源，并行总耗时 = 最慢的那个，
+#   串行只会把各集群耗时相加（约 1-2 小时）。
 # ---------------------------------------------------------------------------
-declare -a RESULT_LINES=()
-FAIL_COUNT=0
+declare -a LABELS=() IDS=() URLS=()
+FAIL_TRIGGER=0
 
 for entry in "${RUNNERS[@]}"; do
     label="${entry%%|*}"
     [ -n "$ONLY" ] && [ "$label" != "$ONLY" ] && continue
+    LABELS+=("$label")
+done
 
-    echo ""
-    echo "==================================================================="
-    echo "== $label"
-    echo "==================================================================="
+[ ${#LABELS[@]} -eq 0 ] && { echo "没有匹配的 runner（--only $ONLY）"; exit 2; }
+
+# 阶段 1：全部触发
+echo "== 阶段 1：触发 ${#LABELS[@]} 个 run =="
+for label in "${LABELS[@]}"; do
     run_id=$(trigger_one "$label")
     if [ "$run_id" = "TRIGGER_FAIL" ]; then
-        RESULT_LINES+=("❌ $label  触发失败")
-        FAIL_COUNT=$((FAIL_COUNT+1))
-        continue
-    fi
-    local_url="https://github.com/$REPO/actions/runs/$run_id"
-    echo "run: $local_url"
-
-    if [ "$NO_WATCH" = 1 ]; then
-        RESULT_LINES+=("⏳ $label  已触发（未盯）  $local_url")
-        continue
-    fi
-
-    conclusion=$(watch_one "$run_id")
-    jobs_summary=$(gh run view "$run_id" --repo "$REPO" --json jobs \
-        -q '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .name+"("+.conclusion+")"] | join(", ")' 2>/dev/null)
-    if [ "$conclusion" = "success" ]; then
-        RESULT_LINES+=("✅ $label  全绿  $local_url")
+        echo "❌ $label  触发失败"
+        IDS+=("TRIGGER_FAIL"); URLS+=("")
+        FAIL_TRIGGER=$((FAIL_TRIGGER+1))
     else
-        RESULT_LINES+=("❌ $label  conclusion=$conclusion  非绿 job: ${jobs_summary:-?}  $local_url")
-        FAIL_COUNT=$((FAIL_COUNT+1))
+        echo "⏳ $label  run=$run_id"
+        IDS+=("$run_id"); URLS+=("https://github.com/$REPO/actions/runs/$run_id")
     fi
 done
 
+if [ "$NO_WATCH" = 1 ]; then
+    echo ""
+    echo "== 已触发（--no-watch 不盯结果）=="
+    for i in "${!LABELS[@]}"; do
+        printf '%s\t%s\t%s\n' "${LABELS[$i]}" "${IDS[$i]}" "${URLS[$i]}"
+    done
+    [ "$FAIL_TRIGGER" -eq 0 ] || exit 1
+    exit 0
+fi
+
+# 阶段 2：并行盯（每个 run 一个后台子进程，结论落临时文件）
 echo ""
-echo "==================================================================="
-echo "== 汇总（FAIL_COUNT=$FAIL_COUNT）"
-echo "==================================================================="
-printf '%s\n' "${RESULT_LINES[@]}"
+echo "== 阶段 2：并行盯 ${#LABELS[@]} 个 run（超时 ${WATCH_TIMEOUT}s）=="
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
+for i in "${!LABELS[@]}"; do
+    label="${LABELS[$i]}"; id="${IDS[$i]}"
+    (
+        if [ "$id" = "TRIGGER_FAIL" ]; then
+            echo "TRIGGER_FAIL" > "$TMPD/r$i"
+        else
+            watch_one "$id" > "$TMPD/r$i"
+        fi
+    ) &
+done
+wait
+
+# 汇总（按标签顺序输出）
+FAIL_COUNT=$FAIL_TRIGGER
+echo ""
+echo "== 汇总 =="
+for i in "${!LABELS[@]}"; do
+    label="${LABELS[$i]}"; url="${URLS[$i]}"
+    c=$(cat "$TMPD/r$i" 2>/dev/null || echo "NO_RESULT")
+    if [ "$c" = "success" ]; then
+        echo "✅ $label  全绿  $url"
+    elif [ "$c" = "TRIGGER_FAIL" ]; then
+        echo "❌ $label  触发失败"
+    else
+        jobs_summary=$(gh run view "${IDS[$i]}" --repo "$REPO" --json jobs \
+            -q '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .name+"("+.conclusion+")"] | join(", ")' 2>/dev/null)
+        echo "❌ $label  conclusion=$c  非绿 job: ${jobs_summary:-?}  $url"
+        FAIL_COUNT=$((FAIL_COUNT+1))
+    fi
+done
+echo ""
+echo "FAIL_COUNT=$FAIL_COUNT"
 [ "$FAIL_COUNT" -eq 0 ] || exit 1
