@@ -419,7 +419,10 @@ wait_origin() {  # <port> 经 squid 探活 /health（vllm-ascend conftest 同形
 # vLLM 模型拉取模拟：ModelScope（首选）/ HF（回退）双通道 —— 元数据小文件 +
 # 多 worker 大文件（全量 + Range 断点续传混跑），二轮复拉验证缓存命中
 vllm-model-pull() {
-    local port=18081
+    # 每 run 随机端口：缓存键（含端口的完整 URL）跨 run 永不碰撞——
+    # pod IP 复用时，squid 不会命中上一轮同 URL 的缓存条目（gy-005 2026-10-09
+    # 事故：陈旧 /health 200 骗过探活 → POST 打到未就绪的 origin 全灭）
+    local port=$(( 20000 + RANDOM % 20000 ))
     local mock_dir="/tmp/test-squid-mock/model"
     rm -rf "$mock_dir"
     local run_tag="m-${GITHUB_RUN_ID:-local}-$(date +%s)"
@@ -499,7 +502,7 @@ vllm-model-pull() {
 
 # vLLM API 通信模拟：OpenAI 兼容端点，8 并发流式 POST（经 squid 转发不断流）
 vllm-api-stream() {
-    local port=18082
+    local port=$(( 20000 + RANDOM % 20000 ))   # 同上：随机端口防跨 run 缓存键碰撞
     local mock_dir="/tmp/test-squid-mock/api"
     rm -rf "$mock_dir"
     local pid
