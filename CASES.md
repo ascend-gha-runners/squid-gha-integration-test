@@ -66,21 +66,73 @@ summary job 汇总进 GITHUB_STEP_SUMMARY，artifact 一并上传。
 | `conc-distinct` | F5 | URL 池 + query 变体绕缓存键，聚合吞吐 | 全部 exit=0=PASS | R8.2、R10 |
 | `conc-mixed` | F5 | pip download / git / wget / curl 四类并行 | 四类全绿=PASS | R8.3、R7 |
 
-### vllm 组（mock vLLM 通信）
+### vllm 组（mock vLLM 通信，逐 case 对照 vllm-ascend 真实用例）
 
-模拟 vLLM 生命周期两类真实通信形态，origin 为套件自带 mock（`mock-vllm-origin.py`，
-纯标准库，确定性生成模型文件），流量**显式 `-x` 走 squid**（不受 NO_PROXY 影响）；
+case 设计以 `vllm-ascend` 仓库真实测试用例为蓝本（逐条对照见下文
+「vllm-ascend 真实 case 对照」），origin 为套件自带 mock（`mock-vllm-origin.py`，
+纯标准库，确定性生成模型文件）。**流量路径按真实 CI 形态分流**：
+
+- **模型下载过 squid**（对齐真实 #5：CI 用 `VLLM_USE_MODELSCOPE=True`，`vllm serve`
+  继承注入的 HTTP(S)_PROXY，模型下载确实过代理——这是真实 CI 里唯一过 squid 的路径）
+- **API 通信 127.0.0.1 直连**（对齐真实 #1/#2/#4：server/client 同 pod，API 流量全部
+  localhost，从不过代理——旧版强行塞过 squid 测的是不存在的拓扑，且是无缓存头请求
+  撞 squid 陈旧缓存事故的根源）
+
 两层各跑一遍（`--mode vllm [--container]`）。
 
 | 阶段 | 面 | 场景 | 判定 | 规则 |
 |---|---|---|---|---|
-| `meta-trace` | — | 同功能组元自检（mock 流量同样必须经 squid） | FAIL 整套作废 | R11、R3 |
-| `vllm-model-pull` | F5/F3 | **HF hub 下载形态**：元数据顺序拉（config/tokenizer）+ 4 worker 并行权重（2 全量 sha256 对 manifest + 2 Range 半拉断点续传）；热复拉验缓存命中 | 完整性一票否决=PASS/FAIL；命中仅记录 | R8、R2、R4 |
-| `vllm-api-stream` | F5/F1 | **OpenAI 兼容 API 形态**：8 并发流式 POST（SSE 8 chunk + [DONE] 完整性）+ 非流式 + /v1/models；验证 squid 转发 POST/SSE 不断流不缓存 | 全绿=PASS | R8.3、R1、R7 |
+| `meta-trace` | — | 同功能组元自检（验证 runner 注入环境本身） | FAIL 整套作废 | R11、R3 |
+| `vllm-model-pull` | F5/F3 | **模型下载形态（真实 #5）**：ModelScope `repo?Revision=$run_tag&FilePath=…` + HF `resolve/$run_tag/` 双通道（Revision 段 run 唯一——真实 ModelScope/HF 的 URL 本就是 Revision/commit 内容寻址，缓存键跨 run 不撞）；元数据顺序拉 + 4 worker 并行权重（2 全量 sha256 对 manifest + 2 Range 半拉断点续传）；热复拉冷拉同 URL 验缓存命中 | 完整性一票否决=PASS/FAIL；命中仅记录 | R8、R2、R4 |
+| `vllm-api-stream` | F5/F1 | **OpenAI 兼容 API 形态（真实 #1/#2/#3/#4，127.0.0.1 直连不过 squid）**：8 并发流式 POST（SSE 8 chunk + [DONE] 完整性）+ /v1/models + X-Request-ID 三断言（非流式响应 id=`chatcmpl-{ID}` 回显 endswith、流式 chunk id 透传 + [DONE]、重复 ID 三连发各 200/400——vLLM DuplicateRequestError 形态，allow_400 语义对齐 test_request_id.py 2×2×2 矩阵） | 全绿=PASS | R8.3、R7 |
 
-mock 说明：模型文件按 tag+块序号哈希确定性生成（16MB+8MB 权重），每 run 用
-`$GITHUB_RUN_ID` 唯一 tag → 冷拉必 MISS、热复拉可观测 HIT；origin 服务在阶段内
-起停（失败不传染，R7）。本地无代理 env 时自动直连并记 SKIP（只验 mock 逻辑）。
+mock 说明：模型文件按 tag+块序号哈希确定性生成（16MB+8MB 权重），run tag 同时进
+**文件内容**与 **URL Revision 段**（内容寻址）→ 同 run 冷拉 MISS、热复拉同 URL 可
+观测 HIT、跨 run 缓存键不撞；origin 服务在阶段内起停（失败不传染，R7）；探活与
+API 阶段 127.0.0.1 直连（对齐真实拓扑）。本地无代理 env 时 model-pull 自动直连
+（只验 mock 逻辑，缓存/代理行为不判）。
+
+#### vllm-ascend 真实 case 对照（2026-10-09 取证 `../vllm-ascend-forked`）
+
+原则：**每条 mock case 必须指到 vllm-ascend 仓库的真实用例**，形态保真优先。
+下表保真度为取证时点状态（#1/#3 的偏离已在下文修正清单落地）。
+
+| # | 真实 case | 它做什么 | 我们对应阶段 | 保真度 |
+|---|---|---|---|---|
+| 1 | `e2e/conftest.py:337,393-445` | RemoteOpenAIServer `vllm serve` 子进程，循环 `requests.get http://127.0.0.1:8000/health` 直到 200（5s 间隔） | `wait_origin` 探活 | ⚠️ 语义同（GET /health 轮询到 200），旧版路径不同：真实是 localhost 直连，我们曾绕 squid 打 pod IP（已修正为直连） |
+| 2 | `weekly/single_node/engine_func_test_robot/tests/test_*.py`（temperature/max_tokens/stop 等十几个） | 原生 requests `POST /v1/chat/completions`，断言 200 + SSE [DONE] + finish_reason，绝大多数 stream=True | `vllm-api-stream` 流式 POST | ✅ 形态一致（断言 8 chunk + [DONE]） |
+| 3 | `.../test_request_id.py:9,78` | X-Request-ID 透传 + 重复 ID → 400，3 worker，同步+流式 | 非流式 POST 的 X-Request-Id 回显 | ⚠️ 旧版只做了回显半件事，没做重复 ID→400（已补齐三断言） |
+| 4 | `features/structured_output/test_openai_api.py:41-75` | openai SDK，32 请求 / 8 worker，流式+非流式混合 | 8 并发流式 POST | ✅ 并发规模直接对齐 |
+| 5 | 模型下载：`VLLM_USE_MODELSCOPE=True`（`_e2e_nightly_single_node_models.yaml:85`）→ `vllm serve` 继承 env 内部下载 | ModelScope/HF 客户端路径下载 | `vllm-model-pull`（ModelScope repo API + HF resolve + Range 续传 + 4 并行） | ✅ 下载形态复刻；**真实 CI 里这是唯一存在代理的路径**（`vllm serve` 继承注入的 HTTP(S)_PROXY，下载确实过 squid） |
+| 6 | `ut/proxy/test_load_balance_proxy_server.py:26-30` | 他们自己的 load-balance proxy 起在 127.0.0.1:19080，mock 后端 127.0.0.1:19001/19002，脚本化 SSE + 死后端注入 | （无对应——我们用 squid 替代了他们的 proxy 角色） | ⚠️ 真实 proxy 测试全程 loopback，从不按 pod IP 寻址后端 |
+| 7 | `one_card/rlhf/`：/sleep /wake_up /pause /resume /metrics 生命周期 | NPU 特有控制面 | 无 | 按约定 mock NPU case 跳过 |
+
+#### 对照暴露的三个偏离（均为旧版 case 设计问题）
+
+1. **#1 探活 + #2/#4 客户端**：真实 case 全部 **localhost 直连**
+   （127.0.0.1/localhost:8000/8770），无代理。旧版把 API 流量强行塞过 squid
+   （pod IP + `-x`）——测的是真实 CI 不存在的拓扑，且是无缓存头请求撞 squid
+   陈旧缓存事故（gy-005/gy003：`TCP_REFRESH_FAIL_OLD_ABORTED` 假阳性探活 →
+   POST 打到未就绪 origin 全灭）的根源。
+2. **#5 下载**：这条**真实过代理**（env 继承），mock 过 squid 反而是保真的——
+   但旧版 URL 跨 run 不变（固定 18081 + 固定路径）而内容跨 run 变（run_tag 只进
+   生成字节不进 URL），无缓存头响应撞 cache key → 跨 run 污染。真实 ModelScope
+   URL 带 `Revision=`、HF 带 `resolve/{rev}/` 内容寻址段。
+3. **#3 X-Request-ID**：真实 case 还断言重复 ID → 400，旧版没做。
+
+#### 修正清单（已实施）
+
+- **api-stream**：base 改 `http://127.0.0.1:$port`、全部请求裸 curl 去 `-x`
+  （对齐 #1/#2/#4 真实形态）→ 撞缓存从机制上消失；新增 X-Request-ID 三断言
+  （补齐 #3）：非流式 id endswith `chatcmpl-squid-it-req-42`、流式 chunk id
+  endswith `chatcmpl-stream-rid-7` + [DONE]、重复 ID 三连发各响应 200/400 均合法
+  （allow_400：并发下取决于重复请求是否赶在首个完成前到达）
+- **model-pull**：保持过 squid（对齐 #5 真实代理路径）；mock URL 加 run 唯一
+  Revision 路径段（`Revision=$run_tag` / `resolve/$run_tag/`，对齐真实内容寻址
+  URL）；热复拉改拉冷拉同 URL（旧版用冷拉从未拉过的 `/models/…` 路径——同 run
+  内必 MISS，观测到的"命中"全是跨 run 污染）
+- **wait_origin**：127.0.0.1 直连探活（对齐 #1）——探活是脚手架不是被测流量，
+  直连才不会被 squid 陈旧缓存条目假阳性
 
 ### container 层追加检查
 

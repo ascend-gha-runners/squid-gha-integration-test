@@ -10,7 +10,9 @@
 #      （huggingface_hub/modelscope 客户端的断点续传形态）。
 #   2. OpenAI 兼容 API：GET /health（conftest 探活端点）、/v1/models、
 #      POST /v1/chat/completions（stream → SSE 逐 token + [DONE]，chunk 含
-#      stop_reason 字段；请求/响应携带 X-Request-Id）。
+#      stop_reason 字段）。X-Request-ID 语义对齐 test_request_id.py：
+#      响应 id = "chatcmpl-" + 客户端 ID（回显）；同一 ID 重复提交 → 400
+#      （vLLM DuplicateRequestError 形态，进程级去重 + 线程锁）。
 #   注：HCCL/RDMA/KV-cache 传输为 NPU 私网 P2P，不经 HTTP 代理，不在模拟范围。
 #
 # 模型文件内容确定性生成（按 tag+块序号哈希扩展），同 tag 重启 sha256 不变；
@@ -21,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 模型仓库清单：文件名 → 大小（vLLM 拉模型的典型构成）
@@ -63,6 +66,8 @@ def build_repo(root: str, tag: str) -> None:
 class Handler(BaseHTTPRequestHandler):
     serve_dir = "/tmp/mock-vllm-repo"
     protocol_version = "HTTP/1.1"
+    _rid_lock = threading.Lock()
+    _rid_seen = set()   # 已受理的 X-Request-Id（进程级；对齐 vLLM 重复提交 → 400）
 
     def log_message(self, fmt, *args):  # 静默默认访问日志（套件日志已经很吵）
         pass
@@ -146,7 +151,18 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             return self._json({"error": "bad json"}, 400)
         n = int(body.get("max_tokens", 8))
-        cid = "chatcmpl-mock-vllm"
+        # X-Request-ID 透传语义（对齐 vllm-ascend engine_func_test_robot/test_request_id.py）：
+        #   1. 响应 id = "chatcmpl-" + 客户端 ID（断言 endswith）
+        #   2. 同一 ID 重复提交 → 400（vLLM DuplicateRequestError 形态；
+        #      真实 case 的 allow_400：重复 ID 被拒属合法行为）
+        rid = self.headers.get("X-Request-Id")
+        if rid:
+            with self._rid_lock:
+                if rid in self._rid_seen:
+                    return self._json({"error": {"code": 400,
+                                                 "message": f"duplicate request id: {rid}"}}, 400)
+                self._rid_seen.add(rid)
+        cid = f"chatcmpl-{rid}" if rid else "chatcmpl-mock-vllm"
         if body.get("stream"):
             # SSE 形态：逐 token 分块（delta.content，finish_reason/stop_reason 均为
             # null 的中间块），结尾 [DONE]；与 vllm-ascend 仓库内 OpenAI server

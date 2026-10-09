@@ -407,10 +407,13 @@ px_curl() {  # px_curl <curl 参数…>（无代理 env 时去掉 -x，本地冒
     fi
 }
 
-wait_origin() {  # <port> 经 squid 探活 /health（vllm-ascend conftest 同形态），10s 不通视为失败
-    local url="http://$(origin_host):$1/health" i
+wait_origin() {  # <port> 本机直连探活 /health —— 对齐 vllm-ascend e2e/conftest.py:337
+                 # （requests.get http://127.0.0.1:8000/health 轮询到 200）。
+                 # 探活是脚手架不是被测流量：直连才不会被 squid 的陈旧缓存条目
+                 # 假阳性（gy-005/gy003 事故形态），10s 不通视为失败
+    local url="http://127.0.0.1:$1/health" i
     for i in $(seq 1 10); do
-        px_curl "$url" 2>/dev/null | grep -q '"ok"' && return 0
+        curl -sS --max-time 5 "$url" 2>/dev/null | grep -q '"ok"' && return 0
         sleep 1
     done
     return 1
@@ -441,8 +444,10 @@ vllm-model-pull() {
     t0=$(date +%s)
     # 元数据（顺序，ModelScope 通道——vllm-ascend CI 首选 modelscope download）
     local f rc=0 ms_base hf_base
-    ms_base="$base/api/v1/models/qwen/mock-vllm/repo?Revision=master&FilePath="
-    hf_base="$base/qwen/mock-vllm/resolve/main/"
+    # Revision / resolve rev 带 run 唯一段（真实 ModelScope repo?Revision=… /
+    # HF resolve/{rev}/ 本就是内容寻址）→ 缓存键跨 run 不撞，且同 tag 内容可复现
+    ms_base="$base/api/v1/models/qwen/mock-vllm/repo?Revision=$run_tag&FilePath="
+    hf_base="$base/qwen/mock-vllm/resolve/$run_tag/"
     for f in config.json tokenizer.json; do
         px_curl -L -o "$RESULTS_DIR/vllm-$f" "$ms_base$f" || rc=1
     done
@@ -480,7 +485,10 @@ vllm-model-pull() {
     echo "--- 热复拉（同对象重下，验证 squid 缓存命中）---"
     local hdr wall_b
     t0=$(date +%s)
-    hdr=$(px_curl -L -D - -o "$RESULTS_DIR/vllm-hot.bin" "$base/models/model-00001-of-00002.safetensors" | tr -d '\r')
+    # 复拉冷拉阶段的同一个 URL（同 cache key 才可能 HIT）。旧实现用冷拉从未
+    # 拉过的 /models/… 路径——同 run 内必 MISS，观测到的"命中"全是跨 run 污染
+    hdr=$(px_curl -L -D - -o "$RESULTS_DIR/vllm-hot.bin" \
+        "$ms_base/model-00001-of-00002.safetensors" | tr -d '\r')
     wall_b=$(( $(date +%s) - t0 ))
     expect=$(python3 -c "import json;print(json.load(open('$manifest'))['model-00001-of-00002.safetensors'])")
     h=$(sha256_of "$RESULTS_DIR/vllm-hot.bin")
@@ -497,7 +505,11 @@ vllm-model-pull() {
     echo "✅ vLLM 模型拉取模拟通过（mock origin 已停）"
 }
 
-# vLLM API 通信模拟：OpenAI 兼容端点，8 并发流式 POST（经 squid 转发不断流）
+# vLLM API 通信模拟：OpenAI 兼容端点，同 pod 127.0.0.1 直连 —— 形态对齐真实
+# vllm-ascend CI（e2e/conftest.py RemoteOpenAIServer + engine_func_test_robot 各
+# test_*：server/client 同 pod，API 流量全部 localhost 直连、从不过代理）。
+# 早期版本强行走 squid（pod IP + -x）测的是真实 CI 不存在的拓扑，且是无缓存头
+# POST/GET 撞 squid 陈旧缓存事故的根源——已按对照表纠正（见 CASES.md vllm 组）
 vllm-api-stream() {
     local port=18082
     local mock_dir="/tmp/test-squid-mock/api"
@@ -508,17 +520,17 @@ vllm-api-stream() {
         kill "$pid" 2>/dev/null
         echo "❌ mock origin 起不来"; return 1
     fi
-    local base="http://$(origin_host):$port"
-    [ -z "$PX" ] && echo "⚠️ 无代理 env（本地冒烟）：直连 origin 仅验证 mock 逻辑"
+    # 同 pod 直连（对齐 conftest.py:337 http://127.0.0.1:8000/health 的 localhost 形态）
+    local base="http://127.0.0.1:$port"
 
-    echo "--- GET /v1/models ---"
-    px_curl "$base/v1/models" | grep -q '"mock-vllm-model"' || { echo "❌ /v1/models 异常"; kill "$pid" 2>/dev/null; return 1; }
+    echo "--- GET /v1/models（localhost 直连，原生 requests 形态）---"
+    curl -sS --max-time 60 "$base/v1/models" | grep -q '"mock-vllm-model"' || { echo "❌ /v1/models 异常"; kill "$pid" 2>/dev/null; return 1; }
 
-    echo "--- 8 并发流式 POST /v1/chat/completions（SSE 完整性：8 chunk + [DONE]）---"
+    echo "--- 8 并发流式 POST /v1/chat/completions（SSE 完整性：8 chunk + [DONE]；规模对齐 structured_output 32req/8worker）---"
     local wd="$RESULTS_DIR/vllm-api"; rm -rf "$wd"; mkdir -p "$wd"
     local pids=() i
     for i in $(seq 1 8); do
-        ( px_curl -N -X POST -H 'Content-Type: application/json' \
+        ( curl -sS --max-time 60 -N -X POST -H 'Content-Type: application/json' \
             -d '{"model":"mock-vllm-model","stream":true,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' \
             "$base/v1/chat/completions" > "$wd/s$i.out" 2>&1 \
           && [ "$(grep -c '^data: {' "$wd/s$i.out")" -eq 8 ] \
@@ -528,16 +540,50 @@ vllm-api-stream() {
     local rc=0 j
     for j in "${!pids[@]}"; do wait "${pids[$j]}" || rc=1; done
     cat "$wd/verdict"
-    # 非流式对照（完整 JSON 一发，带 X-Request-Id——vllm-ascend 代理层真实形态）并验证回显
-    px_curl -D "$RESULTS_DIR/vllm-api-headers" -X POST -H 'Content-Type: application/json' \
+
+    # X-Request-ID 语义三断言（对齐 engine_func_test_robot/test_request_id.py 的
+    # 2×2×2 矩阵：透传回显 endswith + 重复 ID → 400）
+    echo "--- 非流式 POST 带 X-Request-Id（响应 id = chatcmpl-{ID} 回显）---"
+    curl -sS --max-time 60 -X POST -H 'Content-Type: application/json' \
         -H 'X-Request-Id: squid-it-req-42' \
         -d '{"model":"mock-vllm-model","stream":false,"temperature":0.7,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' \
-        "$base/v1/chat/completions" | grep -q '"finish_reason"' || { echo "❌ 非流式异常"; kill "$pid" 2>/dev/null; return 1; }
-    grep -qi '^x-request-id:' "$RESULTS_DIR/vllm-api-headers" || { echo "❌ 响应缺 X-Request-Id"; kill "$pid" 2>/dev/null; return 1; }
+        "$base/v1/chat/completions" > "$wd/nostream.json"
+    grep -Eq '"id": *"chatcmpl-squid-it-req-42"' "$wd/nostream.json" \
+        || { echo "❌ 非流式响应 id 未回显 X-Request-Id"; kill "$pid" 2>/dev/null; return 1; }
+    grep -q '"finish_reason"' "$wd/nostream.json" || { echo "❌ 非流式异常"; kill "$pid" 2>/dev/null; return 1; }
+    echo "✅ 非流式 id 回显"
+
+    echo "--- 流式 POST 带 X-Request-Id（chunk id 透传 + [DONE]）---"
+    curl -sS --max-time 60 -N -X POST -H 'Content-Type: application/json' \
+        -H 'X-Request-Id: stream-rid-7' \
+        -d '{"model":"mock-vllm-model","stream":true,"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}' \
+        "$base/v1/chat/completions" > "$wd/rid-stream.out"
+    grep -Eq '"id": *"chatcmpl-stream-rid-7"' "$wd/rid-stream.out" \
+        && grep -q 'data: \[DONE\]' "$wd/rid-stream.out" \
+        || { echo "❌ 流式 chunk id 未透传或流不完整"; kill "$pid" 2>/dev/null; return 1; }
+    echo "✅ 流式 id 透传"
+
+    echo "--- 重复 X-Request-Id 三连发（重复提交 → 400，vLLM DuplicateRequestError；allow_400：200/400 均合法）---"
+    local dup_pids=() k code
+    for k in 1 2 3; do
+        ( curl -sS --max-time 60 -o "$wd/dup$k.json" -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' -H 'X-Request-Id: dup-rid-9' \
+            -d '{"model":"mock-vllm-model","stream":false,"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}' \
+            "$base/v1/chat/completions" > "$wd/dup$k.code" ) & dup_pids+=($!)
+    done
+    for k in "${!dup_pids[@]}"; do wait "${dup_pids[$k]}" || rc=1; done
+    for k in 1 2 3; do
+        code=$(cat "$wd/dup$k.code" 2>/dev/null)
+        case "$code" in
+            200|400) echo "✅ dup$k → $code（合法）" ;;
+            *) echo "❌ dup$k → ${code:-无}（期望 200 或 400）"; rc=1 ;;
+        esac
+    done
+
     if grep -q '❌' "$wd/verdict"; then kill "$pid" 2>/dev/null; return 1; fi
     [ "$rc" -eq 0 ] || { kill "$pid" 2>/dev/null; return 1; }
     kill "$pid" 2>/dev/null
-    echo "✅ vLLM API 通信模拟通过（8 并发流式经 squid 无断流）"
+    echo "✅ vLLM API 通信模拟通过（8 并发流式直连无断流 + X-Request-ID 语义全量）"
 }
 
 # =============================================================================
