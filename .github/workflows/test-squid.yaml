@@ -309,7 +309,7 @@ jobs:
 
       - name: 运行 MISS p95 假慢复现（容器层）
         run: |
-          PX="${HTTP_PROXY:-${http_proxy:-}}" \
+          PX="${HTTP_PROXY:-${http_proxy:-}}" GROUP=container \
           bash test-squid/repro-miss-p95.sh
 
       - name: 上传结果

@@ -27,6 +27,7 @@ N_FAST=90                 # 快流量样本数
 N_BLOB=5                  # 慢 blob 样本数
 N_POLL=7                  # 长轮询样本数（占比 ≥5.5% 才能顶进 p95）
 RESULTS=${RESULTS:-/tmp/repro-miss-p95}
+T0=$(date +%s)
 
 mkdir -p "$RESULTS"
 
@@ -143,4 +144,10 @@ else
     echo "❌ 未复现（all=$P95_ALL excl=$P95_EXCL poll_med=$P95_POLL）——检查 origin.log 与 probes.tsv"
     FAIL=1
 fi
+
+# ---------- timings.tsv（对齐套件口径 phase/seconds/status/group，汇总表统一收录）----------
+WALL=$(( $(date +%s) - T0 ))
+printf 'phase\tseconds\tstatus\tgroup\n' > "$RESULTS/timings.tsv"
+printf 'miss-p95\t%s\t%s\t%s\n' "$WALL" "$FAIL" "${GROUP:-runner}" >> "$RESULTS/timings.tsv"
+
 exit $FAIL
