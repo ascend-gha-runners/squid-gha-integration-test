@@ -86,22 +86,30 @@ probe() {  # <url> <tag> → 追加 elapsed ms 到 TSV
         -o /dev/null -w '%{time_total}' "$1" 2>/dev/null)
     echo -e "$2\t$(awk -v s="$t" 'BEGIN{printf "%d", s*1000}')" >> "$RESULTS/probes.tsv"
 }
+# warmup 直连探活（脚手架；正式流量走 $BASE=pod IP —— squid 模式下 127.0.0.1
+# 是 squid 自己的 loopback，回源连不到本 pod 的 mock origin）
 probe "http://127.0.0.1:$PORT/fast" warmup
 
-# fast ×90（xargs -P10 并发）
+# fast ×90（xargs -P10 并发）；URL host 必须用 pod IP（$BASE），
+# 经 squid 时 127.0.0.1 会连到 squid 自身 loopback（curl -x 语义）
+# 注：xargs bash -c 只继承函数体（declare -f），PXARG 数组须按传入的 PX 重建，
+# 否则 squid 模式下 -x 参数静默丢失（直连冒烟测不出）
 seq 1 "$N_FAST" | xargs -P 10 -I{} bash -c \
-    "$(declare -f probe); PX='${PX:-}'; PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
-     probe \"http://127.0.0.1:$PORT/fast?i={}\" fast"
+    "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
+     PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
+     probe \"$BASE/fast?i={}\" fast"
 
 # blob ×5（模拟 5% 冷拉抖动）
 seq 1 "$N_BLOB" | xargs -P 5 -I{} bash -c \
-    "$(declare -f probe); PX='${PX:-}'; PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
-     probe \"http://127.0.0.1:$PORT/blob?i={}\" blob"
+    "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
+     PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
+     probe \"$BASE/blob?i={}\" blob"
 
 # poll ×7 并发（broker 长轮询形态）
 seq 1 "$N_POLL" | xargs -P "$N_POLL" -I{} bash -c \
-    "$(declare -f probe); PX='${PX:-}'; PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
-     probe \"http://127.0.0.1:$PORT/poll?i={}\" poll"
+    "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
+     PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
+     probe \"$BASE/poll?i={}\" poll"
 
 # ---------- p95 三口径（模拟 mtail 滚动窗 MISS p95 计算方式） ----------
 p95() { sort -n "$1" | awk -v q="$2" '{a[NR]=$1} END{print a[int(NR*q)]}'; }

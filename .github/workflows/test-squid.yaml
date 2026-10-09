@@ -12,6 +12,8 @@
 #                  内容签名 + 负样本 + 回归守卫）
 #   upstream    —— 上游通道健康（META R17：Actions 构件通道单域集中失败判据、
 #                  gh-proxy 延迟预算、read_timeout 数据留档）
+#   miss-p95    —— SquidMissP95Slow 告警假慢复现（broker 长轮询 hold 顶爆
+#                  MISS p95 的口径缺陷，test-squid/repro-miss-p95.sh）
 #   tools       —— 真实工具链 e2e（no-mirror-test tool-* 移植：零镜像配置，
 #                  HEAVY=1 追加 rustup/conda/cmake/bazel/precommit）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
@@ -269,9 +271,34 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  miss-p95:
+    name: MISS p95 假慢复现（broker 长轮询诊断）
+    # 2026-10-09 SquidMissP95Slow 告警诊断的复现场景：GHA runner 保活长轮询
+    # （broker.actions.githubusercontent.com）hold ~57s 才回，占比 >5% 即把
+    # 滚动窗 MISS p95 钉在 hold 值上（aiframework p95=57.44813 两分片同值）。
+    # mock origin 复刻 fast/blob(10-12s)/poll(57s hold) 三形态经 squid 打点，
+    # 断言"全量 p95 落 hold 区间 + 排除 poll 后健康"（test-squid/repro-miss-p95.sh）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行 MISS p95 假慢复现
+        # squid 地址来自 pod 注入的 env（workflow 内不配置代理——被测对象本身）
+        run: |
+          PX="${HTTP_PROXY:-${http_proxy:-}}" \
+          bash test-squid/repro-miss-p95.sh
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-miss-p95
+          path: /tmp/repro-miss-p95/
+          if-no-files-found: warn
+
   summary:
     name: 汇总
-    needs: [function, concurrency, vllm, parity, tools, upstream, container-function, container-concurrency, container-vllm, container-tools]
+    needs: [function, concurrency, vllm, parity, tools, upstream, miss-p95, container-function, container-concurrency, container-vllm, container-tools]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -285,12 +312,12 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-tools \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-tools test-squid-miss-p95 \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools; do
-            if [ -f "$d/timings.tsv" ]; then
+            if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
-              cat "$d/timings.tsv" >> "$GITHUB_STEP_SUMMARY"
+              cat "$d/timings.tsv" "$d/probes.tsv" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
             fi
           done
