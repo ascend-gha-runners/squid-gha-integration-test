@@ -296,9 +296,33 @@ jobs:
           path: /tmp/repro-miss-p95/
           if-no-files-found: warn
 
+  container-miss-p95:
+    name: 容器层·MISS p95 假慢复现（CANN 镜像）
+    # 告警里的 MISS 流量负载（artifact 上传/长轮询等）实际在用户容器里产生，
+    # 容器层验证同一复现链（squid 回源 pod IP + CA/工具链差异不参与本场景，
+    # 但多验一层执行形态与套件其余组保持两层对称）
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行 MISS p95 假慢复现（容器层）
+        run: |
+          PX="${HTTP_PROXY:-${http_proxy:-}}" \
+          bash test-squid/repro-miss-p95.sh
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-squid-container-miss-p95
+          path: /tmp/repro-miss-p95/
+          if-no-files-found: warn
+
   summary:
     name: 汇总
-    needs: [function, concurrency, vllm, parity, tools, upstream, miss-p95, container-function, container-concurrency, container-vllm, container-tools]
+    needs: [function, concurrency, vllm, parity, tools, upstream, miss-p95, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -313,7 +337,7 @@ jobs:
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
           for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-tools test-squid-miss-p95 \
-                   test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools; do
+                   test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
