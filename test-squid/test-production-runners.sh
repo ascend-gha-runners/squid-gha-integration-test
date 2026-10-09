@@ -62,12 +62,16 @@ fi
 command -v gh >/dev/null || { echo "❌ 需要 gh CLI"; exit 2; }
 
 # ---------------------------------------------------------------------------
-# 触发一个 runner 的 test-squid，返回新 run id（用触发前后 run 集合差集防撞车）
+# 触发一个 runner 的 test-squid，返回新 run id
+# 判定口径：createdAt >= 本轮触发时刻（cutoff）且未被此前触发认领。
+# 不用「前后差集」：gh 的 run 登记有秒级延迟，上一轮触发的 run 可能迟到
+# 混进下一轮的差集窗口（2026-10-09 实测 7 连发时 cn12-001 的 id 被拼脏）。
 # ---------------------------------------------------------------------------
+CLAIMED=" "   # 已认领 run id（空格分隔，跨 trigger_one 累积）
+
 trigger_one() {  # trigger_one <标签> → stdout: run_id
-    local label="$1" before after id
-    before=$(gh run list --repo "$REPO" --workflow "$WF" --limit 30 \
-                 --json databaseId --jq '.[].databaseId' 2>/dev/null | sort | tr '\n' ',')
+    local label="$1" cutoff id i
+    cutoff=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     local extra=()
     [ -n "$HEAVY" ]  && extra+=(-f heavy="$HEAVY")
     [ -n "$LADDER" ] && extra+=(-f ladder="$LADDER")
@@ -76,12 +80,17 @@ trigger_one() {  # trigger_one <标签> → stdout: run_id
         echo "TRIGGER_FAIL"
         return 1
     fi
-    sleep 10   # 等 GitHub 登记新 run
-    after=$(gh run list --repo "$REPO" --workflow "$WF" --limit 30 \
-                --json databaseId --jq '.[].databaseId' 2>/dev/null | sort)
-    id=$(comm -13 <(echo "$before" | tr ',' '\n' | sort) <(echo "$after") \
-            | grep -oE '^[0-9]+$' | head -1)   # 只认纯数字 id，防串入其它输出
-    [ -n "$id" ] && { echo "$id"; return 0; }
+    # 轮询等 GitHub 登记新 run（最多 60s）
+    for i in $(seq 1 12); do
+        sleep 5
+        id=$(gh run list --repo "$REPO" --workflow "$WF" --limit 10 \
+                --json databaseId,createdAt \
+                --jq "[.[] | select(.createdAt >= \"$cutoff\") \
+                        | select((.databaseId|tostring) as \$d \
+                                  | (\"$CLAIMED\" | split(\" \")) | index(\$d) | not)] \
+                      | sort_by(.createdAt) | first | .databaseId // empty" 2>/dev/null)
+        [ -n "$id" ] && { CLAIMED="$CLAIMED$id "; echo "$id"; return 0; }
+    done
     echo "TRIGGER_FAIL"
     return 1
 }
