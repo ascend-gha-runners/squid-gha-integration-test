@@ -341,7 +341,13 @@ jobs:
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
-              cat "$d/timings.tsv" "$d/probes.tsv" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"
+              # 逐文件判断后 cat：miss-p95 artifact 只有 probes.tsv 没有
+              # timings.tsv，cat 对缺失文件 exit 1 会让 bash -e 直接退出
+              for f in timings.tsv probes.tsv; do
+                if [ -f "$d/$f" ]; then
+                  cat "$d/$f" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              done
               echo '```' >> "$GITHUB_STEP_SUMMARY"
             fi
           done
