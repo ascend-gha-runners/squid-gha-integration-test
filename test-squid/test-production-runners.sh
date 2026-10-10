@@ -32,6 +32,7 @@ POLL_INTERVAL=30
 #   标签 | 集群 | 注入状态备注（集群侧变更由平台侧维护，此处仅留档）
 # ---------------------------------------------------------------------------
 RUNNERS=(
+    "linux-amd64-cpu-2-gy001|gy-001|新增（2026-10-10 上产线）"
     "linux-amd64-cpu-2-aiframe|aiframework|caNamespaces 已有"
     "linux-amd64-cpu-2-gy003|gy-003|caNamespaces 已有，仅注入"
     "linux-amd64-cpu-2-hk001|hk-001|新增 postStart（原无 lifecycle）；CM 在 ascend-gha-runners-hk-001 ns"
