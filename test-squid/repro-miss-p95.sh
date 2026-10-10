@@ -15,6 +15,12 @@
 # 预期：全量 p95 落在 poll 区间（复现告警 >10s），排除 poll 后 p95 <12s
 # （证明回源链路健康，告警口径缺陷成立）。
 #
+# NO_PROXY 对照（第二遍，仅 squid 模式）：poll 改走直连（模拟把 broker 加进
+# runner NO_PROXY / squid 侧 splice 后的旁路形态，不进 squid 口径），fast/blob
+# 照常经 squid，并与直连 poll 并发起跑（mock origin 线程池承接）。断言：
+# 直连 poll 照常 hold ~57s（流量没消失，只是不经 squid）+ squid 可见口径
+# （np-fast+np-blob）p95 保持健康——即旁路后 squid_Cache_Misses_95 不再被钉住。
+#
 # 用法：
 #   bash test-squid/repro-miss-p95.sh                 # 直连模式（本地演示）
 #   PX=http://squid-cache.squid.svc:3128 bash ...     # squid 模式（runner 上 MISS 语义）
@@ -144,6 +150,57 @@ else
     echo "❌ 未复现（all=$P95_ALL excl=$P95_EXCL poll_med=$P95_POLL）——检查 origin.log 与 probes.tsv"
     FAIL=1
 fi
+echo
+
+# ---------- NO_PROXY 对照：broker 摘出代理后 squid 口径不再被钉住 ----------
+# 仅 squid 模式（PX）有对照意义。poll 直连（不带 -x，模拟 NO_PROXY 旁路，不进
+# squid）与 fast/blob（照常经 squid）并发起跑，squid 可见口径 = np-fast+np-blob。
+# 注：直连目标用 $BASE（pod IP）——mock origin 就在本 pod，直连天然可达。
+NP_FAIL=0
+if [ -n "${PX:-}" ]; then
+    echo "== NO_PROXY 对照：poll 直连旁路（模拟 NO_PROXY），fast/blob 照常经 squid =="
+    # 直连 poll 先起（占住 ~57s 等待窗口），fast/blob 并行推进
+    seq 1 "$N_POLL" | xargs -P "$N_POLL" -I{} bash -c \
+        "$(declare -f probe); PXARG=(); PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
+         probe \"$BASE/poll?np={}\" np-poll" &
+    NPPID=$!
+    seq 1 "$N_FAST" | xargs -P 10 -I{} bash -c \
+        "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
+         PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
+         probe \"$BASE/fast?np={}\" np-fast"
+    seq 1 "$N_BLOB" | xargs -P 5 -I{} bash -c \
+        "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
+         PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
+         probe \"$BASE/blob?np={}\" np-blob"
+    wait "$NPPID" 2>/dev/null || true
+
+    tag_ms np-fast > "$RESULTS/np-fast.txt"
+    tag_ms np-blob > "$RESULTS/np-blob.txt"
+    tag_ms np-poll > "$RESULTS/np-poll.txt"
+    cat "$RESULTS/np-fast.txt" "$RESULTS/np-blob.txt" > "$RESULTS/np-squid-seen.txt"
+    P95_NP_SEEN=$(p95 "$RESULTS/np-squid-seen.txt" 0.95)
+    MED_NP_POLL=$(p95 "$RESULTS/np-poll.txt" 0.5)
+
+    echo
+    echo "== NO_PROXY 对照结果（ms）=="
+    printf '%-40s %s\n' "对照前：squid 口径全量 p95（被钉住）" "$P95_ALL"
+    printf '%-40s %s\n' "对照后：squid 口径 p95（np-fast+blob）" "$P95_NP_SEEN"
+    printf '%-40s %s\n' "直连 poll 中位（不经 squid，照常 hold）" "$MED_NP_POLL"
+    echo
+    if [ "$MED_NP_POLL" -ge $((HOLD * 1000 * 9 / 10)) ] && [ "$P95_NP_SEEN" -lt 12000 ]; then
+        echo "✅ NO_PROXY 对照成立：直连 poll 照常 hold（$MED_NP_POLL ms）但不进 squid 口径，"
+        echo "   squid 可见 MISS p95=$P95_NP_SEEN ms 健康——broker 加进 NO_PROXY（或 squid 侧"
+        echo "   splice）后 SquidMissP95Slow 误报根除"
+    else
+        echo "❌ NO_PROXY 对照未达预期（seen_p95=$P95_NP_SEEN poll_med=$MED_NP_POLL）"
+        NP_FAIL=1
+    fi
+    echo
+else
+    echo "== NO_PROXY 对照：SKIP（直连模式无 squid 口径，仅 squid 模式有对照意义）=="
+    echo
+fi
+FAIL=$((FAIL | NP_FAIL))
 
 # ---------- timings.tsv（对齐套件口径 phase/seconds/status/group，汇总表统一收录）----------
 WALL=$(( $(date +%s) - T0 ))
