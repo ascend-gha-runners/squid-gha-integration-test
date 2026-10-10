@@ -50,7 +50,7 @@ jobs:
     # 一个字面标签，永远匹配不到 → job 永久 queued）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行功能测试
         run: bash test-squid/run-suite.sh --mode function
@@ -61,7 +61,7 @@ jobs:
           sha256sum /tmp/squid-payload.bin | awk '{print $1}' > /tmp/squid-payload.sha256
 
       - name: 上传测试载荷
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: squid-test-payload
           path: |
@@ -70,7 +70,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-function
           path: /tmp/test-squid-results/
@@ -80,7 +80,7 @@ jobs:
     name: squid 并发测试
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行并发测试
         # PR 事件无 inputs：阶梯/大载荷走默认值（heavy=0，见 REPORT 教训：
@@ -92,7 +92,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-concurrency
           path: /tmp/test-squid-results/
@@ -108,7 +108,7 @@ jobs:
     steps:
       # CANN 镜像 insteadOf 重写 github.com → gh-proxy 是环境正道，gitconfig 保留。
       # 仓库已转 public：gh-proxy 匿名可拉，无需额外凭据（此前 401 系私有仓库所致）
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行功能测试（容器层）
         run: bash test-squid/run-suite.sh --mode function --container
@@ -116,7 +116,7 @@ jobs:
       # 场景 artifact-download：GHA artifact 下载流量经 squid（dawidd6 走
       # github API + 对象存储；needs: function 保证载荷已上传，无竞态）
       - name: 场景 artifact-download（dawidd6/action-download-artifact）
-        uses: dawidd6/action-download-artifact@v9
+        uses: dawidd6/action-download-artifact@v27
         with:
           github_token: ${{ github.token }}
           run_id: ${{ github.run_id }}
@@ -128,7 +128,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-container-function
           path: /tmp/test-squid-results/
@@ -141,7 +141,7 @@ jobs:
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行并发测试（容器层）
         run: |
@@ -151,7 +151,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-container-concurrency
           path: /tmp/test-squid-results/
@@ -161,14 +161,14 @@ jobs:
     name: vllm 通信模拟（runner 层）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行 vLLM 通信模拟
         run: bash test-squid/run-suite.sh --mode vllm
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-vllm
           path: /tmp/test-squid-results/
@@ -181,14 +181,14 @@ jobs:
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行 vLLM 通信模拟（容器层）
         run: bash test-squid/run-suite.sh --mode vllm --container
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-container-vllm
           path: /tmp/test-squid-results/
@@ -198,14 +198,14 @@ jobs:
     name: 透明重写同构校验（tool-17 全量）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行重写同构校验
         run: bash test-squid/run-suite.sh --mode parity
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-parity
           path: /tmp/test-squid-results/
@@ -215,7 +215,7 @@ jobs:
     name: 真实工具链 e2e（no-mirror 形态）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行真实工具 e2e
         run: |
@@ -224,7 +224,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-tools
           path: /tmp/test-squid-results/
@@ -237,7 +237,7 @@ jobs:
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行真实工具 e2e（容器层）
         run: |
@@ -246,7 +246,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-container-tools
           path: /tmp/test-squid-results/
@@ -258,14 +258,14 @@ jobs:
     # 与执行层（容器/CA）无关；判定采用单域集中失败 + 延迟预算（META R17）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行上游通道健康检查
         run: bash test-squid/run-suite.sh --mode upstream
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-upstream
           path: /tmp/test-squid-results/
@@ -282,7 +282,7 @@ jobs:
     # （test-squid/repro-miss-p95.sh）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行 MISS p95 假慢复现
         # squid 地址来自 pod 注入的 env（workflow 内不配置代理——被测对象本身）
@@ -292,7 +292,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-miss-p95
           path: /tmp/repro-miss-p95/
@@ -307,7 +307,7 @@ jobs:
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 运行 MISS p95 假慢复现（容器层）
         run: |
@@ -316,7 +316,7 @@ jobs:
 
       - name: 上传结果
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-squid-container-miss-p95
           path: /tmp/repro-miss-p95/
@@ -329,7 +329,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 拉取结果
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: test-squid-*
           merge-multiple: false
