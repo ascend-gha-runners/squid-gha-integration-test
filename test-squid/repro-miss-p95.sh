@@ -15,11 +15,13 @@
 # 预期：全量 p95 落在 poll 区间（复现告警 >10s），排除 poll 后 p95 <12s
 # （证明回源链路健康，告警口径缺陷成立）。
 #
-# NO_PROXY 对照（第二遍，仅 squid 模式）：poll 改走直连（模拟把 broker 加进
-# runner NO_PROXY / squid 侧 splice 后的旁路形态，不进 squid 口径），fast/blob
-# 照常经 squid，并与直连 poll 并发起跑（mock origin 线程池承接）。断言：
-# 直连 poll 照常 hold ~57s（流量没消失，只是不经 squid）+ squid 可见口径
-# （np-fast+np-blob）p95 保持健康——即旁路后 squid_Cache_Misses_95 不再被钉住。
+# NO_PROXY 对照（第二遍，仅 squid 模式）：所有探测统一带 -x $PX（对齐 runner
+# env 注入形态），再真设 NO_PROXY=broker.actions.githubusercontent.com 并用
+# --resolve 把该域钉到本 pod IP（mock origin 所在）。分流由 curl 的 NO_PROXY
+# 匹配逻辑决定：poll（URL host=broker 域）命中 → 直连旁路不进 squid；
+# fast/blob（URL host=pod IP）不命中 → 照常经 squid。与生产 runner 把 broker
+# 加进 NO_PROXY 后的行为同构。断言：直连 poll 照常 hold ~57s（流量没消失，
+# 只是不经 squid）+ squid 可见口径（np-fast+np-blob）p95 保持健康。
 #
 # 用法：
 #   bash test-squid/repro-miss-p95.sh                 # 直连模式（本地演示）
@@ -87,15 +89,18 @@ fi
 
 # ---------- 流量模型：并发打点，记录 elapsed ----------
 # 探测顺序：fast 先进（health 轮询 + 主流量），poll 最后一批起跑，总时长 ≈ HOLD+5s
-probe() {  # <url> <tag> → 追加 elapsed ms 到 TSV
+probe() {  # <url> <tag> [curl 额外参数…] → 追加 elapsed ms 到 TSV
+    local url=$1 tag=$2
+    shift 2
     local t
-    t=$(curl -sS --max-time $((HOLD + 15)) "${PXARG[@]}" \
-        -o /dev/null -w '%{time_total}' "$1" 2>/dev/null)
-    echo -e "$2\t$(awk -v s="$t" 'BEGIN{printf "%d", s*1000}')" >> "$RESULTS/probes.tsv"
+    t=$(curl -sS --max-time $((HOLD + 15)) "${PXARG[@]}" "$@" \
+        -o /dev/null -w '%{time_total}' "$url" 2>/dev/null)
+    echo -e "$tag\t$(awk -v s="$t" 'BEGIN{printf "%d", s*1000}')" >> "$RESULTS/probes.tsv"
 }
-# warmup 直连探活（脚手架；正式流量走 $BASE=pod IP —— squid 模式下 127.0.0.1
-# 是 squid 自己的 loopback，回源连不到本 pod 的 mock origin）
-probe "http://127.0.0.1:$PORT/fast" warmup
+# warmup 直连探活（脚手架，失败不致命——正式判据在 pass-1 断言里；
+# 正式流量走 $BASE=pod IP —— squid 模式下 127.0.0.1 是 squid 自己的
+# loopback，回源连不到本 pod 的 mock origin）
+probe "http://127.0.0.1:$PORT/fast" warmup --noproxy '*' || true
 
 # fast ×90（xargs -P10 并发）；URL host 必须用 pod IP（$BASE），
 # 经 squid 时 127.0.0.1 会连到 squid 自身 loopback（curl -x 语义）
@@ -152,17 +157,25 @@ else
 fi
 echo
 
-# ---------- NO_PROXY 对照：broker 摘出代理后 squid 口径不再被钉住 ----------
-# 仅 squid 模式（PX）有对照意义。poll 直连（不带 -x，模拟 NO_PROXY 旁路，不进
-# squid）与 fast/blob（照常经 squid）并发起跑，squid 可见口径 = np-fast+np-blob。
-# 注：直连目标用 $BASE（pod IP）——mock origin 就在本 pod，直连天然可达。
+# ---------- NO_PROXY 对照：真设 NO_PROXY，分流交给 curl 的匹配逻辑 ----------
+# 机理：三批探测统一带 -x $PX（= runner env 注入的 HTTP(S)_PROXY），poll 的
+# URL host 换成 broker 域名并真设 NO_PROXY=该域（--noproxy 旗子与 env 同语义，
+# 双保险兼容老 curl；--resolve 把该域钉到本 pod IP，直连时可达 mock origin）。
+# 于是 curl 自己决定：poll 命中 NO_PROXY → 直连，不进 squid 口径；fast/blob
+# （host=pod IP）不命中 → 照常经 squid。若 curl 不认 NO_PROXY（分流失败），
+# poll 会被送去 squid 回源真 broker 域 → 探测失败 → 断言立刻抓住。
+NPHOST=broker.actions.githubusercontent.com
+NPIP=${IP:-127.0.0.1}
 NP_FAIL=0
 if [ -n "${PX:-}" ]; then
-    echo "== NO_PROXY 对照：poll 直连旁路（模拟 NO_PROXY），fast/blob 照常经 squid =="
-    # 直连 poll 先起（占住 ~57s 等待窗口），fast/blob 并行推进
+    echo "== NO_PROXY 对照：NO_PROXY=$NPHOST（poll 直连旁路，fast/blob 照常经 squid）=="
+    # poll（命中 NO_PROXY）先起占住 ~57s 等待窗口，fast/blob 并行推进
     seq 1 "$N_POLL" | xargs -P "$N_POLL" -I{} bash -c \
-        "$(declare -f probe); PXARG=(); PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; \
-         probe \"$BASE/poll?np={}\" np-poll" &
+        "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
+         PORT=$PORT; RESULTS=$RESULTS; HOLD=$HOLD; NPHOST=$NPHOST; NPIP=$NPIP; \
+         export NO_PROXY=$NPHOST no_proxy=$NPHOST; \
+         probe \"http://\$NPHOST:\$PORT/poll?np={}\" np-poll \
+               --noproxy \"\$NPHOST\" --resolve \"\$NPHOST:\$PORT:\$NPIP\"" &
     NPPID=$!
     seq 1 "$N_FAST" | xargs -P 10 -I{} bash -c \
         "$(declare -f probe); PX='${PX:-}'; PXARG=(); [ -n \"\$PX\" ] && PXARG=(-x \"\$PX\"); \
@@ -188,11 +201,12 @@ if [ -n "${PX:-}" ]; then
     printf '%-40s %s\n' "直连 poll 中位（不经 squid，照常 hold）" "$MED_NP_POLL"
     echo
     if [ "$MED_NP_POLL" -ge $((HOLD * 1000 * 9 / 10)) ] && [ "$P95_NP_SEEN" -lt 12000 ]; then
-        echo "✅ NO_PROXY 对照成立：直连 poll 照常 hold（$MED_NP_POLL ms）但不进 squid 口径，"
-        echo "   squid 可见 MISS p95=$P95_NP_SEEN ms 健康——broker 加进 NO_PROXY（或 squid 侧"
-        echo "   splice）后 SquidMissP95Slow 误报根除"
+        echo "✅ NO_PROXY 对照成立：poll 命中 NO_PROXY 直连、照常 hold（$MED_NP_POLL ms）"
+        echo "   但不进 squid 口径，squid 可见 MISS p95=$P95_NP_SEEN ms 健康——broker 加进"
+        echo "   runner NO_PROXY（或 squid 侧 splice）后 SquidMissP95Slow 误报根除"
     else
         echo "❌ NO_PROXY 对照未达预期（seen_p95=$P95_NP_SEEN poll_med=$MED_NP_POLL）"
+        echo "   → poll 未按 NO_PROXY 直连或直连链路异常，检查 curl 版本与 probes.tsv"
         NP_FAIL=1
     fi
     echo
