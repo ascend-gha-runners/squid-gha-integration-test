@@ -48,7 +48,10 @@ HEAVY="${HEAVY:-0}"
 URL_SMALL="${URL_SMALL:-https://repo.huaweicloud.com/ubuntu-ports/dists/noble/Release}"
 URL_MED="${URL_MED:-https://repo.huaweicloud.com/ubuntu-ports/dists/noble/main/binary-arm64/Packages.gz}"
 URL_HEAVY="${URL_HEAVY:-https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl}"
-DOMAINS="${DOMAINS:-https://github.com https://raw.githubusercontent.com https://repo.huaweicloud.com https://download.pytorch.org https://pypi.org https://mirrors.tuna.tsinghua.edu.cn}"
+# 域名矩阵只探测有业务契约的域：github.com 直连不在承诺内（业务 git 流量由
+# gitconfig 重写到 gh-proxy，e2e 组覆盖），直连 github.com 实测常态 10~20s
+# 且会以 503/超时制造告警噪声（2026-10-10 gy001 取证），故不列入
+DOMAINS="${DOMAINS:-https://raw.githubusercontent.com https://repo.huaweicloud.com https://download.pytorch.org https://pypi.org https://mirrors.tuna.tsinghua.edu.cn}"
 
 mkdir -p "$RESULTS_DIR"
 TSV="$RESULTS_DIR/timings.tsv"
