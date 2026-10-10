@@ -89,13 +89,14 @@ fi
 
 # ---------- 流量模型：并发打点，记录 elapsed ----------
 # 探测顺序：fast 先进（health 轮询 + 主流量），poll 最后一批起跑，总时长 ≈ HOLD+5s
-probe() {  # <url> <tag> [curl 额外参数…] → 追加 elapsed ms 到 TSV
+probe() {  # <url> <tag> [curl 额外参数…] → 追加 elapsed ms + 对端 IP 到 TSV
+    # 第三列 remote_ip 是"每笔连接的真实对端"直证：经代理=代理 IP，直连=源站 IP
     local url=$1 tag=$2
     shift 2
     local t
     t=$(curl -sS --max-time $((HOLD + 15)) "${PXARG[@]}" "$@" \
-        -o /dev/null -w '%{time_total}' "$url" 2>/dev/null)
-    echo -e "$tag\t$(awk -v s="$t" 'BEGIN{printf "%d", s*1000}')" >> "$RESULTS/probes.tsv"
+        -o /dev/null -w '%{time_total}\t%{remote_ip}' "$url" 2>/dev/null)
+    printf '%s\t%s\n' "$tag" "$t" >> "$RESULTS/probes.tsv"
 }
 # warmup 直连探活（脚手架，失败不致命——正式判据在 pass-1 断言里；
 # 正式流量走 $BASE=pod IP —— squid 模式下 127.0.0.1 是 squid 自己的
@@ -124,8 +125,11 @@ seq 1 "$N_POLL" | xargs -P "$N_POLL" -I{} bash -c \
      probe \"$BASE/poll?i={}\" poll"
 
 # ---------- p95 三口径（模拟 mtail 滚动窗 MISS p95 计算方式） ----------
-p95() { sort -n "$1" | awk -v q="$2" '{a[NR]=$1} END{print a[int(NR*q)]}'; }
-tag_ms() { awk -F'\t' -v t="$1" '$1==t && $2 ~ /^[0-9]+$/{print $2}' "$RESULTS/probes.tsv"; }
+# p95 空文件返回 0（防炸：set -e 下空串进 [-ge] 会 "integer expression expected"）
+p95() { sort -n "$1" | awk -v q="$2" '{a[NR]=$1} END{if(NR>0) print a[int(NR*q)]; else print 0}'; }
+# probes.tsv 三列：tag / elapsed_ms（curl 原始浮点，取整）/ remote_ip（对端直证）
+tag_ms() { awk -F'\t' -v t="$1" '$1==t && $2 ~ /^[0-9]+(\.[0-9]+)?$/{print int($2*1000)}' "$RESULTS/probes.tsv"; }
+tag_ip() { awk -F'\t' -v t="$1" '$1==t && $3!=""{print $3}' "$RESULTS/probes.tsv" | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}'; }
 
 tag_ms fast  > "$RESULTS/fast.txt"
 tag_ms blob  > "$RESULTS/blob.txt"
@@ -193,19 +197,28 @@ if [ -n "${PX:-}" ]; then
     cat "$RESULTS/np-fast.txt" "$RESULTS/np-blob.txt" > "$RESULTS/np-squid-seen.txt"
     P95_NP_SEEN=$(p95 "$RESULTS/np-squid-seen.txt" 0.95)
     MED_NP_POLL=$(p95 "$RESULTS/np-poll.txt" 0.5)
+    # 直证：np-poll 每笔对端 IP 必须等于 pod IP（=curl 真的直连了）；
+    # 任何一笔落到别的 IP（=squid 被使用）即分流失败
+    NP_BAD_IP=$(awk -F'\t' -v t="np-poll" -v want="$NPIP" \
+        '$1==t && $3!="" && $3!=want{c++} END{print c+0}' "$RESULTS/probes.tsv")
 
     echo
     echo "== NO_PROXY 对照结果（ms）=="
     printf '%-40s %s\n' "对照前：squid 口径全量 p95（被钉住）" "$P95_ALL"
     printf '%-40s %s\n' "对照后：squid 口径 p95（np-fast+blob）" "$P95_NP_SEEN"
     printf '%-40s %s\n' "直连 poll 中位（不经 squid，照常 hold）" "$MED_NP_POLL"
+    printf '%-40s %s\n' "np-poll 对端 IP 直证（应只有 pod IP）" "$(tag_ip np-poll)"
+    printf '%-40s %s\n' "np-fast/blob 对端 IP（对照：squid）" "$(tag_ip np-fast)$(tag_ip np-blob)"
+    printf '%-40s %s\n' "第一遍 poll 对端 IP（对照：squid）" "$(tag_ip poll)"
     echo
-    if [ "$MED_NP_POLL" -ge $((HOLD * 1000 * 9 / 10)) ] && [ "$P95_NP_SEEN" -lt 12000 ]; then
-        echo "✅ NO_PROXY 对照成立：poll 命中 NO_PROXY 直连、照常 hold（$MED_NP_POLL ms）"
-        echo "   但不进 squid 口径，squid 可见 MISS p95=$P95_NP_SEEN ms 健康——broker 加进"
-        echo "   runner NO_PROXY（或 squid 侧 splice）后 SquidMissP95Slow 误报根除"
+    if [ "$MED_NP_POLL" -ge $((HOLD * 1000 * 9 / 10)) ] && [ "$P95_NP_SEEN" -lt 12000 ] \
+        && [ "$NP_BAD_IP" -eq 0 ]; then
+        echo "✅ NO_PROXY 对照成立：poll 命中 NO_PROXY 直连（对端 $NPIP，0 笔异常）、"
+        echo "   照常 hold（$MED_NP_POLL ms）但不进 squid 口径，squid 可见 MISS "
+        echo "   p95=$P95_NP_SEEN ms 健康——broker 加进 runner NO_PROXY（或 squid 侧"
+        echo "   splice）后 SquidMissP95Slow 误报根除"
     else
-        echo "❌ NO_PROXY 对照未达预期（seen_p95=$P95_NP_SEEN poll_med=$MED_NP_POLL）"
+        echo "❌ NO_PROXY 对照未达预期（seen_p95=$P95_NP_SEEN poll_med=$MED_NP_POLL 异常对端=$NP_BAD_IP 笔）"
         echo "   → poll 未按 NO_PROXY 直连或直连链路异常，检查 curl 版本与 probes.tsv"
         NP_FAIL=1
     fi
