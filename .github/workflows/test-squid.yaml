@@ -135,7 +135,11 @@ jobs:
 
   container-concurrency:
     name: 容器层·并发测试（CANN 镜像）
-    needs: function
+    # 容器层五 job 用 needs 链串行（runner 层照常并行）：并行触发多个
+    # container hook 会踩 runner-container-hooks 的挂死竞态（连接死亡后
+    # Promise 不 reject，job 永挂 Initialize containers，见 issue #2，
+    # 2026-10-10 8 集群并行验证 10/10 复现），串行化牺牲时长换稳定
+    needs: [concurrency, container-function]
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
@@ -175,7 +179,7 @@ jobs:
 
   container-vllm:
     name: vllm 通信模拟（CANN 镜像）
-    needs: function
+    needs: [vllm, container-concurrency]
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
@@ -231,7 +235,7 @@ jobs:
 
   container-tools:
     name: 容器层·真实工具 e2e（CANN 镜像）
-    needs: function
+    needs: [tools, container-vllm]
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12
@@ -299,6 +303,7 @@ jobs:
 
   container-miss-p95:
     name: 容器层·MISS p95 假慢复现（CANN 镜像）
+    needs: [miss-p95, container-tools]
     # 告警里的 MISS 流量负载（artifact 上传/长轮询等）实际在用户容器里产生，
     # 容器层验证同一复现链（squid 回源 pod IP + CA/工具链差异不参与本场景，
     # 但多验一层执行形态与套件其余组保持两层对称）
