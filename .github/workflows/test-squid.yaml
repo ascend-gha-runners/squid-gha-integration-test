@@ -113,13 +113,12 @@ jobs:
       - name: 运行功能测试（容器层）
         run: bash test-squid/run-suite.sh --mode function --container
 
-      # 场景 artifact-download：GHA artifact 下载流量经 squid（dawidd6 走
-      # github API + 对象存储；needs: function 保证载荷已上传，无竞态）
-      - name: 场景 artifact-download（dawidd6/action-download-artifact）
-        uses: dawidd6/action-download-artifact@v27
+      # 场景 artifact-download：GHA artifact 下载流量经 squid（官方 v8 走
+      # Actions artifact API + 对象存储，与 v7 上传配套；needs: function
+      # 保证载荷已上传，无竞态）
+      - name: 场景 artifact-download
+        uses: actions/download-artifact@v8
         with:
-          github_token: ${{ github.token }}
-          run_id: ${{ github.run_id }}
           name: squid-test-payload
           path: payload-download
 
