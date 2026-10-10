@@ -19,7 +19,6 @@
 #   LADDER        并发度阶梯，默认 "1 4 8 16"
 #   HEAVY         1=启用大载荷（~146MB torch wheel，默认 0）
 #   URL_SMALL/URL_MED/URL_HEAVY   三档载荷 URL（真实 URL、mock 大小）
-#   DOMAINS       功能探测域名矩阵
 #
 # 输出（RESULTS_DIR 下）：
 #   timings.tsv   阶段<TAB>秒<TAB>状态(0/1/SKIP)<TAB>组
@@ -48,10 +47,6 @@ HEAVY="${HEAVY:-0}"
 URL_SMALL="${URL_SMALL:-https://repo.huaweicloud.com/ubuntu-ports/dists/noble/Release}"
 URL_MED="${URL_MED:-https://repo.huaweicloud.com/ubuntu-ports/dists/noble/main/binary-arm64/Packages.gz}"
 URL_HEAVY="${URL_HEAVY:-https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl}"
-# 域名矩阵只探测有业务契约的域：github.com 直连不在承诺内（业务 git 流量由
-# gitconfig 重写到 gh-proxy，e2e 组覆盖），直连 github.com 实测常态 10~20s
-# 且会以 503/超时制造告警噪声（2026-10-10 gy001 取证），故不列入
-DOMAINS="${DOMAINS:-https://raw.githubusercontent.com https://repo.huaweicloud.com https://download.pytorch.org https://pypi.org https://mirrors.tuna.tsinghua.edu.cn}"
 
 mkdir -p "$RESULTS_DIR"
 TSV="$RESULTS_DIR/timings.tsv"
@@ -137,28 +132,6 @@ basic-proxy() {
     curl_get "$URL_SMALL" "$RESULTS_DIR/basic-https.out" 60
     [ -s "$RESULTS_DIR/basic-https.out" ] || { echo "❌ https 响应体为空"; return 1; }
     echo "✅ http/https 全通，MITM CA 链有效（无证书告警）"
-}
-
-# 域名可达矩阵（记录数据；全部无响应才算失败）
-domain-matrix() {
-    local unreachable=0 total=0
-    for d in $DOMAINS; do
-        total=$((total + 1))
-        # 用 GET 而非 HEAD：经 squid 时部分站点对 HEAD 响应异常（前作实测）
-        local code t0
-        t0=$(date +%s)
-        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$d" 2>/dev/null)
-        local rc=$?
-        if [ $rc -ne 0 ]; then
-            printf '%s\tERR(%s)\t%s\n' "$d" "$rc" "$(( $(date +%s) - t0 ))" >> "$PROBES"
-            unreachable=$((unreachable + 1))
-        else
-            printf '%s\t%s\t%s\n' "$d" "$code" "$(( $(date +%s) - t0 ))" >> "$PROBES"
-        fi
-    done
-    echo "可达 $((total - unreachable))/$total（明细 probes.tsv）"
-    [ "$unreachable" -eq "$total" ] && return 1
-    return 0
 }
 
 # 缓存 MISS→HIT：同 URL 二连发，抓 X-Cache-Lookup 头 + 耗时对照
@@ -1111,7 +1084,6 @@ if [ "$MODE" = "function" ]; then
     run_timed meta-trace     "$LAYER" meta-trace
     run_timed basic-proxy    "$LAYER" basic-proxy
     [ "$LAYER" = "container" ] && run_timed ca-trust "$LAYER" ca-trust
-    run_timed domain-matrix  "$LAYER" domain-matrix
     run_timed cache-hitmiss  "$LAYER" cache-hitmiss
     run_timed integrity      "$LAYER" integrity
     run_timed failure-face   "$LAYER" failure-face

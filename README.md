@@ -15,7 +15,7 @@ test-squid/run-suite.sh            # 测试主脚本（run_timed 阶段计时 + 
 
 | 组 | 场景 |
 |---|---|
-| function | 元自检（squid 专属痕迹）、http/https/MITM 代理、域名矩阵、缓存 MISS→HIT、传输完整性 sha256、失败面（坏域名快速失败 + squid 存活） |
+| function | 元自检（squid 专属痕迹）、http/https/MITM 代理、缓存 MISS→HIT、传输完整性 sha256、失败面（坏域名快速失败 + squid 存活） |
 | concurrency | 同对象阶梯并发（LADDER 默认 1→4→8→16，正确性一票否决）、异对象并发聚合吞吐、pip/git/wget/curl 混合并行 |
 
 ## 运行

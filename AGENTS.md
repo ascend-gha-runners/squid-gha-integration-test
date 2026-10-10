@@ -82,7 +82,7 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 
 | job | 内容 |
 |---|---|
-| `squid 功能测试` | 元自检、基本代理/CONNECT/MITM、域名矩阵、缓存 MISS→HIT、sha256 完整性、失败面、artifact 下载 |
+| `squid 功能测试` | 元自检、基本代理/CONNECT/MITM、缓存 MISS→HIT、sha256 完整性、失败面、artifact 下载 |
 | `squid 并发测试` | 同对象阶梯并发、异对象并发、混合工具并行 |
 | `vllm 通信模拟` | ModelScope/HF 双通道模型下载 + OpenAI API 8 并发 SSE（自带 mock origin） |
 | `透明重写同构校验` | no-mirror tool-17 全量移植：13 条重写规则内容签名 + 负样本 + 回归守卫（runner 层 only） |
