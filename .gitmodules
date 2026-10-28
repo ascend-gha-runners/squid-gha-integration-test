@@ -1,0 +1,3 @@
+[submodule ".repos/vllm-omni"]
+	path = .repos/vllm-omni
+	url = https://github.com/ascend-gha-runners/vllm-omni
