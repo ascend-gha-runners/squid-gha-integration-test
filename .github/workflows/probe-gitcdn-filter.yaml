@@ -64,7 +64,7 @@ jobs:
 
           echo '===== git-cdn upload-pack 能力通告 ====='
           TMPC=/tmp/gitcdn-info.txt
-          curl -sS --max-time 30 -o "$TMPC" \
+          curl -sSL --max-time 30 -o "$TMPC" \
             "http://git-cdn-service.git-cdn.svc.cluster.local:8000/octocat/Hello-World.git/info/refs?service=git-upload-pack" \
             || true
           head -c 2000 "$TMPC" | tr -d '\000' > /tmp/gitcdn-info.txt.txt 2>/dev/null || true
