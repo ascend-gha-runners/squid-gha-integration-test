@@ -323,6 +323,19 @@ conc-distinct() {
 # 容器内工具可能缺失：缺失记 ⚪ SKIP，不算失败
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# busybox wget 经 HTTP 代理访问 https 不发 CONNECT（把 https URL 当绝对 URI 直接
+# 丢给代理，squid 侧 abort），上游长期未修 → 任何用它下 https 的用例都必失败，
+# 且与 squid/CA/no_proxy 无关，统一记 ⚪ SKIP 而不是红。
+# 判定：可执行文件解析后落在 busybox，或 --version 输出含 BusyBox
+# （Alpine 默认镜像 /usr/bin/wget -> /bin/busybox）。
+wget_is_busybox() {
+    have wget || return 1
+    local p
+    p=$(readlink -f "$(command -v wget)" 2>/dev/null || command -v wget)
+    case "$p" in *busybox*) return 0;; esac
+    wget --version 2>&1 | head -3 | grep -qi 'busybox'
+}
+
 conc-mixed() {
     local wd="$RESULTS_DIR/mixed"; rm -rf "$wd"; mkdir -p "$wd"
     local pids=() rc=0
@@ -345,12 +358,14 @@ conc-mixed() {
     else
         echo "⚪ git SKIP（镜像无 git）" >>"$wd/verdict"
     fi
-    # 3 wget：直链下载
-    if have wget; then
+    # 3 wget：直链下载（busybox wget 经代理访 https 必失败且与 squid 无关 → SKIP）
+    if ! have wget; then
+        echo "⚪ wget SKIP（镜像无 wget）" >>"$wd/verdict"
+    elif wget_is_busybox; then
+        echo "⚪ wget SKIP（busybox wget 不发 CONNECT，经代理访 https 必失败；上游未修）" >>"$wd/verdict"
+    else
         ( wget -q -O "$wd/wget.out" "$URL_SMALL" >"$wd/wget.log" 2>&1 \
             && echo "✅ wget" >>"$wd/verdict" || echo "❌ wget" >>"$wd/verdict" ) & pids+=($!)
-    else
-        echo "⚪ wget SKIP（镜像无 wget）" >>"$wd/verdict"
     fi
     # 4 curl：与 wget 并发拉同一对象 URL_SMALL（~200KB，稳定小载荷）。
     #   不用 pypi JSON API：pypi host 上 /simple、/packages 是重写域而
@@ -931,6 +946,8 @@ tool-goproxy() {
 # tool-06 wget：官方 github release 下载（规则3），ELF 魔数校验
 tool-wget() {
     need wget || return 2
+    # busybox wget 不发 CONNECT，https 必失败（上游未修）→ 记 SKIP，不判红
+    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
     wget -q --timeout=90 -O "$RESULTS_DIR/shfmt" \
         https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_${PKG_ARCH} \
         || { echo "❌ wget release 失败"; return 1; }
@@ -973,6 +990,8 @@ tool-rustup() {
 
 # tool-11 conda：官方 miniconda installer + conda-forge create（规则9）
 tool-conda() {
+    # busybox wget 无法经代理下 https → 环境不可用，记 SKIP（非 squid 层问题）
+    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
     local d="$RESULTS_DIR/conda"; rm -rf "$d"; mkdir -p "$d"
     wget -q --timeout=300 -O "$d/miniconda.sh" \
         https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
@@ -1009,6 +1028,8 @@ int main(){testing::InitGoogleTest(nullptr,nullptr);return 0;}' > "$d/main.cc"
 
 # tool-08 bazel：bazelisk（官方 github release，规则3）+ http_archive 构建
 tool-bazel() {
+    # busybox wget 无法经代理下 https → 环境不可用，记 SKIP（非 squid 层问题）
+    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
     local d="$RESULTS_DIR/bazel-proj"; rm -rf "$d"; mkdir -p "$d"
     wget -q --timeout=120 -O "$d/bazelisk" \
         https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64 \
@@ -1455,7 +1476,7 @@ ib-ascend-obs() {
         echo "⚠️ gitleaks 仅发布 x86_64 产物，$arch 跳过"
     else
         bin="$RESULTS_DIR/gitleaks"; rm -f "$bin"
-        if command -v wget >/dev/null 2>&1; then
+        if have wget && ! wget_is_busybox; then
             wget -q --no-check-certificate --timeout=120 -O "$bin" "$OBS_ELF_URL" 2>"$RESULTS_DIR/obs-elf.err"
             rc=$?
         else
