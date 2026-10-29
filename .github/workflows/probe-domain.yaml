@@ -1,8 +1,14 @@
 name: probe-domain
 
-# 临时诊断 workflow：在指定 runner 上按域名矩阵探测出网状态，用于定位
-# sh-001 上 github.com 间歇 418 的影响面。结果作为 artifact probe.tsv 上传。
-# 用完即删。
+# 调试探针（长期保留）：在指定 runner 上按域名矩阵探测出网状态——每个域名
+# 同时走 squid 代理（默认代理 env）与直连（--noproxy '*'），用状态码/耗时对照
+# 判断流量是否真的经 squid 出网、哪些域被代理拦成 418/超时。
+#
+# 触发：
+#   gh workflow run probe-domain.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+#     --ref main -f 'runner=["linux-aarch64-a5-2-sh001"]' -f repeat=5
+# 结果：artifact probe-domain/probe.tsv（host / path / attempt / via / code / time）。
+# 只做诊断取证，不参与 test-squid 的判定口径。
 
 on:
   workflow_dispatch:

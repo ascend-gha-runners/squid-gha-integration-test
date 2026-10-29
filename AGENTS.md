@@ -45,6 +45,19 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 - `test-squid/**`（任何测试脚本/mock 改动）
 - `.github/workflows/test-squid.yaml`
 
+### 3. 调试探针（probe-domain，长期保留）
+
+排查单个 runner 出网问题时用，不参与 test-squid 判定：
+
+```bash
+# 在 sh-001 上按域名矩阵探测（每个域同时走 squid 与直连作对照）
+gh workflow run probe-domain.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+  --ref main -f 'runner=["linux-aarch64-a5-2-sh001"]' -f repeat=5
+```
+
+结果在 artifact `probe-domain` 的 `probe.tsv`（host/path/attempt/via/code/time），
+`via=proxy` 是经 squid、`via=direct` 是 `--noproxy '*'` 直连对照。
+
 ## 二、前置条件（缺一不可）
 
 1. **runner 注入 squid**：目标 runner set 的 pod 模板必须已注入
