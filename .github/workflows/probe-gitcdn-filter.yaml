@@ -1,0 +1,129 @@
+name: probe-gitcdn-filter
+
+# 复现探针：验证 sh-001 / sh-002 容器层「github.com → git-cdn 重写」下
+# git 部分克隆（--filter=blob:none）是否被 git-cdn 拒绝。
+#
+# 背景：2026-10-29 sh-001 容器层并发测试 conc-mixed 的 git 步骤报
+#   fatal: remote error: fatal: unexpected line: 'filter blob:none'
+# 怀疑 2026-10-28 重建的 arm64 git-cdn 镜像不支持 filter 能力。
+#
+# 必须容器层：github.com → git-cdn 的 insteadOf 由 job PodTemplate 的
+# postStart 写入 /root/.gitconfig，只有 container: 作业才会生效。
+#
+# 触发：
+#   gh workflow run probe-gitcdn-filter.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+#     --ref repro-gitcdn-filter -f 'runner=["linux-aarch64-a5-2-sh001"]'
+#   gh workflow run probe-gitcdn-filter.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+#     --ref repro-gitcdn-filter -f 'runner=["linux-amd64-a5-2-sh002"]'
+# 结果：artifact probe-gitcdn-filter/probe-gitcdn.tsv（本步骤全部 ✅/❌ 明细）
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签 JSON 数组'
+        required: false
+        default: '["linux-aarch64-a5-2-sh001"]'
+      image:
+        description: '容器镜像（默认 CANN）'
+        required: false
+        default: 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12'
+
+jobs:
+  probe:
+    name: git-cdn 部分克隆探针
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 20
+    container:
+      image: ${{ inputs.image }}
+    steps:
+      - name: 探测 git-cdn filter 能力
+        run: |
+          set -u
+          OUT=/tmp/probe-gitcdn.tsv
+          printf 'case\tresult\tdetail\n' > "$OUT"
+          rec() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$OUT"; echo "### [$1] $2  $3"; }
+
+          echo '===== 环境 ====='
+          env | grep -iE '^(http|https|no)_proxy|CA_BUNDLE|SSL_CERT' | sort || true
+          git --version || true
+
+          echo '===== 重写规则 ====='
+          git config --get-regexp '^url\..*\.insteadof$' || echo '(无 insteadOf)'
+
+          echo '===== 生效 URL（ls-remote --get-url 展开） ====='
+          EFF=$(git ls-remote --get-url https://github.com/octocat/Hello-World.git 2>&1) || true
+          echo "$EFF"
+          case "$EFF" in
+            *git-cdn-service*) REWRITE=git-cdn ;;
+            *gh-proxy*)        REWRITE=gh-proxy ;;
+            *github.com*)      REWRITE=none ;;
+            *)                 REWRITE=unknown ;;
+          esac
+          rec rewrite "$REWRITE" "effective=$EFF"
+
+          echo '===== git-cdn upload-pack 能力通告 ====='
+          TMPC=/tmp/gitcdn-info.txt
+          curl -sS --max-time 30 -o "$TMPC" \
+            "http://git-cdn-service.git-cdn.svc.cluster.local:8000/octocat/Hello-World.git/info/refs?service=git-upload-pack" \
+            || true
+          head -c 2000 "$TMPC" | tr -d '\000' > /tmp/gitcdn-info.txt.txt 2>/dev/null || true
+          echo '--- 首条 pkt-line（能力行）---'
+          head -c 600 "$TMPC" | tr -d '\000' | head -2
+          if tr -d '\000' < "$TMPC" | grep -aq 'filter'; then
+            rec caps-filter YES 'upload-pack 通告了 filter 能力'
+          else
+            rec caps-filter NO 'upload-pack 未通告 filter 能力'
+          fi
+
+          echo '===== 用例 ====='
+          # 1. github.com 经重写 → git-cdn，带 filter（目标用例）
+          if git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git /tmp/c-filter >/tmp/c-filter.log 2>&1; then
+            rec clone-filter OK '经 git-cdn 重写 + --filter=blob:none 成功'
+          else
+            if grep -q "filter blob:none" /tmp/c-filter.log; then
+              rec clone-filter FILTER-REJECTED "$(grep -m1 'filter blob:none' /tmp/c-filter.log)"
+            else
+              rec clone-filter FAIL "$(tail -2 /tmp/c-filter.log | tr '\n' ' ')"
+            fi
+          fi
+
+          # 2. 对照：同路径不带 filter
+          if git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/c-plain >/tmp/c-plain.log 2>&1; then
+            rec clone-plain OK '经 git-cdn 重写 + --depth 1 成功'
+          else
+            rec clone-plain FAIL "$(tail -2 /tmp/c-plain.log | tr '\n' ' ')"
+          fi
+
+          # 3. 直接打 git-cdn 基址 + filter（绕过 insteadOf，验证后端本身）
+          if git clone --depth 1 --filter=blob:none \
+              http://git-cdn-service.git-cdn.svc.cluster.local:8000/octocat/Hello-World.git /tmp/c-filter-direct \
+              >/tmp/c-filter-direct.log 2>&1; then
+            rec clone-filter-direct OK '直连 git-cdn 基址 + filter 成功'
+          else
+            if grep -q "filter blob:none" /tmp/c-filter-direct.log; then
+              rec clone-filter-direct FILTER-REJECTED "$(grep -m1 'filter blob:none' /tmp/c-filter-direct.log)"
+            else
+              rec clone-filter-direct FAIL "$(tail -2 /tmp/c-filter-direct.log | tr '\n' ' ')"
+            fi
+          fi
+
+          # 4. 绕过重写、直连 github.com（经 squid）+ filter（GitHub 原生能力对照）
+          if GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+             git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git /tmp/c-filter-gh \
+             >/tmp/c-filter-gh.log 2>&1; then
+            rec clone-filter-github OK '绕过重写直连 github.com + filter 成功（GitHub 支持）'
+          else
+            rec clone-filter-github FAIL "$(tail -2 /tmp/c-filter-gh.log | tr '\n' ' ')"
+          fi
+
+          echo '===== 汇总 ====='
+          cat "$OUT"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-gitcdn-filter
+          path: /tmp/probe-gitcdn.tsv
+          if-no-files-found: warn
