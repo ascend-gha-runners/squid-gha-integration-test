@@ -1,0 +1,120 @@
+name: probe-domain
+
+# 临时诊断 workflow：在指定 runner 上按域名矩阵探测出网状态，用于定位
+# sh-001 上 github.com 间歇 418 的影响面。结果作为 artifact probe.tsv 上传。
+# 用完即删。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签 JSON 数组'
+        required: false
+        default: '["linux-aarch64-a5-2-sh001"]'
+      repeat:
+        description: 'github.com archive 路径重复次数（看 418 是否间歇）'
+        required: false
+        default: '5'
+
+jobs:
+  probe:
+    name: 域名出网探测
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 25
+    steps:
+      - name: 代理环境快照
+        run: env | grep -iE '^(http|https|no)_proxy|CA_BUNDLE|SSL_CERT' | sort
+
+      - name: 域名矩阵探测
+        run: |
+          set -u
+          OUT=/tmp/probe.tsv
+          REPEAT='${{ inputs.repeat }}'
+          printf 'host\tpath\tattempt\tvia\tcode\ttime\n' > "$OUT"
+
+          probe() {  # probe <host> <path> [attempts]
+            local host="$1" path="$2" n="${3:-1}" url="https://$host$path" i out code secs
+            for i in $(seq 1 "$n"); do
+              out=$(curl -sS -L --max-time 30 -r 0-2047 -o /dev/null \
+                      -w '%{http_code} %{time_total}' "$url" 2>/dev/null) || out="ERR 0"
+              code=${out%% *}; secs=${out##* }
+              printf '%s\t%s\t%s\tproxy\t%s\t%s\n' "$host" "$path" "$i" "$code" "$secs" >> "$OUT"
+            done
+            out=$(curl -sS -L --max-time 15 --noproxy '*' -r 0-2047 -o /dev/null \
+                    -w '%{http_code} %{time_total}' "$url" 2>/dev/null) || out="ERR 0"
+            code=${out%% *}; secs=${out##* }
+            printf '%s\t%s\t1\tdirect\t%s\t%s\n' "$host" "$path" "$code" "$secs" >> "$OUT"
+          }
+
+          # --- github 族（418 重灾区）---
+          probe github.com "/mvdan/sh/archive/refs/tags/v3.10.0.tar.gz" "$REPEAT"
+          probe github.com "/mvdan/sh/info/refs?service=git-upload-pack" 2
+          probe github.com "/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64" 2
+          probe github.com "/ascend-gha-runners/squid-gha-integration-test" 2
+          probe codeload.github.com "/mvdan/sh/tar.gz/refs/tags/v3.10.0" 2
+          probe raw.githubusercontent.com "/mvdan/sh/master/README.md" 2
+          probe objects.githubusercontent.com "/" 1
+          probe api.github.com "/user" 1
+          # --- 镜像站 ---
+          probe gh-proxy.com "/https://github.com/mvdan/sh/archive/refs/tags/v3.10.0.tar.gz" 2
+          probe ghfast.top "/https://github.com/mvdan/sh/archive/refs/tags/v3.10.0.tar.gz" 1
+          probe gh-proxy.test.osinfra.cn "/https://github.com/mvdan/sh/archive/refs/tags/v3.10.0.tar.gz" 1
+          # --- pypi / apt ---
+          probe pypi.org "/simple/" 2
+          probe files.pythonhosted.org "/" 1
+          probe repo.huaweicloud.com "/repository/pypi/simple/" 1
+          probe repo.huaweicloud.com "/ubuntu/" 1
+          probe ports.ubuntu.com "/ubuntu-ports/dists/noble/Release" 1
+          probe mirrors.ustc.edu.cn "/ubuntu/dists/noble/Release" 1
+          probe ppa.launchpadcontent.net "/deadsnakes/ppa/ubuntu/dists/noble/Release" 1
+          # --- go / npm / cargo / conda / rustup ---
+          probe proxy.golang.org "/github.com/google/uuid/@v/list" 2
+          probe go.dev "/dl/" 1
+          probe dl.google.com "/go/go1.26.1.linux-amd64.tar.gz" 1
+          probe golang.google.cn "/" 1
+          probe goproxy.cn "/github.com/google/uuid/@v/list" 1
+          probe registry.npmmirror.com "/lodash" 1
+          probe registry.npmjs.org "/lodash" 1
+          probe index.crates.io "/config.json" 1
+          probe rsproxy.cn "/api/v1/crates" 1
+          probe conda.anaconda.org "/conda-forge/linux-64/repodata.json" 1
+          probe repo.anaconda.com "/miniconda/Miniconda3-latest-Linux-x86_64.sh" 1
+          probe mirrors.nju.edu.cn "/conda/cloud/conda-forge/linux-64/repodata.json" 1
+          probe repo.openeuler.org "/openEuler-24.03-LTS/OS/aarch64/repodata/repomd.xml" 1
+          probe static.rust-lang.org "/dist/channel-rust-stable.toml.sha256" 1
+          probe sh.rustup.rs "/" 1
+          # --- 模型 / OBS / 其它 ---
+          probe modelscope.cn "/api/v1/models" 1
+          probe www.modelscope.cn "/" 1
+          probe huggingface.co "/" 1
+          probe hf-mirror.com "/" 1
+          probe download.pytorch.org "/whl/torch/" 1
+          probe pytorch-package.obs.cn-north-4.myhuaweicloud.com "/" 1
+          probe sglang-npu.obs.cn-southwest-2.myhuaweicloud.com "/" 1
+          probe dl.k8s.io "/release/stable.txt" 1
+          probe pkgs.k8s.io "/core/stable/v1.31/deb/Release" 1
+          probe www.hiascend.com "/" 1
+          probe gitcode.com "/ascend/pytorch.git/info/refs?service=git-upload-pack" 1
+
+          echo '===== 汇总（按 host 首次出现顺序，展示 proxy 各次码 / direct 码）====='
+          awk -F'\t' 'NR>1 {
+            key=$1"\t"$2;
+            if ($4=="proxy") p[key]=p[key]" "$5; else d[key]=$5;
+            if (!(key in seen)) { order[++n]=key; seen[key]=1 }
+          }
+          END {
+            for (i=1;i<=n;i++) {
+              split(order[i],a,"\t");
+              printf "%-55s %-6s proxy=[%s] direct=[%s]\n", a[1], "", p[order[i]], d[order[i]]
+            }
+          }' "$OUT"
+          echo '===== 明细 ====='
+          cat "$OUT"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-domain
+          path: /tmp/probe.tsv
+          if-no-files-found: warn
