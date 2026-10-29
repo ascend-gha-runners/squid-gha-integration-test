@@ -33,7 +33,10 @@ jobs:
           printf 'host\tpath\tattempt\tvia\tcode\ttime\n' > "$OUT"
 
           probe() {  # probe <host> <path> [attempts]
-            local host="$1" path="$2" n="${3:-1}" url="https://$host$path" i out code secs
+            # 不能写成一条 local 多赋值：bash 5.x 会先把所有名字本地化再求值，
+            # set -u 下 url="https://$host$path" 里的 $host 会变 unbound。
+            local host="$1" path="$2" n="${3:-1}"
+            local url="https://$host$path" i out code secs
             for i in $(seq 1 "$n"); do
               out=$(curl -sS -L --max-time 30 -r 0-2047 -o /dev/null \
                       -w '%{http_code} %{time_total}' "$url" 2>/dev/null) || out="ERR 0"
