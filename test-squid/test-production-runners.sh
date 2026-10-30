@@ -35,10 +35,11 @@ POLL_INTERVAL=30
 #   标签 | 集群 | 注入状态备注（集群侧变更由平台侧维护，此处仅留档）
 # ---------------------------------------------------------------------------
 RUNNERS=(
-    "linux-amd64-cpu-2-gy001|gy-001|新增（2026-10-10 上产线）；gitcode 后端非 git-cdn-gitcode（不在本套件 gitcode 组覆盖范围）"
+    "linux-amd64-cpu-2-gy001|gy-001|新增（2026-10-10 上产线）；gitcode 后端 git-cdn-gitcode（gy-001 无独立实例，用 ExternalName 别名指向 git-cache，部署仓 PR #2293）"
     "linux-aarch64-a3-2-aiframe|aiframework|caNamespaces 已有；aarch64（amd64 容量死锁，run 38370252096 实证换型）"
     "linux-amd64-cpu-2-gy003|gy-003|caNamespaces 已有，仅注入"
     "linux-amd64-cpu-2-hk001|hk-001|新增 postStart（原无 lifecycle）；CM 在 ascend-gha-runners-hk-001 ns"
+    "linux-aarch64-a2-1-wlcb001|wlcb-001|新增（2026-10-27）；aarch64 A2 NPU；Liqo 卸载（CM 在 hk-001 的 ascend-gha-runners-hk-001，pod 跑在 wlcb）；gitcode 走 git-cdn-gitcode 别名"
     "linux-amd64-cpu-2-mind-third|mind-third-ci|caNamespaces + ascend-gha-runners"
     "linux-amd64-cpu-4-gy004|gy-004|caNamespaces 已有，仅注入"
     "linux-amd64-cpu-8-gy005|gy-005|保留 karpenter 注解；caNamespaces + ascend-gha-runners"
@@ -53,7 +54,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --only)     ONLY="${2:?}"; shift 2 ;;
         --exclude)  EXCLUDE="${2:?}"; shift 2 ;;
-        --gitcode)  GITCODE=1; GITCODE_BACKEND="${2:-smart-git-proxy}"; shift 2 ;;
+        # 后端可省略（默认 smart-git-proxy）；下一个参数若本身是选项（以 -- 开头）则不吞掉，
+        # 避免 `--gitcode --list` 把 --list 当成后端名，也避免参数不足时 shift 失败死循环。
+        --gitcode)  GITCODE=1; GITCODE_BACKEND=smart-git-proxy
+                    if [ $# -ge 2 ] && [ "${2#--}" = "$2" ]; then GITCODE_BACKEND="$2"; shift; fi
+                    shift ;;
         --gitcode-lfs-repo) GITCODE_LFS_REPO="${2:?}"; shift 2 ;;
         --no-watch) NO_WATCH=1; shift ;;
         --list)     LIST_ONLY=1; shift ;;
@@ -62,6 +67,15 @@ while [ $# -gt 0 ]; do
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
+
+# workflow 的 gitcode_backend 是 choice，传错值会让 gh workflow run 直接报错；
+# 这里提前拦住，错误信息更明确。
+if [ "$GITCODE" = 1 ]; then
+    case "$GITCODE_BACKEND" in
+        smart-git-proxy|git-cdn-gitcode) ;;
+        *) echo "❌ 不支持的 gitcode 后端: $GITCODE_BACKEND（可选 smart-git-proxy | git-cdn-gitcode）" >&2; exit 2 ;;
+    esac
+fi
 
 if [ "$LIST_ONLY" = 1 ]; then
     echo "生产 runner 注册表（标签 | 集群 | 注入状态）："

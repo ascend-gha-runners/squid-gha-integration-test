@@ -16,6 +16,18 @@
 # 前提（同 test-squid）：目标 runner 的 job pod 模板 postStart 已注入
 #   url.<backend>.insteadOf = https://gitcode.com/
 # 故必须跑容器层（runner 容器没有这条重写）。
+#
+# 示例（User 的 LFS 测试仓，跑在 wlcb001 容器层）：
+#   gh workflow run test-gitcode-clone.yaml --ref main \
+#     -f runner='["linux-aarch64-a2-1-wlcb001"]' \
+#     -f gitcode_backend='git-cdn-gitcode' \
+#     -f repo='https://gitcode.com/ccijunk/lfs-test.git' \
+#     -f iterations='3' \
+#     -f lfs_verify='1' \
+#     -f github_clone='0'
+#   效果：先断言重写展开到
+#   http://git-cdn-service.git-cdn-gitcode.svc.cluster.local:8000/ccijunk/lfs-test.git，
+#   再 3 次 clone 做冷/热耗时对比，最后 git lfs pull 逐文件校验 sha256 == pointer oid。
 # =============================================================================
 name: test-gitcode-clone
 
