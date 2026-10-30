@@ -11,6 +11,8 @@
 #       concurrency —— 并发：同对象阶梯、异对象阶梯、混合工具并行
 #       cabundle    —— no_proxy 直连 × CA 注入矩阵（独立脚本 no-proxy-ca-test.sh）
 #       pkg         —— dnf/yum 包管理链路（openEuler 基底容器；RHEL 系 CA 注入路径）
+#       stale-index —— 索引页陈旧复现（源站 15 天 max-age → squid 长期供旧页，
+#                      2026-10-29 triton-ascend post2 构建失败回归守卫）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -1920,8 +1922,18 @@ elif [ "$MODE" = "gitcode" ]; then
     run_timed gitcode-refs-probe    "$LAYER" gitcode-refs-probe
     run_timed gitcode-clone-hitmiss "$LAYER" gitcode-clone-hitmiss
     run_timed gitcode-lfs           "$LAYER" gitcode-lfs
+elif [ "$MODE" = "stale-index" ]; then
+    # R15 回归守卫（2026-10-29 取证）：源站索引页带 Cache-Control: max-age=1296000
+    # （15 天），squid 兜底 refresh_pattern 无 override-expire → 镜像重新生成索引
+    # 后仍长期供旧页，pip 报 No matching distribution（18:32:58 事故形态）。
+    # 阶段：mock 机制复现 + 真实索引页 squid×源站直连清单对照
+    # （test-squid/repro-stale-index.sh；runner 层 only）
+    run_timed env-snapshot            "$LAYER" env-snapshot
+    run_timed meta-trace              "$LAYER" meta-trace
+    run_timed stale-index-mechanism   "$LAYER" bash "$SCRIPT_DIR/repro-stale-index.sh" mock
+    run_timed stale-index-origin-parity "$LAYER" bash "$SCRIPT_DIR/repro-stale-index.sh" parity
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index）" >&2
     exit 2
 fi
 

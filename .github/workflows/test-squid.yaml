@@ -24,6 +24,8 @@
 #                  HEAVY=1 追加 rustup/conda/cmake/bazel/precommit）
 #   pkg         —— dnf/yum 包管理链路（openEuler 24.03 容器层，R20：RHEL 系
 #                  CA 信任路径 + 原生 rpm 源/GPG 校验）
+#   stale-index —— 索引页陈旧复现（源站 max-age 15 天 → squid 长期供旧页，
+#                  2026-10-29 triton-ascend 3.6.0.post2 构建失败回归守卫）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
 # =============================================================================
 name: test-squid
@@ -79,6 +81,14 @@ on:
         description: 'dnf/yum 容器层镜像（跨集群拉取慢时换成就近仓库，如 quay.io/openeuler/openeuler:24.03）'
         required: false
         default: 'swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/openeuler/openeuler:24.03'
+      stale_index:
+        description: '1=启用索引页陈旧复现（源站 max-age 15 天 → squid 长期供旧页；2026-10-29 post2 构建失败回归守卫）'
+        required: false
+        default: '0'
+      stale_strict:
+        description: '1=parity 严格模式：经 squid HIT 且 Age 超阈值（900s）判红（验证短 TTL 规则已生效）'
+        required: false
+        default: '1'
   pull_request:
     paths:
       - 'test-squid/**'
@@ -438,6 +448,33 @@ jobs:
           path: /tmp/repro-miss-p95/
           if-no-files-found: warn
 
+  stale-index:
+    name: 索引页陈旧复现（max-age 陷阱）
+    # 2026-10-29 triton-ascend 3.6.0.post2 构建失败取证：镜像源 10-28 21:50 已
+    # 重新生成索引页（含 post2），squid 因源站 Cache-Control: max-age=1296000
+    # （15 天）判新鲜、不回源验证，18:32:58 仍供旧页 → pip No matching distribution；
+    # 两台副本先后换页后（19:33）才自愈（失败窗口约 1 小时）。
+    # 两个阶段：mock 机制复现（长 max-age + 翻页后仍供旧页）+ 真实索引页
+    # squid×源站直连清单对照（test-squid/repro-stale-index.sh，R15 回归守卫）。
+    # opt-in：stale_index=1 才跑（修复未落地时 parity 会红，属预期）。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.stale_index == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行索引页陈旧复现
+        env:
+          STALE_STRICT: ${{ inputs.stale_strict }}
+        run: bash test-squid/run-suite.sh --mode stale-index
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-stale-index
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   container-miss-p95:
     name: 容器层·MISS p95 假慢复现（CANN 镜像）
     needs: [miss-p95, container-tools]
@@ -541,7 +578,7 @@ jobs:
 
   summary:
     name: 汇总
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -555,7 +592,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"

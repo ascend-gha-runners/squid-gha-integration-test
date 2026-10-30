@@ -323,6 +323,40 @@ runner 容器没有这条重写。
 说明：该链路属 `.svc.cluster.local`（在 NO_PROXY 内）直连，**不经过 squid**，
 故本组不跑 `meta-trace`；结论只代表缓存后端（smart git proxy / git-cdn）的行为。
 
+### stale-index 组（索引页陈旧复现，R15 回归守卫，runner 层 only，opt-in）
+
+背景（2026-10-29 取证）：triton-ascend 3.6.0.post2 构建在 18:32:58 报
+`No matching distribution found`。不是包缺失/网络/源站故障——镜像源 10-28 21:50
+已重新生成索引页（8012B，含 post2），但源站响应带 `Cache-Control: max-age=1296000`
+（15 天），squid 兜底 `refresh_pattern . 0 0% 0 refresh-ims` 没有 `override-expire`，
+源站 max-age 直接生效 → 对象全程判新鲜（`elapsed=0` / `HIER_NONE`），镜像重新生成
+索引后最长 15 天内不回源验证；两台副本 cache-0/1 先后换页（19:05/19:33）才自愈，
+失败窗口约 1 小时（attempt 1/2 红，attempt 4 绿）。
+
+触发：`gh workflow run test-squid.yaml -f stale_index=1`（仅 workflow_dispatch；
+`stale_strict=1` 为默认，验证短 TTL 规则是否落地）。
+
+| 阶段 | 场景 | 判定 |
+|---|---|---|
+| `stale-index-mechanism` | 自带 mock origin：索引页带 15 天 max-age；同 URL（run 唯一 query）经 squid 预热 → 源站翻页（新增 8 条 `3.6.0.post2`）→ 再经 squid 连打 | 翻页后仍返回旧页=复现成立 PASS；全部拿到新页=未复现记 SKIP（短 TTL 已生效或对象未缓存）；无代理 env=SKIP |
+| `stale-index-origin-parity` | 真实索引页（`STALE_INDEX_URL`，默认 mirrors triton-ascend）经 squid vs 源站直连（cache-buster + no-cache）的 href 清单对照，留档 `Cache-Control`/`Age`/`Cache-Status`/`Last-Modified` | 清单不一致=FAIL（18:32:58 形态，打印源站独有/缓存独有版本）；HIT 且 `Age > STALE_MAX_AGE_S`（默认 900s）=`STALE_STRICT=1` 时 FAIL（短 TTL 未生效）；无 squid 痕迹/源站不可达=SKIP |
+
+修复方向留档（配置侧，不在本套件内实施）：
+
+```conf
+refresh_pattern -i (mirrors|repo)\.huaweicloud\.com/ascend/repos/pypi/ 0 20% 10 ignore-reload override-expire
+refresh_pattern -i ascend\.devcloud\.huaweicloud\.com/pypi/ 0 20% 10 ignore-reload override-expire
+```
+
+只约束 Ascend/devcloud 的**索引页**路径，不影响同域 `.whl` 大对象缓存收益。
+
+本地冒烟（无 squid，两阶段均记 SKIP，只验脚本逻辑）：
+
+```bash
+RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh mock
+RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh parity
+```
+
 ## 结论口径
 
 - **PASS**：判定项全部达标（缓存 MISS→HIT 无缓存头等"数据记录"场景不阻断结论，但计入数据）。
