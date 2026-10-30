@@ -446,7 +446,8 @@ cacheability_case() {
             other=$((other + 1))
         elif cached_served "$results/cacheable-$i.hdr"; then
             hit=$((hit + 1))
-        elif echo "$status" | grep -qiE 'miss'; then
+        elif echo "$status" | grep -qiE 'miss|no-cache'; then
+            # miss=none;no-cache 是 squid 判定「不可缓存」时的标记（cache deny 命中即此形态）
             miss=$((miss + 1))
         else
             other=$((other + 1))
