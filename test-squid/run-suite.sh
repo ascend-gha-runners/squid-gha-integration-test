@@ -1930,8 +1930,8 @@ elif [ "$MODE" = "stale-index" ]; then
     # （test-squid/repro-stale-index.sh；runner 层 only）
     run_timed env-snapshot            "$LAYER" env-snapshot
     run_timed meta-trace              "$LAYER" meta-trace
-    run_timed stale-index-mechanism   "$LAYER" bash "$SCRIPT_DIR/repro-stale-index.sh" mock
-    run_timed stale-index-origin-parity "$LAYER" bash "$SCRIPT_DIR/repro-stale-index.sh" parity
+    run_timed stale-index-mechanism   "$LAYER" env RESULTS="$RESULTS_DIR/stale-index" bash "$SCRIPT_DIR/repro-stale-index.sh" mock
+    run_timed stale-index-origin-parity "$LAYER" env RESULTS="$RESULTS_DIR/stale-index" bash "$SCRIPT_DIR/repro-stale-index.sh" parity
 else
     echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index）" >&2
     exit 2

@@ -45,7 +45,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOCK_PID=""
 trap '[ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null' EXIT
-results="${RESULTS:-/tmp/repro-stale-index}"
+results="${RESULTS:-${RESULTS_DIR:-/tmp/repro-stale-index}}"
 mkdir -p "$results"
 
 PX="${PX:-${HTTP_PROXY:-${http_proxy:-}}}"
