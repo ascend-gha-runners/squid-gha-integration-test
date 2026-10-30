@@ -339,7 +339,7 @@ runner 容器没有这条重写。
 | 阶段 | 场景 | 判定 |
 |---|---|---|
 | `stale-index-mechanism` | 自带 mock origin：索引页带 15 天 max-age；同 URL（run 唯一 query）经 squid 预热 → 源站翻页（新增 8 条 `3.6.0.post2`）→ 再经 squid 连打 | **仅机制证据，不判红**：翻页后仍供旧页打印 ⚠️（证明"长 max-age 源站缺乏通用保护"的形态），全部新页打印 ℹ️；无代理 env / 无 squid 痕迹 = SKIP |
-| `stale-index-cacheability` | 真实域索引页带 run 唯一 query（缓存键全新）经 squid 连打 4 发 | **主判定**：任一发由缓存对象作答（`hit` / `fwd=stale` / `detail=mismatch`）= **FAIL**（可变索引页被缓存，即事故温床）；4 发全 MISS = PASS；无 squid 痕迹 = SKIP |
+| `stale-index-cacheability` | 真实域索引页**裸 URL**（与真实 pip 请求一致）经 squid 连打 4 发 | **主判定**：任一发由缓存对象作答（`hit` / `fwd=stale` / `detail=mismatch`）= **FAIL**（可变索引页被缓存，即事故温床）；4 发全 MISS = PASS；无 squid 痕迹 = SKIP。⚠️ 不能加 cache-buster query：实测带 query 时 squid 7 的 `urlpath_regex` 行尾 `$` 锚点失配（裸 URL 判 no-cache、加 `?probe=` 立刻 HIT），会把已修复集群误判为红 |
 | `stale-index-origin-parity` | 真实索引页（`STALE_INDEX_URL`，默认 mirrors triton-ascend）经 squid vs 源站直连（cache-buster + no-cache）的 href 清单对照，留档 `Cache-Control`/`Age`/`Cache-Status`/`Last-Modified` | 清单不一致 = **FAIL**（18:32:58 形态，打印源站独有/缓存独有版本）；HIT 且 `Age > STALE_MAX_AGE_S`（默认 900s）=`STALE_STRICT=1` 时 FAIL（短 TTL 未生效）；无 squid 痕迹/源站不可达 = SKIP |
 
 ⚠️ `stale-index-mechanism` 用的是 pod IP，**不匹配** `cache deny` 的 `hc_repo dstdomain`（只匹配 `mirrors/repo.huaweicloud.com`），所以它永远看不到域级修复、只作机制证据；真实域是否修复由 `cacheability`（是否被缓存）+ `origin-parity`（清单是否一致）判定。

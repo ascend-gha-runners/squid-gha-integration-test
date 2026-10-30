@@ -410,13 +410,17 @@ parity_case() {
 # =============================================================================
 # cacheability 子命令：真实域索引页「是否被缓存」判定（主判定）
 #   可变索引页必须每次回源（gy-006 用 cache deny hc_repo mutable_meta 实现，
-#   path ^/ascend/repos/.*/$）。做法：真实域 URL 带 run 唯一 query（缓存键全新，
-#   不受历史对象影响），连打 4 次；只要有一发由缓存对象作答（HIT / fwd=stale）
+#   path ^/ascend/repos/.*/$）。做法：**裸 URL**（与真实 pip 请求一致，不带 query）
+#   连打 4 次；只要有一发由缓存对象作答（HIT / fwd=stale / detail=mismatch）
 #   就说明这张索引页被缓存了 → 就是 18:32:58 事故的温床 → 判 FAIL。
-#   唯一 query 对源站无影响（已实测 200 / 8012B，与裸 URL 同页）。
+#
+#   ⚠️ 不能用 cache-buster query：实测 squid 7 的 urlpath_regex 在 URL 带 query 时
+#   让 `.../$` 这类行尾锚点失配（实测 `/ascend/repos/pypi/triton-ascend/` 裸 URL
+#   判 no-cache、加 `?__probe=` 后立刻 HIT），会把“规则已生效”误判成“被缓存”。
+#   真实 pip 取索引页就是裸 URL，故用裸 URL 才是对生产形态的判定。
 # =============================================================================
 cacheability_case() {
-    local i token probe_url code hit=0 miss=0 other=0 trace=0
+    local i probe_url="$STALE_INDEX_URL" code hit=0 miss=0 other=0 trace=0
     local status age
 
     if [ -z "$PX" ]; then
@@ -424,11 +428,6 @@ cacheability_case() {
         return 2
     fi
 
-    token="$(date +%s)-$$"
-    case "$STALE_INDEX_URL" in
-        *\?*) probe_url="$STALE_INDEX_URL&__idx_probe=$token" ;;
-        *)    probe_url="$STALE_INDEX_URL?__idx_probe=$token" ;;
-    esac
     echo "缓存性判定：$probe_url"
 
     for i in $(seq 1 4); do
