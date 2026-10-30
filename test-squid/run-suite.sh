@@ -325,6 +325,23 @@ conc-distinct() {
 # 容器内工具可能缺失：缺失记 ⚪ SKIP，不算失败
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# git 硬超时兜底（2026-10-30 事故）：容器层 github.com 被 insteadOf 重写到集群内
+# git-cdn，而 git-cdn 自身回源 github 经常连不上（TCP 握手即丢），它按
+# `aiohttp.ClientTimeout(total=None)` + 10 次退避重试一直挂着，git 客户端本身
+# 又没有超时 —— 一条静默上游连接就能让整个 job 挂到小时级（40995187145 的
+# tool-git 卡 4h、41016156204 的 checkout 卡 6min 都是这条链）。
+# 这里统一包 timeout，超时按失败计：宁可判红也不挂死。
+#   GIT_LS_TIMEOUT（默认 60s）  —— ls-remote / fetch 这类元数据操作
+#   GIT_OP_TIMEOUT（默认 180s）  —— clone
+#   GIT_BIG_TIMEOUT（默认 300s） —— git lfs pull 这类大对象下载
+git_to() {  # git_to <秒> <git 命令...>
+    local sec="$1"; shift
+    if have timeout; then timeout -k 10 "$sec" "$@"; else "$@"; fi
+}
+GIT_LS_TIMEOUT="${GIT_LS_TIMEOUT:-60}"
+GIT_OP_TIMEOUT="${GIT_OP_TIMEOUT:-180}"
+GIT_BIG_TIMEOUT="${GIT_BIG_TIMEOUT:-300}"
+
 # busybox wget 经 HTTP 代理访问 https 不发 CONNECT（把 https URL 当绝对 URI 直接
 # 丢给代理，squid 侧 abort），上游长期未修 → 任何用它下 https 的用例都必失败，
 # 且与 squid/CA/no_proxy 无关，统一记 ⚪ SKIP 而不是红。
@@ -351,8 +368,8 @@ conc-mixed() {
     # 2 git：ls-remote + 浅克隆（容器内 insteadOf 重写 gh-proxy 需认证时，
     #   属环境路由问题非 squid 层问题 → 降级 SKIP）
     if have git; then
-        ( git ls-remote https://github.com/octocat/Hello-World.git HEAD >"$wd/git-ls.log" 2>&1 \
-            && git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git "$wd/clone" >"$wd/git-clone.log" 2>&1 \
+        ( git_to "$GIT_LS_TIMEOUT" git ls-remote https://github.com/octocat/Hello-World.git HEAD >"$wd/git-ls.log" 2>&1 \
+            && git_to "$GIT_OP_TIMEOUT" git clone --depth 1 --filter=blob:none https://github.com/octocat/Hello-World.git "$wd/clone" >"$wd/git-clone.log" 2>&1 \
             && echo "✅ git" >>"$wd/verdict" \
             || { grep -q "could not read Username" "$wd/git-ls.log" "$wd/git-clone.log" 2>/dev/null \
                 && echo "⚪ git SKIP（insteadOf 重写 gh-proxy 需认证，环境路由问题非 squid 层）" >>"$wd/verdict" \
@@ -1011,7 +1028,7 @@ tool-conda() {
 tool-cmake() {
     need cmake || return 2
     local d="$RESULTS_DIR/cmake-proj"; rm -rf "$d"; mkdir -p "$d"
-    git clone --depth 1 --quiet https://github.com/google/googletest.git "$d/googletest" \
+    git_to "$GIT_OP_TIMEOUT" git clone --depth 1 --quiet https://github.com/google/googletest.git "$d/googletest" \
         > "$RESULTS_DIR/tool-cmake.log" 2>&1 || { echo "❌ googletest clone 失败"; return 1; }
     cat > "$d/CMakeLists.txt" <<'EOF'
 cmake_minimum_required(VERSION 3.16)
@@ -1149,10 +1166,10 @@ tool-hf() {
 # git 真实 clone —— no-mirror 直连 github.com（runner 层）/ insteadOf 重写 gh-proxy（容器层）
 tool-git() {
     local dir="$RESULTS_DIR/git-clone"; rm -rf "$dir"
-    git ls-remote https://github.com/octocat/Hello-World.git HEAD > "$RESULTS_DIR/tool-git.log" 2>&1 \
-        || { echo "❌ ls-remote 失败"; return 1; }
-    git clone --depth 1 --quiet https://github.com/octocat/Hello-World.git "$dir" >> "$RESULTS_DIR/tool-git.log" 2>&1 \
-        || { echo "❌ clone 失败"; return 1; }
+    git_to "$GIT_LS_TIMEOUT" git ls-remote https://github.com/octocat/Hello-World.git HEAD > "$RESULTS_DIR/tool-git.log" 2>&1 \
+        || { echo "❌ ls-remote 失败（超时阈值 ${GIT_LS_TIMEOUT}s）"; return 1; }
+    git_to "$GIT_OP_TIMEOUT" git clone --depth 1 --quiet https://github.com/octocat/Hello-World.git "$dir" >> "$RESULTS_DIR/tool-git.log" 2>&1 \
+        || { echo "❌ clone 失败（超时阈值 ${GIT_OP_TIMEOUT}s）"; return 1; }
     local nrewritten
     nrewritten=$(git config --global --get-regexp '^url\..*\.insteadof' 2>/dev/null | wc -l)
     if [ "$nrewritten" -gt 0 ]; then
@@ -1302,14 +1319,14 @@ ib-catlass() {
     echo "--- gitcode.com/cann/catlass @ $CATLASS_COMMIT（checkout submodules:recursive 形态）---"
     (
         cd "$dir" && git init -q . && git remote add origin https://gitcode.com/cann/catlass.git &&
-        git fetch -q --depth 1 origin "$CATLASS_COMMIT" && git checkout -q FETCH_HEAD
+        git_to "$GIT_OP_TIMEOUT" git fetch -q --depth 1 origin "$CATLASS_COMMIT" && git checkout -q FETCH_HEAD
     ) 2>"$RESULTS_DIR/catlass.err" || mode="default"
     if [ "$mode" = "default" ]; then
         # 部分托管端不放开任意 commit fetch（allowAnySHA1InWant）→ 回退默认分支
         # depth1：仅数据点（mock 形态降级），不判失败——代理链路是否通由内容落盘判
         echo "⚠️ pinned commit fetch 被拒（$(head -c 160 "$RESULTS_DIR/catlass.err" | tr '\n' ' ')），回退默认分支 depth1"
         (
-            cd "$dir" && git fetch -q --depth 1 origin && git checkout -q FETCH_HEAD
+            cd "$dir" && git_to "$GIT_OP_TIMEOUT" git fetch -q --depth 1 origin && git checkout -q FETCH_HEAD
         ) 2>>"$RESULTS_DIR/catlass.err" || { echo "❌ catlass fetch 失败（含默认分支回退）"; return 1; }
     fi
     local n
@@ -1736,7 +1753,7 @@ gitcode-lfs() {
     export GIT_LFS_SKIP_SMUDGE=1
     # LFS 仓库（如 Ascend/pytorch，LFS 体量 GB 级）历史与对象都大：clone 用
     # --depth 1 只取 HEAD 的指针，真正的对象下载由下面的 git lfs pull 有界执行。
-    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --single-branch -q "$url" "$d1" 2>"$RESULTS_DIR/gitcode-lfs-1.trace"; then
+    if ! GIT_TERMINAL_PROMPT=0 git_to "$GIT_OP_TIMEOUT" git clone --depth 1 --single-branch -q "$url" "$d1" 2>"$RESULTS_DIR/gitcode-lfs-1.trace"; then
         echo "❌ LFS 用例 clone 失败"
         tail -n 8 "$RESULTS_DIR/gitcode-lfs-1.trace" | sed 's/^/    | /'
         return 1
@@ -1767,7 +1784,7 @@ gitcode-lfs() {
     # 只拉这一个对象（不拉全仓 GB 级 LFS），两次独立 clone 各拉一次；
     # GIT_CURL_VERBOSE 是为了取对象实际下载域（见下方断言）。
     s=$(date +%s%3N)
-    if ! (cd "$d1" && GIT_TERMINAL_PROMPT=0 GIT_CURL_VERBOSE=1 git lfs pull --include="$obj" >"$RESULTS_DIR/gitcode-lfs-pull-1.log" 2>&1); then
+    if ! (cd "$d1" && GIT_TERMINAL_PROMPT=0 GIT_CURL_VERBOSE=1 git_to "$GIT_BIG_TIMEOUT" git lfs pull --include="$obj" >"$RESULTS_DIR/gitcode-lfs-pull-1.log" 2>&1); then
         echo "❌ 第 1 次 git lfs pull 失败"
         tail -n 8 "$RESULTS_DIR/gitcode-lfs-pull-1.log" | sed 's/^/    | /'
         return 1
@@ -1806,12 +1823,12 @@ gitcode-lfs() {
         echo "⚠️ 未能从 pull 日志解析对象下载 URL（oid=${oid:-<未取到>}），仅留档"
     fi
 
-    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --single-branch -q "$url" "$d2" 2>"$RESULTS_DIR/gitcode-lfs-2.trace"; then
+    if ! GIT_TERMINAL_PROMPT=0 git_to "$GIT_OP_TIMEOUT" git clone --depth 1 --single-branch -q "$url" "$d2" 2>"$RESULTS_DIR/gitcode-lfs-2.trace"; then
         echo "❌ 第 2 次 LFS clone 失败"
         return 1
     fi
     s=$(date +%s%3N)
-    if ! (cd "$d2" && GIT_TERMINAL_PROMPT=0 git lfs pull --include="$obj" >"$RESULTS_DIR/gitcode-lfs-pull-2.log" 2>&1); then
+    if ! (cd "$d2" && GIT_TERMINAL_PROMPT=0 git_to "$GIT_BIG_TIMEOUT" git lfs pull --include="$obj" >"$RESULTS_DIR/gitcode-lfs-pull-2.log" 2>&1); then
         echo "❌ 第 2 次 git lfs pull 失败"
         tail -n 8 "$RESULTS_DIR/gitcode-lfs-pull-2.log" | sed 's/^/    | /'
         return 1
