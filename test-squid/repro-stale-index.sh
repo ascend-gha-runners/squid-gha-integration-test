@@ -409,66 +409,90 @@ parity_case() {
 
 # =============================================================================
 # cacheability 子命令：真实域索引页「是否被缓存」判定（主判定）
-#   可变索引页必须每次回源（gy-006 用 cache deny hc_repo mutable_meta 实现，
-#   path ^/ascend/repos/.*/$）。做法：**裸 URL**（与真实 pip 请求一致，不带 query）
-#   连打 4 次；只要有一发由缓存对象作答（HIT / fwd=stale / detail=mismatch）
-#   就说明这张索引页被缓存了 → 就是 18:32:58 事故的温床 → 判 FAIL。
-#
-#   ⚠️ 不能用 cache-buster query：实测 squid 7 的 urlpath_regex 在 URL 带 query 时
-#   让 `.../$` 这类行尾锚点失配（实测 `/ascend/repos/pypi/triton-ascend/` 裸 URL
-#   判 no-cache、加 `?__probe=` 后立刻 HIT），会把“规则已生效”误判成“被缓存”。
-#   真实 pip 取索引页就是裸 URL，故用裸 URL 才是对生产形态的判定。
+#   可变索引页必须每次回源（gy-006 用 cache deny hc_repo mutable_meta 实现）。
+#   两种 URL 形态各打一组，任一发由缓存对象作答（HIT / fwd=stale / Vary mismatch）
+#   即判 FAIL：
+#     bare  —— 裸 URL，真实 pip 取索引页的形态，连打 4 发；
+#     query —— 唯一 query（`?__idx_query=<run>`），连打 2 发。
+#   为什么要 query 形态：squid 7 的 urlpath_regex 在 URL 带 query 时会让
+#   `.../$` 这类行尾锚点失配（实测裸 URL 判 no-cache、加 `?__probe=` 立刻 HIT）。
+#   若 deny 只用 `^/ascend/repos/.*/$`，带 query 的客户端（预签名/防盗链/附加参数）
+#   会绕过 deny 把索引页缓存下来；正确写法是 `^/ascend/repos/[^?]*/(\?.*)?$`。
+#   两形态都判 = 同时守住“真实 pip 形态”与“带 query 形态”。
 # =============================================================================
 cacheability_case() {
-    local i probe_url="$STALE_INDEX_URL" code hit=0 miss=0 other=0 trace=0
-    local status age
+    local token qurl
+    local b_hit b_miss b_other b_trace q_hit q_miss q_other q_trace
 
     if [ -z "$PX" ]; then
         echo "⚠️ 无代理 env——无法判定索引页缓存性，记 SKIP"
         return 2
     fi
 
-    echo "缓存性判定：$probe_url"
+    token="$(date +%s)-$$"
+    case "$STALE_INDEX_URL" in
+        *\?*) qurl="$STALE_INDEX_URL&__idx_query=$token" ;;
+        *)    qurl="$STALE_INDEX_URL?__idx_query=$token" ;;
+    esac
+    : > "$results/cacheability-counts.tsv"
 
-    for i in $(seq 1 4); do
-        # 固定 Accept-Encoding：真实页带 Vary: Accept-Encoding，请求头一致才可能 HIT
-        # （否则 Vary 不匹配会让本就该判红的情况看起来像 MISS）
-        code=$(NO_PROXY='' no_proxy='' curl -sS --max-time 60 -x "$PX" -H 'Accept-Encoding: gzip' \
-               -D "$results/cacheable-$i.hdr" \
-               -o "$results/cacheable-$i.html" -w '%{http_code}' "$probe_url" 2>"$results/cacheable-$i.err") || code="000"
-        status=$(hdr_val 'cache-status' "$results/cacheable-$i.hdr")
-        age=$(hdr_val 'age' "$results/cacheable-$i.hdr")
-        printf 'cacheability-%d\thttp=%s\t%s\tAge=%s\n' "$i" "$code" "${status:-N/A}" "${age:-N/A}" \
-            >> "$results/cacheability.tsv"
-        echo "  第 $i 发：http=$code  Cache-Status=${status:-N/A}  Age=${age:-N/A}"
-        squid_trace "$results/cacheable-$i.hdr" && trace=$((trace + 1))
-        if [ "$code" != "200" ]; then
-            other=$((other + 1))
-        elif cached_served "$results/cacheable-$i.hdr"; then
-            hit=$((hit + 1))
-        elif echo "$status" | grep -qiE 'miss|no-cache'; then
-            # miss=none;no-cache 是 squid 判定「不可缓存」时的标记（cache deny 命中即此形态）
-            miss=$((miss + 1))
-        else
-            other=$((other + 1))
-        fi
-    done
+    # probe_shape <label> <url> <shots>：逐发探测并把计数落盘（不在这里下结论）
+    probe_shape() {
+        local label=$1 url=$2 shots=$3 i code st age hit=0 miss=0 other=0 trace=0
+        echo "形态[$label]：$url"
+        for i in $(seq 1 "$shots"); do
+            # 固定 Accept-Encoding：真实页带 Vary: Accept-Encoding，请求头一致才可能 HIT
+            code=$(NO_PROXY='' no_proxy='' curl -sS --max-time 60 -x "$PX" -H 'Accept-Encoding: gzip' \
+                   -D "$results/cacheable-$label-$i.hdr" \
+                   -o "$results/cacheable-$label-$i.html" -w '%{http_code}' "$url" 2>"$results/cacheable-$label-$i.err") || code="000"
+            st=$(hdr_val 'cache-status' "$results/cacheable-$label-$i.hdr")
+            age=$(hdr_val 'age' "$results/cacheable-$label-$i.hdr")
+            printf 'cacheability-%s-%d\thttp=%s\t%s\tAge=%s\n' "$label" "$i" "$code" "${st:-N/A}" "${age:-N/A}" \
+                >> "$results/cacheability.tsv"
+            echo "  第 $i 发：http=$code  Cache-Status=${st:-N/A}  Age=${age:-N/A}"
+            squid_trace "$results/cacheable-$label-$i.hdr" && trace=$((trace + 1))
+            if [ "$code" != "200" ]; then
+                other=$((other + 1))
+            elif cached_served "$results/cacheable-$label-$i.hdr"; then
+                hit=$((hit + 1))
+            elif echo "$st" | grep -qiE 'miss|no-cache'; then
+                # miss=none;no-cache 是 squid 判定「不可缓存」时的标记（cache deny 命中即此形态）
+                miss=$((miss + 1))
+            else
+                other=$((other + 1))
+            fi
+        done
+        printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$hit" "$miss" "$other" "$trace" \
+            >> "$results/cacheability-counts.tsv"
+    }
 
-    if [ "$trace" -eq 0 ]; then
-        echo "⚠️ 4 发都无 squid 专属痕迹——流量未经过 squid，记 SKIP"
+    probe_shape bare  "$STALE_INDEX_URL" 4
+    probe_shape query "$qurl"            2
+
+    read -r _ b_hit b_miss b_other b_trace < <(awk -F'\t' '$1=="bare"' "$results/cacheability-counts.tsv")
+    read -r _ q_hit q_miss q_other q_trace < <(awk -F'\t' '$1=="query"' "$results/cacheability-counts.tsv")
+
+    if [ "${b_trace:-0}" -eq 0 ] && [ "${q_trace:-0}" -eq 0 ]; then
+        echo "⚠️ 两形态都无 squid 专属痕迹——流量未经过 squid，记 SKIP"
         return 2
     fi
-    if [ "$hit" -gt 0 ]; then
-        echo "❌ 可变索引页被缓存：同 URL 连打 4 发中有 ${hit} 发由缓存对象作答（HIT / fwd=stale）"
+    if [ "${b_hit:-0}" -gt 0 ]; then
+        echo "❌ 可变索引页被缓存（裸 URL）：4 发中有 ${b_hit} 发由缓存对象作答（HIT / fwd=stale）"
         echo "   后果：镜像重新生成索引后，客户端仍拿到旧版本清单 → pip 报 No matching distribution found"
         echo "   修复：cache deny 覆盖 (mirrors|repo).huaweicloud.com/ascend/repos/ 的索引页路径"
         return 1
     fi
-    if [ "$miss" -ge 3 ]; then
-        echo "✅ 索引页不缓存：4 发全部回源（MISS ${miss}/4，无 HIT），与可变元数据策略一致"
+    if [ "${q_hit:-0}" -gt 0 ]; then
+        echo "❌ 带 query 的索引页被缓存：2 发中有 ${q_hit} 发由缓存对象作答"
+        echo "   原因：deny 的 urlpath_regex 用行尾 \$ 锚点（^/ascend/repos/.*/\$），带 query 时失配"
+        echo "   修复：改成 ^/ascend/repos/[^?]*/(\\?.*)?\$（对 .whl 路径不匹配，不伤大对象缓存）"
+        return 1
+    fi
+    if [ "$((${b_miss:-0} + ${q_miss:-0}))" -ge 3 ]; then
+        echo "✅ 索引页不缓存：裸 URL ${b_miss}/4、带 query ${q_miss}/2 全部回源（无 HIT），与可变元数据策略一致"
         return 0
     fi
-    echo "⚠️ 判定证据不足（MISS ${miss}/4，HIT ${hit}/4，无结论 ${other}/4）——记 SKIP"
+    echo "⚠️ 判定证据不足（裸 ${b_miss:-0}/4、query ${q_miss:-0}/2 未缓存，HIT ${b_hit:-0}+${q_hit:-0}，无结论 ${b_other:-0}+${q_other:-0}）——记 SKIP"
     return 2
 }
 
