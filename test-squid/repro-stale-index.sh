@@ -14,9 +14,9 @@
 #   最长 15 天内不回源验证。与包缺失/网络/源站故障无关。
 #
 # 两个子命令：
-#   mock    —— 机制复现（自带 mock origin，纯标准库）：
+#   mock    —— 索引页陈旧判定（自带 mock origin，纯标准库）：
 #              索引页响应带 15 天 max-age；先经 squid 预热（同 URL），再翻页
-#              （源站新增 3.6.0.post2），再经 squid 请求——仍返回旧页即复现。
+#              （源站新增 3.6.0.post2），再经 squid 请求——只要仍返回旧页就判 FAIL。
 #              URL 带 run 唯一 query，跨 run 不撞缓存键（幂等，R5）。
 #   parity  —— 真实索引页新鲜度对照（回归守卫，R15）：
 #              经 squid 取索引页 vs 源站直连（cache-buster）取同一页，
@@ -38,7 +38,7 @@
 #   STALE_MAX_AGE_S    短 TTL 判定阈值（默认 900s：修复建议 max 10min + 5min 余量）
 #   STALE_STRICT       1=经 squid 的 HIT 且 Age 超阈值判红（短 TTL 规则未生效）
 #
-# 退出码：0=PASS（mock=复现成立 / parity=清单一致）；1=FAIL；2=SKIP（数据记录）
+# 退出码：0=PASS（未供旧页/清单一致）；1=FAIL（供旧索引页/清单不一致）；2=SKIP（取证不足）
 # =============================================================================
 set -uo pipefail
 
@@ -288,17 +288,16 @@ PY
 
     echo "翻页后经 squid：旧页 ${stale}/6，新页 ${fresh}/6"
     if [ "$stale" -gt 0 ]; then
-        echo "✅ 复现成立：源站已换成含 post2 的新页，经 squid 仍供旧页（缺 3.6.0.post2）"
-        echo "   机制：源站 Cache-Control: max-age=1296000（15 天）→ squid 判新鲜、未回源验证，"
-        echo "   客户端拿到的版本清单停在 3.6.0 → pip 报 No matching distribution found"
-        return 0
+        echo "❌ 缓存供旧索引页：源站已是含 post2 的新页，经 squid 仍有 ${stale}/6 返回旧页（缺 3.6.0.post2）"
+        echo "   后果：客户端版本清单停在 3.6.0 → pip 报 No matching distribution found"
+        return 1
     fi
     if [ "$fresh" -ge 6 ]; then
-        echo "⚠️ 未复现：翻页后经 squid 每次都拿到新页（短 TTL/刷新规则已生效，或缓存未命中）"
-        return 2
+        echo "✅ 翻页后经 squid 每次回源拿到新页（短 TTL/刷新规则对该 URL 生效）"
+        return 0
     fi
-    echo "⚠️ 未复现：翻页后经 squid 请求结果混合（旧 ${stale} / 新 ${fresh}），不足以判定"
-    return 2
+    echo "❌ 翻页后经 squid 结果混合（旧 ${stale} / 新 ${fresh}），存在供旧页的副本"
+    return 1
 }
 
 # =============================================================================

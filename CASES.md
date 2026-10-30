@@ -338,8 +338,10 @@ runner 容器没有这条重写。
 
 | 阶段 | 场景 | 判定 |
 |---|---|---|
-| `stale-index-mechanism` | 自带 mock origin：索引页带 15 天 max-age；同 URL（run 唯一 query）经 squid 预热 → 源站翻页（新增 8 条 `3.6.0.post2`）→ 再经 squid 连打 | 翻页后仍返回旧页=复现成立 PASS；全部拿到新页=未复现记 SKIP（短 TTL 已生效或对象未缓存）；无代理 env=SKIP |
-| `stale-index-origin-parity` | 真实索引页（`STALE_INDEX_URL`，默认 mirrors triton-ascend）经 squid vs 源站直连（cache-buster + no-cache）的 href 清单对照，留档 `Cache-Control`/`Age`/`Cache-Status`/`Last-Modified` | 清单不一致=FAIL（18:32:58 形态，打印源站独有/缓存独有版本）；HIT 且 `Age > STALE_MAX_AGE_S`（默认 900s）=`STALE_STRICT=1` 时 FAIL（短 TTL 未生效）；无 squid 痕迹/源站不可达=SKIP |
+| `stale-index-mechanism` | 自带 mock origin：索引页带 15 天 max-age；同 URL（run 唯一 query）经 squid 预热 → 源站翻页（新增 8 条 `3.6.0.post2`）→ 再经 squid 连打 | 翻页后**仍返回旧页 = FAIL**（缓存供旧索引页，缺 post2）；全部拿到新页 = PASS；无代理 env / 无 squid 痕迹 = SKIP |
+| `stale-index-origin-parity` | 真实索引页（`STALE_INDEX_URL`，默认 mirrors triton-ascend）经 squid vs 源站直连（cache-buster + no-cache）的 href 清单对照，留档 `Cache-Control`/`Age`/`Cache-Status`/`Last-Modified` | 清单不一致 = **FAIL**（18:32:58 形态，打印源站独有/缓存独有版本）；HIT 且 `Age > STALE_MAX_AGE_S`（默认 900s）=`STALE_STRICT=1` 时 FAIL（短 TTL 未生效）；无 squid 痕迹/源站不可达 = SKIP |
+
+⚠️ `stale-index-mechanism` 用的是 pod IP，**不匹配** `mirrors\.huaweicloud\.com/ascend/repos/pypi/` 域级规则。因此：若修复只覆盖真实域，本阶段会持续判红（它证明的是“缓存对长 max-age 源站缺乏通用保护”，不是该域是否已修）；真实域是否修复以 `parity` 为准。
 
 修复方向留档（配置侧，不在本套件内实施）：
 
