@@ -338,24 +338,31 @@ runner 容器没有这条重写。
 
 | 阶段 | 场景 | 判定 |
 |---|---|---|
-| `stale-index-mechanism` | 自带 mock origin：索引页带 15 天 max-age；同 URL（run 唯一 query）经 squid 预热 → 源站翻页（新增 8 条 `3.6.0.post2`）→ 再经 squid 连打 | 翻页后**仍返回旧页 = FAIL**（缓存供旧索引页，缺 post2）；全部拿到新页 = PASS；无代理 env / 无 squid 痕迹 = SKIP |
+| `stale-index-mechanism` | 自带 mock origin：索引页带 15 天 max-age；同 URL（run 唯一 query）经 squid 预热 → 源站翻页（新增 8 条 `3.6.0.post2`）→ 再经 squid 连打 | **仅机制证据，不判红**：翻页后仍供旧页打印 ⚠️（证明"长 max-age 源站缺乏通用保护"的形态），全部新页打印 ℹ️；无代理 env / 无 squid 痕迹 = SKIP |
+| `stale-index-cacheability` | 真实域索引页带 run 唯一 query（缓存键全新）经 squid 连打 4 发 | **主判定**：任一发由缓存对象作答（`hit` / `fwd=stale` / `detail=mismatch`）= **FAIL**（可变索引页被缓存，即事故温床）；4 发全 MISS = PASS；无 squid 痕迹 = SKIP |
 | `stale-index-origin-parity` | 真实索引页（`STALE_INDEX_URL`，默认 mirrors triton-ascend）经 squid vs 源站直连（cache-buster + no-cache）的 href 清单对照，留档 `Cache-Control`/`Age`/`Cache-Status`/`Last-Modified` | 清单不一致 = **FAIL**（18:32:58 形态，打印源站独有/缓存独有版本）；HIT 且 `Age > STALE_MAX_AGE_S`（默认 900s）=`STALE_STRICT=1` 时 FAIL（短 TTL 未生效）；无 squid 痕迹/源站不可达 = SKIP |
 
-⚠️ `stale-index-mechanism` 用的是 pod IP，**不匹配** `mirrors\.huaweicloud\.com/ascend/repos/pypi/` 域级规则。因此：若修复只覆盖真实域，本阶段会持续判红（它证明的是“缓存对长 max-age 源站缺乏通用保护”，不是该域是否已修）；真实域是否修复以 `parity` 为准。
+⚠️ `stale-index-mechanism` 用的是 pod IP，**不匹配** `cache deny` 的 `hc_repo dstdomain`（只匹配 `mirrors/repo.huaweicloud.com`），所以它永远看不到域级修复、只作机制证据；真实域是否修复由 `cacheability`（是否被缓存）+ `origin-parity`（清单是否一致）判定。
 
-修复方向留档（配置侧，不在本套件内实施）：
+修复方向留档（配置侧；gy-006 已落地 `cache deny` 版本）：
 
 ```conf
-refresh_pattern -i (mirrors|repo)\.huaweicloud\.com/ascend/repos/pypi/ 0 20% 10 ignore-reload override-expire
-refresh_pattern -i ascend\.devcloud\.huaweicloud\.com/pypi/ 0 20% 10 ignore-reload override-expire
+# 现行做法（推荐）：可变索引页不落盘，每次回源
+acl hc_repo dstdomain repo.huaweicloud.com mirrors.huaweicloud.com
+acl mutable_meta urlpath_regex -i ^/(ubuntu|ubuntu-ports)/dists/ ^/openeuler/.*/repodata/ ^/ascend/repos/.*/$
+cache deny hc_repo mutable_meta
+
+# 早期建议（refresh_pattern 不能压制源站显式 max-age，已被上面方案取代）
+# refresh_pattern -i (mirrors|repo)\.huaweicloud\.com/ascend/repos/pypi/ 0 20% 10 ignore-reload override-expire
 ```
 
 只约束 Ascend/devcloud 的**索引页**路径，不影响同域 `.whl` 大对象缓存收益。
 
-本地冒烟（无 squid，两阶段均记 SKIP，只验脚本逻辑）：
+本地冒烟（无 squid，三阶段均记 SKIP，只验脚本逻辑）：
 
 ```bash
 RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh mock
+RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh cacheability
 RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh parity
 ```
 

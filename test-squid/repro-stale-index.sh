@@ -13,11 +13,18 @@
 #   直接生效 → 对象全程判新鲜（elapsed=0 / HIER_NONE），镜像重新生成索引后
 #   最长 15 天内不回源验证。与包缺失/网络/源站故障无关。
 #
-# 两个子命令：
-#   mock    —— 索引页陈旧判定（自带 mock origin，纯标准库）：
+# 三个子命令：
+#   mock    —— 机制证据（自带 mock origin，纯标准库）：
 #              索引页响应带 15 天 max-age；先经 squid 预热（同 URL），再翻页
-#              （源站新增 3.6.0.post2），再经 squid 请求——只要仍返回旧页就判 FAIL。
+#              （源站新增 3.6.0.post2），再经 squid 请求，记录是否仍供旧页。
+#              仅留档、不判红——mock 主机是 runner pod IP，域级 deny 规则不适用
+#              （grep 结论看 cacheability）。
 #              URL 带 run 唯一 query，跨 run 不撞缓存键（幂等，R5）。
+#   cacheability —— 主判定：真实域索引页是否被缓存
+#              真实 URL 带 run 唯一 query 连打 4 次；任一发由缓存对象作答
+#              （HIT / fwd=stale）即判 FAIL——可变索引页被缓存就是事故温床。
+#              修复（cache deny hc_repo mutable_meta 覆盖 ^/ascend/repos/.*/$）
+#              落地后 4 发全 MISS → PASS。
 #   parity  —— 真实索引页新鲜度对照（回归守卫，R15）：
 #              经 squid 取索引页 vs 源站直连（cache-buster）取同一页，
 #              比对版本清单（href 集合）+ 留档 Cache-Control/Age/Cache-Status。
@@ -25,7 +32,7 @@
 #
 # 用法：
 #   bash test-squid/repro-stale-index.sh mock
-#   PX="${HTTP_PROXY:-${http_proxy:-}}" bash test-squid/repro-stale-index.sh mock
+#   bash test-squid/repro-stale-index.sh cacheability
 #   bash test-squid/repro-stale-index.sh parity
 #
 # 可覆盖：
@@ -76,6 +83,12 @@ hdr_val() {  # hdr_val <header-name> <hdr-file>
 
 squid_trace() {  # 响应头里是否有 squid 专属痕迹（Cache-Status/X-Cache-Lookup/Via）
     grep -qiE '^cache-status:.*squid|^x-cache-lookup:|^x-squid-error:|^via:.*squid' "$1" 2>/dev/null
+}
+
+cached_served() {  # 该响应是否由缓存对象作答/存在缓存副本
+    # HIT（squid 7: `squid-cache;hit;detail=match`）、fwd=stale（直接供旧副本）、
+    # detail=mismatch（Vary 不匹配但有存量对象）都说明该页被缓存了
+    grep -qiE '^cache-status:.*(hit|fwd=stale|detail=mismatch)|^x-cache-lookup:.*hit' "$1" 2>/dev/null
 }
 
 list_links() {  # <html> → 排序去重的 href 文件名（去 #fragment、取 basename；兼容单/双引号）
@@ -287,17 +300,18 @@ PY
     done
 
     echo "翻页后经 squid：旧页 ${stale}/6，新页 ${fresh}/6"
+    # 本阶段仅作机制证据，不参与判定：mock origin 主机是 runner pod IP，
+    # 而修复规则（cache deny hc_repo mutable_meta）按 dstdomain 命中 mirrors/repo
+    # 华为云域，pod IP 永远不匹配 → 该 URL 必然照样缓存旧页。真实判定看
+    # cacheability（真实域是否被缓存）+ parity（真实页清单是否与源站一致）。
     if [ "$stale" -gt 0 ]; then
-        echo "❌ 缓存供旧索引页：源站已是含 post2 的新页，经 squid 仍有 ${stale}/6 返回旧页（缺 3.6.0.post2）"
-        echo "   后果：客户端版本清单停在 3.6.0 → pip 报 No matching distribution found"
-        return 1
-    fi
-    if [ "$fresh" -ge 6 ]; then
-        echo "✅ 翻页后经 squid 每次回源拿到新页（短 TTL/刷新规则对该 URL 生效）"
+        echo "⚠️ 机制证据：源站已翻页（含 post2），经 squid 仍有 ${stale}/6 供旧页——"
+        echo "   复现了 18:32:58 的陷阱形态（可变索引页被按 15 天 max-age 判新鲜）"
+        echo "   （本阶段不判红：mock 主机是 pod IP，域级 deny 规则不适用于该 URL）"
         return 0
     fi
-    echo "❌ 翻页后经 squid 结果混合（旧 ${stale} / 新 ${fresh}），存在供旧页的副本"
-    return 1
+    echo "ℹ️ 翻页后经 squid 全部回源到新页（该 mock URL 未被缓存）"
+    return 0
 }
 
 # =============================================================================
@@ -393,8 +407,74 @@ parity_case() {
     return 0
 }
 
+# =============================================================================
+# cacheability 子命令：真实域索引页「是否被缓存」判定（主判定）
+#   可变索引页必须每次回源（gy-006 用 cache deny hc_repo mutable_meta 实现，
+#   path ^/ascend/repos/.*/$）。做法：真实域 URL 带 run 唯一 query（缓存键全新，
+#   不受历史对象影响），连打 4 次；只要有一发由缓存对象作答（HIT / fwd=stale）
+#   就说明这张索引页被缓存了 → 就是 18:32:58 事故的温床 → 判 FAIL。
+#   唯一 query 对源站无影响（已实测 200 / 8012B，与裸 URL 同页）。
+# =============================================================================
+cacheability_case() {
+    local i token probe_url code hit=0 miss=0 other=0 trace=0
+    local status age
+
+    if [ -z "$PX" ]; then
+        echo "⚠️ 无代理 env——无法判定索引页缓存性，记 SKIP"
+        return 2
+    fi
+
+    token="$(date +%s)-$$"
+    case "$STALE_INDEX_URL" in
+        *\?*) probe_url="$STALE_INDEX_URL&__idx_probe=$token" ;;
+        *)    probe_url="$STALE_INDEX_URL?__idx_probe=$token" ;;
+    esac
+    echo "缓存性判定：$probe_url"
+
+    for i in $(seq 1 4); do
+        # 固定 Accept-Encoding：真实页带 Vary: Accept-Encoding，请求头一致才可能 HIT
+        # （否则 Vary 不匹配会让本就该判红的情况看起来像 MISS）
+        code=$(NO_PROXY='' no_proxy='' curl -sS --max-time 60 -x "$PX" -H 'Accept-Encoding: gzip' \
+               -D "$results/cacheable-$i.hdr" \
+               -o "$results/cacheable-$i.html" -w '%{http_code}' "$probe_url" 2>"$results/cacheable-$i.err") || code="000"
+        status=$(hdr_val 'cache-status' "$results/cacheable-$i.hdr")
+        age=$(hdr_val 'age' "$results/cacheable-$i.hdr")
+        printf 'cacheability-%d\thttp=%s\t%s\tAge=%s\n' "$i" "$code" "${status:-N/A}" "${age:-N/A}" \
+            >> "$results/cacheability.tsv"
+        echo "  第 $i 发：http=$code  Cache-Status=${status:-N/A}  Age=${age:-N/A}"
+        squid_trace "$results/cacheable-$i.hdr" && trace=$((trace + 1))
+        if [ "$code" != "200" ]; then
+            other=$((other + 1))
+        elif cached_served "$results/cacheable-$i.hdr"; then
+            hit=$((hit + 1))
+        elif echo "$status" | grep -qiE 'miss'; then
+            miss=$((miss + 1))
+        else
+            other=$((other + 1))
+        fi
+    done
+
+    if [ "$trace" -eq 0 ]; then
+        echo "⚠️ 4 发都无 squid 专属痕迹——流量未经过 squid，记 SKIP"
+        return 2
+    fi
+    if [ "$hit" -gt 0 ]; then
+        echo "❌ 可变索引页被缓存：同 URL 连打 4 发中有 ${hit} 发由缓存对象作答（HIT / fwd=stale）"
+        echo "   后果：镜像重新生成索引后，客户端仍拿到旧版本清单 → pip 报 No matching distribution found"
+        echo "   修复：cache deny 覆盖 (mirrors|repo).huaweicloud.com/ascend/repos/ 的索引页路径"
+        return 1
+    fi
+    if [ "$miss" -ge 3 ]; then
+        echo "✅ 索引页不缓存：4 发全部回源（MISS ${miss}/4，无 HIT），与可变元数据策略一致"
+        return 0
+    fi
+    echo "⚠️ 判定证据不足（MISS ${miss}/4，HIT ${hit}/4，无结论 ${other}/4）——记 SKIP"
+    return 2
+}
+
 case "${1:-}" in
-    mock)   mock_case ;;
-    parity) parity_case ;;
-    *) echo "用法: $0 mock|parity（mock=机制复现；parity=真实索引页对照）" >&2; exit 2 ;;
+    mock)         mock_case ;;
+    cacheability) cacheability_case ;;
+    parity)       parity_case ;;
+    *) echo "用法: $0 mock|cacheability|parity（mock=机制证据；cacheability=真实域是否被缓存；parity=真实页清单对照）" >&2; exit 2 ;;
 esac
