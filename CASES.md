@@ -366,6 +366,46 @@ RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh cacheability
 RESULTS=/tmp/stale-index bash test-squid/repro-stale-index.sh parity
 ```
 
+### pip-metadata 组（PEP 658 metadata 不缓存，R22 回归守卫，runner 层 only，opt-in）
+
+背景（2026-10-31 pip hash 校验事故）：`download-r2.pytorch.org` 等 CDN 按
+`Accept-Encoding` 实际压缩，但响应**不带 `Vary`**；squid 存储副本无 Vary 键，首个
+请求者的编码定型并共享给所有客户端（配置里的 `reply_header_replace Vary
+Accept-Encoding` 只改回给客户端的响应头，不影响存储副本与缓存键计算）。pip 的
+metadata 请求只收 identity 且不解码（`decode_content=False`），拿到 gzip 变体后对
+压缩体算 sha256 必挂。metadata 是 KB 级、内容寻址（文件名含版本+平台）、pip 每次验
+hash 的对象，缓存收益趋近零，禁缓存后 MISS 回源代价可忽略。命中面是 wheel 与 sdist
+的 metadata 后缀（`.whl.metadata` / `.tar.gz.metadata` / `.zip.metadata`，对所有主机
+生效），`.whl/.tar.gz/.zip` 本体不以 `.metadata` 结尾，不受影响。
+
+触发：`gh workflow run test-squid.yaml -f pip_metadata=1`（可选
+`-f pip_metadata_url=<真实 metadata URL>`；仅 workflow_dispatch）。
+
+| 阶段 | 场景 | 判定 |
+|---|---|---|
+| `pip-metadata-mock` | 自带 mock origin：metadata 按 `Accept-Encoding` 压缩但不发 `Vary`；run 唯一路径保留三种后缀（deny 规则 host 无关，pod IP 同样命中）。每种后缀 gzip 预热 ×2 → identity ×2；再取 `.whl`/`.tar.gz`/`.zip` 本体 ×2 作负样本 | **主判定**：三种 metadata 任一发由缓存作答（`hit` / `fwd=stale` / Vary `mismatch`）= **FAIL**（编码变体可被共享）；identity 响应体 sha256 必须等于源站 identity 且非 gzip 魔数 `1f8b`/`Content-Encoding: gzip`，否则 **FAIL**（事故核心形态）；三种本体第二发必须各 HIT（负样本守卫：HIT 检测有效 + deny 未误伤大对象），否则 FAIL；无代理/无 squid 痕迹 = SKIP |
+| `pip-metadata-real` | 真实域 `.whl.metadata`（默认 torch wheel URL + `.metadata`，`PIP_METADATA_URL` 可覆盖）经 squid 连打 3 发；源站直连（no-cache）取 identity 真值 | 任一发 HIT/`fwd=stale`/`mismatch` = **FAIL**；identity 体与源站 sha256 不一致或 gzip 魔数 = **FAIL**；404 = SKIP（换 URL）；无 squid 痕迹/不可达/多数失败 = SKIP |
+| `pip-metadata-client` | 真实 pip（`--dry-run --no-deps --only-binary=:all: -v`，`PIP_INDEX_URL` 默认事故源 `download.pytorch.org/whl/cpu`，`PIP_PKG` 默认 `torch==2.10.0`）走 PEP 658 metadata 解析 | exit 0 = PASS（日志无 metadata 引用打印 ⚠️ 覆盖度注记）；报 hash/sha256/THashMismatch = **FAIL**（事故签名）；索引/网络/版本等非 hash 失败 = SKIP（R17）；pip <22.2 = SKIP |
+
+修复配置（host 无关，wheel/sdist metadata 后缀全覆盖；注意 squid 7 的
+`urlpath_regex` 带 query 时 `$` 锚点会失配，真实 pip 的 metadata URL 不带 query，
+故按需求保留后缀写法）：
+
+```conf
+acl pip_metadata urlpath_regex -i \.(whl|tar\.gz|zip)\.metadata$
+cache deny pip_metadata
+collapsed_forwarding_access deny pip_metadata
+```
+
+本地冒烟（无 squid，三个阶段均记 SKIP，只验脚本逻辑）：
+
+```bash
+RESULTS=/tmp/pip-metadata bash test-squid/repro-pip-metadata.sh mock
+RESULTS=/tmp/pip-metadata bash test-squid/repro-pip-metadata.sh real
+RESULTS=/tmp/pip-metadata bash test-squid/repro-pip-metadata.sh pip
+```
+
+
 ## 结论口径
 
 - **PASS**：判定项全部达标（缓存 MISS→HIT 无缓存头等"数据记录"场景不阻断结论，但计入数据）。

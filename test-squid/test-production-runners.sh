@@ -18,6 +18,8 @@
 #   ./test-squid/test-production-runners.sh --heavy 1          # 透传给 workflow
 #   ./test-squid/test-production-runners.sh --ref stale-index-case --stale-index 1
 #                                                              # 指定分支 + 顺带跑索引页陈旧复现（R15）
+#   ./test-squid/test-production-runners.sh --only gy-006 --pip-metadata 1
+#                                                              # 顺带跑 PEP 658 metadata 不缓存验证（R22）
 #   ./test-squid/test-production-runners.sh --only gy-005 --gitcode git-cdn-gitcode
 #                                                              # 顺带跑 gitcode 组（后端 smart-git-proxy|git-cdn-gitcode）
 #
@@ -52,7 +54,7 @@ RUNNERS=(
 
 ONLY=""; EXCLUDE=""; NO_WATCH=0; LIST_ONLY=0; HEAVY=""; LADDER=""
 GITCODE=""; GITCODE_BACKEND=""; GITCODE_LFS_REPO=""
-REF="main"; STALE_INDEX=""; STALE_STRICT="1"
+REF="main"; STALE_INDEX=""; STALE_STRICT="1"; PIP_METADATA=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --only)     ONLY="${2:?}"; shift 2 ;;
@@ -70,6 +72,7 @@ while [ $# -gt 0 ]; do
         --ref)      REF="${2:?}"; shift 2 ;;
         --stale-index) STALE_INDEX="${2:?}"; shift 2 ;;
         --stale-strict) STALE_STRICT="${2:?}"; shift 2 ;;
+        --pip-metadata) PIP_METADATA="${2:?}"; shift 2 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
@@ -111,6 +114,7 @@ trigger_one() {  # trigger_one <标签> → stdout: run_id
     fi
     [ -n "${BUNDLE_FIX:-}" ] && extra+=(-f bundle_fix="$BUNDLE_FIX")
     [ -n "$STALE_INDEX" ] && extra+=(-f stale_index="$STALE_INDEX" -f stale_strict="$STALE_STRICT")
+    [ -n "$PIP_METADATA" ] && extra+=(-f pip_metadata="$PIP_METADATA")
     if ! gh workflow run "$WF" --repo "$REPO" --ref "$REF" \
             -f runner="[\"$label\"]" ${extra+"${extra[@]}"}; then
         echo "TRIGGER_FAIL"

@@ -181,11 +181,28 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   RHEL 基底镜像真实跑。runner 与 CANN 镜像均 ubuntu，套件内 pkg 阶段按 R16
   记 SKIP；容器层单独一个 openEuler 24.03 job（SWR 华为云副本，多 arch）
   真实执行 dnf/yum。该形态同时是**唯一覆盖 RHEL 系 CA 信任路径**的样本：
-  注入脚本走 `/etc/pki/ca-trust/source/anchors` + `update-ca-trust extract`，
-  不经任何 CA 环境变量（dnf/librepo 只认系统 trust store，与 Debian 系的
-  `update-ca-certificates` 分叉）。repo 同步面收窄到 OS/everything/EPOL/
+  注入脚本走 `/etc/pki/ca-trust/source/anchors` + `update-ca-trust extract`，不经任何 CA 环境变量（dnf/librepo 只认系统 trust store，
+  与 Debian 系的 `update-ca-certificates` 分叉）。repo 同步面收窄到 OS/everything/EPOL/
   update 四个源（镜像默认还开 debuginfo/source/update-source，元数据 100MB+
   且与安装无关），源 URL 保持镜像默认（零换源，R16）。
+- **R22 PEP 658 metadata 不缓存**（2026-10-31，源自 pip hash 校验事故）：
+  编码变体毒化机理——CDN（download-r2.pytorch.org / files.pythonhosted.org /
+  repo.huaweicloud.com 等）按 `Accept-Encoding` 实际压缩，但响应不带 `Vary`；
+  squid 存储副本无 Vary 键，首个请求者的编码定型并共享给所有客户端
+  （`reply_header_replace Vary Accept-Encoding` 只改回给客户端的响应头，不影响
+  存储副本与缓存键计算）。pip 的 metadata 请求只收 identity 且**不解码**
+  （`decode_content=False`），拿到 gzip 变体后对压缩体算 sha256 必挂。
+  wheel 与 sdist 的 metadata 后缀（`.whl.metadata` / `.tar.gz.metadata` /
+  `.zip.metadata`）是 KB 级、内容寻址（文件名含版本+平台）、pip 每次验 hash 的
+  对象，缓存收益趋近零，因此**禁缓存**（`cache deny` +
+  `collapsed_forwarding_access deny`），后缀对所有主机生效；
+  `.whl/.tar.gz/.zip` 本体不以 `.metadata` 结尾，不受影响。
+  判定三面：① 同 URL 连打不得由缓存作答（`hit` / `fwd=stale` / Vary
+  `detail=mismatch` 都算缓存存量）；② identity 响应体 sha256 必须等于源站
+  identity，且不得是 gzip 魔数 `1f8b`（事故核心客户端面）；③ 同 host 本体
+  二连发必须 `hit`——负样本守卫，证明 HIT 检测方法有效且 deny 未误伤大对象。
+  真实域阶段另加 pip `--dry-run --no-deps` 端到端（PEP 658 metadata 解析 +
+  hash 校验），hash mismatch 判红，索引/网络/版本原因记 SKIP（R17 口径）。
 
 ## 六、与两份前作的关系
 

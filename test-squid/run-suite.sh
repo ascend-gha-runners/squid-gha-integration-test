@@ -13,6 +13,8 @@
 #       pkg         —— dnf/yum 包管理链路（openEuler 基底容器；RHEL 系 CA 注入路径）
 #       stale-index —— 索引页陈旧复现（源站 15 天 max-age → squid 长期供旧页，
 #                      2026-10-29 triton-ascend post2 构建失败回归守卫）
+#       pip-metadata —— PEP 658 metadata 不缓存（编码变体毒化守卫，
+#                      2026-10-31 pip hash 校验事故，META R22）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -1954,8 +1956,20 @@ elif [ "$MODE" = "stale-index" ]; then
     run_timed stale-index-mechanism   "$LAYER" env RESULTS="$RESULTS_DIR/stale-index" bash "$SCRIPT_DIR/repro-stale-index.sh" mock
     run_timed stale-index-cacheability "$LAYER" env RESULTS="$RESULTS_DIR/stale-index" bash "$SCRIPT_DIR/repro-stale-index.sh" cacheability
     run_timed stale-index-origin-parity "$LAYER" env RESULTS="$RESULTS_DIR/stale-index" bash "$SCRIPT_DIR/repro-stale-index.sh" parity
+elif [ "$MODE" = "pip-metadata" ]; then
+    # R22 回归守卫（2026-10-31 取证）：CDN 按 Accept-Encoding 压缩但不发 Vary，
+    # squid 存储副本无 Vary 键 → 首个请求者编码定型共享（reply_header_replace 只改
+    # 客户端响应头，不影响存储副本与缓存键）；pip metadata 只收 identity 且不解码，
+    # 拿到 gzip 变体后 sha256 必挂。修复为 cache deny (whl|tar.gz|zip).metadata。
+    # 阶段：mock 机制+判定（deny 生效 / identity 不被毒化 / .whl 仍可 HIT）
+    # + 真实域 metadata 不缓存与内容完整 + 真实 pip 解析（runner 层 only）
+    run_timed env-snapshot        "$LAYER" env-snapshot
+    run_timed meta-trace          "$LAYER" meta-trace
+    run_timed pip-metadata-mock   "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" mock
+    run_timed pip-metadata-real   "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" real
+    run_timed pip-metadata-client "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" pip
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata）" >&2
     exit 2
 fi
 

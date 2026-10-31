@@ -26,6 +26,8 @@
 #                  CA 信任路径 + 原生 rpm 源/GPG 校验）
 #   stale-index —— 索引页陈旧复现（源站 max-age 15 天 → squid 长期供旧页，
 #                  2026-10-29 triton-ascend 3.6.0.post2 构建失败回归守卫）
+#   pip-metadata —— PEP 658 metadata 不缓存（CDN 压缩但不发 Vary → 编码变体
+#                  毒化，2026-10-31 pip hash 校验事故回归守卫）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
 # =============================================================================
 name: test-squid
@@ -89,6 +91,14 @@ on:
         description: '1=parity 严格模式：经 squid HIT 且 Age 超阈值（900s）判红（验证短 TTL 规则已生效）'
         required: false
         default: '1'
+      pip_metadata:
+        description: '1=启用 PEP 658 metadata 不缓存验证（.whl.metadata 编码变体毒化，2026-10-31 pip hash 事故回归守卫）'
+        required: false
+        default: '0'
+      pip_metadata_url:
+        description: 'pip-metadata 组的真实 metadata URL（空=默认 torch wheel 的 PEP 658 metadata）'
+        required: false
+        default: ''
   pull_request:
     paths:
       - 'test-squid/**'
@@ -479,6 +489,36 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  pip-metadata:
+    name: PEP 658 metadata 不缓存（编码变体毒化）
+    # 2026-10-31 pip hash 校验事故：download-r2.pytorch.org 等 CDN 按
+    # Accept-Encoding 实际压缩但不发 Vary → squid 存储副本无 Vary 键，首个请求者
+    # 的编码定型共享给所有客户端（reply_header_replace 只改回给客户端的响应头，
+    # 不影响存储副本与缓存键）；pip 的 metadata 请求只收 identity 且不解码
+    # （decode_content=False），拿到 gzip 变体后 sha256 必挂。
+    # 修复：acl pip_metadata urlpath_regex -i \.(whl|tar\.gz|zip)\.metadata$
+    #       + cache deny pip_metadata（wheel/sdist metadata 后缀全 host 生效）。
+    # 阶段：mock 机制+判定（三种后缀 deny / identity 完整性 / 本体仍可 HIT）
+    # + 真实域 metadata 不缓存 + 真实 pip 解析（test-squid/repro-pip-metadata.sh）。
+    # opt-in：pip_metadata=1 才跑（修复未落地时 mock/real 会红，属预期）。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.pip_metadata == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 PEP 658 metadata 不缓存验证
+        env:
+          PIP_METADATA_URL: ${{ inputs.pip_metadata_url }}
+        run: bash test-squid/run-suite.sh --mode pip-metadata
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-pip-metadata
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   container-miss-p95:
     name: 容器层·MISS p95 假慢复现（CANN 镜像）
     timeout-minutes: 60
@@ -587,7 +627,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -601,7 +641,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
