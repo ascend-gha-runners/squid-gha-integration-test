@@ -43,13 +43,15 @@ jobs:
             # set -u 下 url="https://$host$path" 里的 $host 会变 unbound。
             local host="$1" path="$2" n="${3:-1}"
             local url="https://$host$path" i out code secs
+            local -a hdr=()
+            [ -n "${4:-}" ] && hdr=(-H "Referer: $4")
             for i in $(seq 1 "$n"); do
-              out=$(curl -sS -L --max-time 30 -r 0-2047 -o /dev/null \
+              out=$(curl -sS -L --max-time 30 -r 0-2047 -o /dev/null ${hdr[@]+"${hdr[@]}"} \
                       -w '%{http_code} %{time_total}' "$url" 2>/dev/null) || out="ERR 0"
               code=${out%% *}; secs=${out##* }
               printf '%s\t%s\t%s\tproxy\t%s\t%s\n' "$host" "$path" "$i" "$code" "$secs" >> "$OUT"
             done
-            out=$(curl -sS -L --max-time 15 --noproxy '*' -r 0-2047 -o /dev/null \
+            out=$(curl -sS -L --max-time 15 --noproxy '*' -r 0-2047 -o /dev/null ${hdr[@]+"${hdr[@]}"} \
                     -w '%{http_code} %{time_total}' "$url" 2>/dev/null) || out="ERR 0"
             code=${out%% *}; secs=${out##* }
             printf '%s\t%s\t1\tdirect\t%s\t%s\n' "$host" "$path" "$code" "$secs" >> "$OUT"
@@ -81,6 +83,16 @@ jobs:
           probe go.dev "/dl/" 1
           probe dl.google.com "/go/go1.26.1.linux-amd64.tar.gz" 1
           probe golang.google.cn "/" 1
+          # 大对象 Range 取证（wlcb-001 run 41180593919 里 go.dev/OBS 503，2026-10-31）
+          case "$(uname -m)" in
+              aarch64|arm64) GO_TB=arm64; CANN_ARCH=aarch64 ;;
+              *) GO_TB=amd64; CANN_ARCH=x86_64 ;;
+          esac
+          probe go.dev "/dl/go1.26.1.linux-$GO_TB.tar.gz" 2
+          probe golang.google.cn "/dl/go1.26.1.linux-$GO_TB.tar.gz" 2
+          probe ascend-repo.obs.cn-east-2.myhuaweicloud.com \
+                "/CANN/CANN%209.1.0/Ascend-cann-toolkit_9.1.0_linux-$CANN_ARCH.run" 1 \
+                "https://www.hiascend.com/"
           probe goproxy.cn "/github.com/google/uuid/@v/list" 1
           probe registry.npmmirror.com "/lodash" 1
           probe registry.npmjs.org "/lodash" 1
