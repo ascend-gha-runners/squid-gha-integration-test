@@ -94,8 +94,12 @@ run_timed() {
     local phase="$1" group="$2"
     shift 2
     local start end status sec
+    # 阶段自身的 stdout 落 <phase>.phase.log：多个 tool-* 阶段内部也往
+    # $RESULTS_DIR/<同名>.log 写命令输出，若此处复用同名文件，内层重定向会
+    # 截断外层的 fd、真实报错被 NUL 覆盖（wlcb-001 run 41178106355 实证）。
+    local plog="$RESULTS_DIR/$phase.phase.log"
     start=$(date +%s)
-    "$@" > "$RESULTS_DIR/$phase.log" 2>&1
+    "$@" > "$plog" 2>&1
     status=$?
     end=$(date +%s)
     sec=$((end - start))
@@ -107,10 +111,10 @@ run_timed() {
         log "### [$phase] OK   ${sec}s"
     elif [[ $status -eq 2 ]]; then
         log "### [$phase] SKIP ${sec}s  (数据记录，非失败；tail 见下)"
-        tail -n 5 "$RESULTS_DIR/$phase.log" | sed 's/^/    | /'
+        tail -n 5 "$plog" | sed 's/^/    | /'
     else
         log "### [$phase] FAIL(exit=$status)  ${sec}s  (tail 见下)"
-        tail -n 5 "$RESULTS_DIR/$phase.log" | sed 's/^/    | /'
+        tail -n 5 "$plog" | sed 's/^/    | /'
     fi
     return 0
 }
