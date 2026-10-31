@@ -21,6 +21,10 @@ on:
         description: 'github.com archive 路径重复次数（看 418 是否间歇）'
         required: false
         default: '5'
+      only:
+        description: '探针子集：all=全矩阵（默认）；range503=只跑大对象 Range 三目标（go.dev/golang.google.cn/OBS CANN）'
+        required: false
+        default: 'all'
 
 jobs:
   probe:
@@ -36,9 +40,19 @@ jobs:
           set -u
           OUT=/tmp/probe.tsv
           REPEAT='${{ inputs.repeat }}'
+          ONLY='${{ inputs.only }}'
           printf 'host\tpath\tattempt\tvia\tcode\ttime\n' > "$OUT"
 
-          probe() {  # probe <host> <path> [attempts]
+          probe() {  # probe <host> <path> [attempts] [referer]
+            # only=range503 时只保留大对象 Range 三目标：全矩阵逐域 30s 超时
+            # 在慢链路上会顶到 25min job 超时（wlcb-001 run 41181925740 实证）
+            if [ "$ONLY" = "range503" ]; then
+              case "$1" in
+                go.dev|golang.google.cn) ;;
+                ascend-repo.*) ;;
+                *) return 0 ;;
+              esac
+            fi
             # 不能写成一条 local 多赋值：bash 5.x 会先把所有名字本地化再求值，
             # set -u 下 url="https://$host$path" 里的 $host 会变 unbound。
             local host="$1" path="$2" n="${3:-1}"
