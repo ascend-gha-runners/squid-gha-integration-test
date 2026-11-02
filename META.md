@@ -120,6 +120,13 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   NO_PROXY 命中后同样是直连，相对判定退化为两条直连腿的抖动互搏
   （gy-001/gy-004 同 commit 一红一绿假红实证）。actions-channels 移出套件；
   R17 判据保留于 gh-proxy 通道（不在 NO_PROXY，A/B 仍真实）+ read_timeout 留档。
+  **parity 组 5xx 降噪**（2026-11-02，生产批量 gy-004/gy-005/wlcb-001 实证）：
+  `ck_get`/`ck_head`/`ck_json`/`ck_page`/`ck_get_inv` 及策略自探测遇 502/503/504
+  先退避重试 2 次（2s/4s），仍 5xx 记 `⚠️` WARN 不判红——上游 5xx 是集群出口
+  可达性问题（gy-004/gy-005 → golang.google.cn 504、wlcb-001 → dl.google.com
+  503；同 URL 其它集群全绿、本地直连 200/206），不是重写规则漂移；
+  内容签名/魔数/JSON 解析不符与非 5xx 的非预期码仍判红。策略探测自身 5xx 时
+  按默认 rewrite 继续，不误降级为 direct（否则会误触 crates-config-guard）。
 - **R18 镜像构建外网面复刻**（2026-10-14，源自 vllm-ascend Image Build and Push
   流量归因）：真实镜像构建（Dockerfile.310p）的出网面里，过 squid 的只有三类
   外网流量——① checkout@v7 submodules:recursive 按 .gitmodules 拉

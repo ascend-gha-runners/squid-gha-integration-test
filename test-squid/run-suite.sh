@@ -650,12 +650,37 @@ vllm-api-stream() {
 
 P_PASS=0; P_FAIL=0
 
+# R17 口径：上游 5xx（502/503/504）属链路可用性问题（DNS/连接失败、读超时），
+# 不是重写规则漂移。先重试 2 次（2s/4s 退避），仍 5xx 则记 ⚠️ WARN 留档、不判红
+# ——2026-10-31 gy-004/gy-005（golang.google.cn 504）、wlcb-001（dl.google.com 503）
+# 实测：同 URL 其它集群全绿、本地直连 200/206，纯集群出口可达性问题。
+# 内容签名/魔数/JSON 解析不符仍判红（那才是真的同构性破坏）。
+ck_code() {  # ck_code <curl 参数...> → 打印状态码；5xx 自动重试
+    local try code
+    for try in 1 2 3; do
+        code=$(curl -sS "$@" 2>>"$RESULTS_DIR/parity.log")
+        case "$code" in
+            502|503|504)
+                [ "$try" -lt 3 ] || break
+                sleep $((try*2))
+                continue ;;
+        esac
+        break
+    done
+    echo "$code"
+}
+
+ck_5xx_warn() {  # ck_5xx_warn <name> <url> <code> <注记>
+    echo "⚠️ $1 [$2] GET=$3（上游 5xx 链路可用性问题，R17 记 WARN 不判红）$4"
+}
+
 ck_get() {  # name url want_code [magic_hex] [grep_pat] —— GET+range，状态码/魔数/签名三重判
     local name=$1 url=$2 want=${3:-200} magic=${4:-} pat=${5:-}
     local body="$RESULTS_DIR/parity-body" code
-    code=$(curl -sS -L --max-time 90 -r 0-65535 -o "$body" -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    code=$(ck_code -L --max-time 90 -r 0-65535 -o "$body" -w '%{http_code}' "$url")
     case "$code" in
         "$want"|206) : ;;
+        502|503|504) ck_5xx_warn "$name" "$url" "$code"; return 0 ;;
         *) echo "✗ $name [$url] GET=$code 期望=$want ← 镜像路径不同构或失效"; P_FAIL=$((P_FAIL+1)); return 1 ;;
     esac
     if [ -n "$magic" ]; then
@@ -670,11 +695,14 @@ ck_get() {  # name url want_code [magic_hex] [grep_pat] —— GET+range，状�
 
 ck_head() {  # 大文件只 HEAD（conda repodata 等百 MB 级）
     local name=$1 url=$2 want=${3:-200} code
-    code=$(curl -sSI -L --max-time 60 -o /dev/null -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    code=$(ck_code -I -L --max-time 60 -o /dev/null -w '%{http_code}' "$url")
     if [ "$code" = "$want" ]; then
         echo "✓ $name HEAD=$code"; P_PASS=$((P_PASS+1))
     else
-        echo "✗ $name HEAD=$code 期望=$want ← 不同构或失效"; P_FAIL=$((P_FAIL+1))
+        case "$code" in
+            502|503|504) ck_5xx_warn "$name" "$url" "$code" ;;
+            *) echo "✗ $name HEAD=$code 期望=$want ← 不同构或失效"; P_FAIL=$((P_FAIL+1)) ;;
+        esac
     fi
 }
 
@@ -684,9 +712,10 @@ ck_json() {  # name url [must_key] —— 200/206 + 真 JSON 可解析
     # 这里做 json.load 真解析；不带 range（include=all 响应可达数百 KB，截断会崩）。
     local name=$1 url=$2 key=${3:-}
     local body="$RESULTS_DIR/parity-body" code
-    code=$(curl -sS -L --max-time 90 -o "$body" -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    code=$(ck_code -L --max-time 90 -o "$body" -w '%{http_code}' "$url")
     case "$code" in
         200|206) : ;;
+        502|503|504) ck_5xx_warn "$name" "$url" "$code"; return 0 ;;
         *) echo "✗ $name [$url] GET=$code（JSON 通道异常）"; P_FAIL=$((P_FAIL+1)); return 1 ;;
     esac
     if command -v python3 >/dev/null 2>&1; then
@@ -703,8 +732,11 @@ sys.exit(0 if (not sys.argv[2]) or (sys.argv[2] in json.dumps(d)) else 1)' "$bod
 
 ck_page() {  # name url —— 下载页守卫：必须 200 + HTML（防 /dl/ 被误改写成 /dl/go*）
     local name=$1 url=$2 body="$RESULTS_DIR/parity-body" code magic
-    code=$(curl -sS -L --max-time 60 -o "$body" -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    code=$(ck_code -L --max-time 60 -o "$body" -w '%{http_code}' "$url")
     magic=$(od -An -tx1 -N4 "$body" 2>/dev/null | tr -d ' \n')
+    case "$code" in
+        502|503|504) ck_5xx_warn "$name" "$url" "$code"; return 0 ;;
+    esac
     if [ "$code" != "200" ]; then
         echo "✗ $name [$url] GET=$code 期望=200 ← 下载页被误改写（规则3 应只匹配 /dl/go*）"; P_FAIL=$((P_FAIL+1)); return 1
     fi
@@ -727,9 +759,10 @@ neg_expect_404() {  # 负样本：故意错误映射，期望 404/403
 ck_get_inv() {  # name url want_code grep_pat —— direct 策略位：镜像特征必须【缺席】
     local name=$1 url=$2 want=${3:-200} pat=${4:-}
     local body="$RESULTS_DIR/parity-body" code
-    code=$(curl -sS -L --max-time 90 -r 0-65535 -o "$body" -w '%{http_code}' "$url" 2>>"$RESULTS_DIR/parity.log")
+    code=$(ck_code -L --max-time 90 -r 0-65535 -o "$body" -w '%{http_code}' "$url")
     case "$code" in
         "$want"|206) : ;;
+        502|503|504) ck_5xx_warn "$name" "$url" "$code"; return 0 ;;
         *) echo "✗ $name [$url] GET=$code（直连链路异常）"; P_FAIL=$((P_FAIL+1)); return 1 ;;
     esac
     if [ -n "$pat" ] && grep -qE "$pat" "$body"; then
@@ -743,19 +776,31 @@ rewrite-parity() {
     # 集群策略为 origin 直连（不重写）。crates config.json 的 api/v1/crates
     # 是唯一无歧义的镜像特征（origin config.json 上不存在），以它判定策略。
     local policy_code REWRITE_POLICY=rewrite
-    policy_code=$(curl -sS -L --max-time 60 -o "$RESULTS_DIR/parity-policy.json" -w '%{http_code}' \
-        "https://index.crates.io/config.json" 2>>"$RESULTS_DIR/parity.log")
-    grep -q 'api/v1/crates' "$RESULTS_DIR/parity-policy.json" 2>/dev/null || REWRITE_POLICY=direct
+    policy_code=$(ck_code -L --max-time 60 -o "$RESULTS_DIR/parity-policy.json" -w '%{http_code}' \
+        "https://index.crates.io/config.json")
+    case "$policy_code" in
+        # 策略探测自身拿 5xx 时无法判策略（不能当成 direct，会误触 crates-config-guard）
+        502|503|504) ck_5xx_warn "policy-probe" "https://index.crates.io/config.json" "$policy_code" " → 按默认 rewrite 继续" ;;
+        *)
+            grep -q 'api/v1/crates' "$RESULTS_DIR/parity-policy.json" 2>/dev/null || REWRITE_POLICY=direct ;;
+    esac
     echo "--- 重写策略探测：$REWRITE_POLICY（config.json GET=$policy_code）---"
 
     echo "--- 规则1/12 pypi → repo.huaweicloud.com/repository/pypi（索引+对象域）---"
     ck_get pypi-simple https://pypi.org/simple/flask/ 200 '' '\.\./\.\./packages/|files\.pythonhosted\.org'
     # 动态取真实 wheel 路径（经 squid 的 simple 页 = 镜像页）
-    local simple_html whl_href
-    simple_html=$(curl -sS -L --max-time 60 https://pypi.org/simple/flask/ 2>>"$RESULTS_DIR/parity.log")
+    local simple_code whl_href
+    simple_code=$(ck_code -L --max-time 60 -o "$RESULTS_DIR/parity-simple.html" -w '%{http_code}' \
+        https://pypi.org/simple/flask/)
+    case "$simple_code" in
+        502|503|504)
+            ck_5xx_warn "pypi-simple-href" "https://pypi.org/simple/flask/" "$simple_code" " → 跳过 pypi-packages"
+            simple_code=; whl_href=- ;;
+    esac
     # href 两种形态：镜像页相对路径（../../packages/…）或官方页绝对 URL（files.pythonhosted…）
-    whl_href=$(printf '%s' "$simple_html" | grep -o 'href="[^"]*\.whl' | head -1 | sed 's/^href="//')
+    [ -n "${whl_href:-}" ] || whl_href=$(grep -o 'href="[^"]*\.whl' "$RESULTS_DIR/parity-simple.html" 2>/dev/null | head -1 | sed 's/^href="//')
     case "$whl_href" in
+        -) : ;;   # 上一步 5xx 已记 WARN，不再重复判
         http*)
             ck_get pypi-packages "$whl_href" 200 ;;                       # 规则12：官方对象域
         ../*)

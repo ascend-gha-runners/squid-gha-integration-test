@@ -169,6 +169,12 @@ gy-006 的 squid 启用 `url_rewrite_program`：客户端零镜像配置，官�
 | rustup-manifest / rustup-init | 规则10a：huaweicloud 固定映射 | `manifest-version` / HEAD 200 |
 | NEG conda-nocloud（故意错映射，直连镜像） | R14 负样本 | 期望 404/403：证明判定方法有效 |
 
+**5xx 降噪（R17 口径，2026-11-02 生产批量实证）**：所有检查点遇 502/503/504 先
+退避重试 2 次（2s/4s），仍 5xx 记 `⚠️` 不判红——gy-004/gy-005 的
+`golang.google.cn` 504、wlcb-001 的 `dl.google.com` 503 属集群出口可达性问题
+（同 URL 其它集群全绿、本地直连 200/206），不是重写漂移；内容签名/魔数/JSON
+解析不符与非 5xx 的非预期码仍判红。
+
 ### tools 组（真实工具链 e2e：no-mirror 移植 + 上游仓库 CI 现状复刻）
 
 两个并存维度，判定口径分开：
