@@ -287,6 +287,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # runner 镜像不自带 node/npm（tool-npm/pnpm 会 SKIP）；用官方 Action 装。
+      # 失败不判红：保留原有 SKIP 语义，避免个别集群到 nodejs.org 不通时误红。
+      # 安装流量同样经 squid，属于真实客户端覆盖。
+      - uses: actions/setup-node@v4
+        continue-on-error: true
+        with:
+          node-version: '22'
+
       - name: 运行真实工具 e2e
         run: |
           HEAVY="${{ github.event_name == 'pull_request' && '0' || inputs.heavy }}" \
@@ -309,6 +317,13 @@ jobs:
       image: ${{ inputs.container_image || 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12' }}
     steps:
       - uses: actions/checkout@v7
+
+      # 容器层（CANN 镜像内）同样缺 node/npm；同一 Action 在容器内执行，
+      # continue-on-error 保持 SKIP 兜底语义
+      - uses: actions/setup-node@v4
+        continue-on-error: true
+        with:
+          node-version: '22'
 
       - name: 运行真实工具 e2e（容器层）
         run: |
