@@ -738,6 +738,56 @@ ck_get_inv() {  # name url want_code grep_pat —— direct 策略位：镜像�
     echo "✓ $name GET=$code 无镜像签名（direct 直连策略符合预期）"; P_PASS=$((P_PASS+1))
 }
 
+# 规则13 git smart-HTTP：github.com → gh-proxy 前缀式重写（info/refs + git-upload-pack 双端点）
+# 2026-11-03 补：此前只有 tool-git 的「clone 能过」功能验证，规则被删也能通过
+# （runner 层直连 github 可达、容器层由镜像 insteadOf 兜底），回归无守卫。
+# 这里用 GIT_CONFIG_GLOBAL/SYSTEM=/dev/null 剥掉 insteadOf，让 URL 原样交给 squid，
+# 再断言落点确实是 gh-proxy（响应头 Server: elb / X-Using-Nginx-Controller）；
+# 真 clone 负责覆盖 POST /git-upload-pack 分支（① 的 GET 探头覆盖不到）。
+GH_GIT_REWRITE_REPO="${GH_GIT_REWRITE_REPO:-https://github.com/minghuaslab/flash-attention-npu.git}"
+ck_git_rewrite() {
+    local repo="$GH_GIT_REWRITE_REPO" wd="$RESULTS_DIR/git-rewrite" hdr="$RESULTS_DIR/parity-hdr"
+    local code sig url="${repo%/}/info/refs?service=git-upload-pack"
+    rm -rf "$wd"; mkdir -p "$wd"
+
+    # ① 落点断言（GET 分支）：gh-proxy 响应带 Server: elb / X-Using-Nginx-Controller，
+    #    origin 直连是 Server: GitHub-Babel
+    code=$(curl -sS -D"$hdr" -o /dev/null -w '%{http_code}' --max-time 90 \
+        -H 'Accept: application/x-git-upload-pack-advertisement' "$url" 2>>"$RESULTS_DIR/parity.log")
+    sig=$(grep -iE '^(server|x-using-nginx-controller):' "$hdr" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+    if [ "$code" != "200" ]; then
+        echo "✗ git-info-refs GET=$code 期望=200（$sig）"; P_FAIL=$((P_FAIL+1)); return 1
+    fi
+    if [ "$REWRITE_POLICY" = direct ]; then
+        if grep -qiE 'x-using-nginx-controller: true|^server: elb' "$hdr"; then
+            echo "✗ git-info-refs 落到 gh-proxy（$sig）← direct 策略下被误重写"; P_FAIL=$((P_FAIL+1)); return 1
+        fi
+        echo "✓ git-info-refs → 源站直连（direct 策略：$sig）"; P_PASS=$((P_PASS+1))
+    else
+        if grep -qiE 'x-using-nginx-controller: true|^server: elb' "$hdr"; then
+            echo "✓ git-info-refs → gh-proxy（$sig）"; P_PASS=$((P_PASS+1))
+        else
+            echo "✗ git-info-refs 未落到 gh-proxy（$sig）← 规则13 未生效（clone 靠直连兜底）"; P_FAIL=$((P_FAIL+1)); return 1
+        fi
+    fi
+
+    # ② 真 clone（POST /git-upload-pack 分支）：浅克隆 + blob 过滤（约 140K，不拉大文件）
+    if git_to "$GIT_OP_TIMEOUT" env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_TERMINAL_PROMPT=0 git clone --depth 1 --filter=blob:none --no-checkout \
+        "$repo" "$wd/clone" >"$wd/clone.log" 2>&1 \
+        && git -C "$wd/clone" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        local origin
+        origin=$(git -C "$wd/clone" config --get remote.origin.url 2>/dev/null)
+        if [ "$origin" = "$repo" ]; then
+            echo "✓ git-clone 成功（HEAD $(git -C "$wd/clone" rev-parse --short HEAD)，origin 未被 gitconfig 重写）"; P_PASS=$((P_PASS+1))
+        else
+            echo "✗ git-clone origin=$origin ← insteadOf 未剥离，测到的不是 squid 层"; P_FAIL=$((P_FAIL+1)); return 1
+        fi
+    else
+        echo "✗ git-clone 失败（insteadOf 已剥离，链路为 squid 重写）"; tail -5 "$wd/clone.log" 2>/dev/null | sed 's/^/    /'; P_FAIL=$((P_FAIL+1)); return 1
+    fi
+}
+
 rewrite-parity() {
     # 策略自探测（R12 范围注记）：CN 出口集群配置镜像重写；HK 等海外出口
     # 集群策略为 origin 直连（不重写）。crates config.json 的 api/v1/crates
@@ -768,6 +818,9 @@ rewrite-parity() {
     ck_get gh-archive https://github.com/mvdan/sh/archive/refs/tags/v3.10.0.tar.gz 200 1f8b08
     ck_get gh-release https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64 200 7f454c46
     ck_get gh-raw https://raw.githubusercontent.com/mvdan/sh/master/README.md 200
+
+    echo "--- 规则13 git smart-HTTP：剥掉 insteadOf 后真 clone（info/refs + git-upload-pack 双端点）---"
+    ck_git_rewrite
 
     echo "--- 规则5 go：goproxy.cn 同构 / tarball→dl.google.com / ?mode=json→golang.google.cn（R15 守卫）---"
     ck_get goproxy-list https://proxy.golang.org/github.com/google/uuid/@v/list 200 '' '^v'
