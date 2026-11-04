@@ -632,6 +632,17 @@ jobs:
             "$R/fetch-container-auth.log" | sed -E 's/(Authorization: basic )[A-Za-z0-9+\/=]+/\1<redacted>/' \
             | head -16 | tee -a "$R/report.txt" || true
 
+          echo "### 未缓存仓库回源（octocat/Hello-World，必然走 git-cdn 上游）" | tee -a "$R/report.txt"
+          start=$(date +%s)
+          GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 timeout 120 \
+            git -c http.extraheader="Authorization: basic $auth" \
+            ls-remote https://github.com/octocat/Hello-World.git >"$R/lsremote-uncached.log" 2>&1
+          rc3=$?; sec3=$(( $(date +%s) - start))
+          echo "lsremote-uncached rc=$rc3 ${sec3}s" | tee -a "$R/report.txt"
+          grep -aE 'redirecting to|Connected to |Host:|HTTP/[12] [0-9]{3}|Location:|fatal:|not our ref|403|Forbidden|not found|denied' \
+            "$R/lsremote-uncached.log" | head -12 | tee -a "$R/report.txt" || true
+          head -3 "$R/lsremote-uncached.log" | tee -a "$R/report.txt" || true
+
       - name: 上传证据
         if: always()
         uses: actions/upload-artifact@v7
