@@ -2030,7 +2030,9 @@ elif [ "$MODE" = "gitcdn-unsynced" ]; then
     # 的 SHA 无法响应该 → checkout 报 not our ref（2026-11-04 run 41762789640）。
     # 本阶段正向断言「git-cdn 能回源未同步 SHA」，缺陷未修时红属预期。
     run_timed env-snapshot        "$LAYER" env-snapshot
-    run_timed gitcdn-unsynced-sha "$LAYER" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
+    # 显式传 RESULTS：脚本的证据文件（gitcfg.txt / control.log / target.log）要落在
+    # 套件结果目录里才会被 artifact 上传（RESULTS_DIR 未 export 到子进程）
+    run_timed gitcdn-unsynced-sha "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-unsynced" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
 else
     echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced）" >&2
     exit 2
