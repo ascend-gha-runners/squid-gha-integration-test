@@ -570,6 +570,54 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  git-container-probe:
+    name: 容器层 git 路由探针（容器内是否可见 insteadOf）
+    # runner 层实测：job 以 uid 1001 / HOME=/home/runner 跑，/root/.gitconfig 读不到
+    # （Permission denied），insteadOf 不生效。容器层是 root，需要单独取证：
+    # 若容器里能看到 /root/.gitconfig，则容器作业的 checkout 会直连 git-cdn（无 302）。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.git_probe == '1'
+    runs-on: ${{ fromJSON('["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 40
+    container:
+      image: ${{ inputs.container_image || 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12' }}
+    steps:
+      - name: 取证与 fetch
+        run: |
+          set -uo pipefail
+          R=/tmp/git-route-probe; mkdir -p "$R"
+          repo="$GITHUB_REPOSITORY"; sha="$GITHUB_SHA"
+          {
+            echo "id=$(id -u) user=$(id -un) HOME=${HOME:-<空>}"
+            echo "--- 配置文件 ---"
+            ls -l /root/.gitconfig /home/runner/.gitconfig /etc/gitconfig 2>&1 || true
+            echo "--- /root/.gitconfig ---"
+            cat /root/.gitconfig 2>&1 || true
+            echo "--- git 可见 url.* ---"
+            git config --show-origin --get-regexp '^url\.' || echo '(空)'
+            echo "--- ls-remote --get-url ---"
+            git ls-remote --get-url "https://github.com/$repo.git" || true
+          } | tee "$R/report.txt"
+
+          echo "### fetch（容器内，与 checkout 同一条命令）" | tee -a "$R/report.txt"
+          wd=$(mktemp -d); git -C "$wd" init -q
+          git -C "$wd" remote add origin "https://github.com/$repo"
+          start=$(date +%s)
+          GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 timeout 180 \
+            git -C "$wd" fetch --no-tags --prune --depth=1 origin "+$sha:refs/probe" \
+            >"$R/fetch-container.log" 2>&1
+          rc=$?; sec=$(( $(date +%s) - start))
+          echo "fetch-container rc=$rc ${sec}s" | tee -a "$R/report.txt"
+          grep -aE 'redirecting to|Connected to |CONNECT |Host:|HTTP/[12] [0-9]{3}|Location:|fatal:' \
+            "$R/fetch-container.log" | head -16 | tee -a "$R/report.txt"
+
+      - name: 上传证据
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: git-container-probe
+          path: /tmp/git-route-probe/
+          if-no-files-found: warn
+
   container-miss-p95:
     name: 容器层·MISS p95 假慢复现（CANN 镜像）
     timeout-minutes: 60
