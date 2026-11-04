@@ -216,8 +216,11 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   gh-proxy 403；退避 0.5/1/2/4/8s 全败后客户端收 `upload-pack: not our ref`。
   等缓存追平后同一 SHA 200（attempt 2 实测 147602 字节 pack 成功）。
   判定（正向断言健康行为，缺 SHA 必须能回源）：① 前置——git-cdn 根路径
-  可访问、`git ls-remote --get-url` 展开确为 git-cdn 基址（否则记 SKIP，
-  该 runner 没注入 insteadOf）；② 造"缓存必缺失"的 SHA——经 API 以 main
+  可访问（不可达记 SKIP，该集群没有 git-cdn）；runner 的 insteadOf 是否展开
+  只做取证留档（`gitcfg.txt`：uid/HOME/`url.*` 来源/`/root/.gitconfig` 内容），
+  不展开也继续——探测面显式打 `$GIT_CDN_BASE`，与 checkout 经 insteadOf 到达
+  的是同一个 Service、同一种客户端凭据形态（2026-11-04 首跑实证：同 pod 的
+  checkout 走 git-cdn，但步骤内 `git ls-remote --get-url` 未展开）；② 造"缓存必缺失"的 SHA——经 API 以 main
   的 tree + main 作 parent 建空提交，再建临时 `refs/heads/gitcdn-unsynced-*`
   （cache-warmer 30 分钟窗口内必未同步），缺 `contents: write` 记 SKIP；
   ③ 对照组——剥掉 insteadOf 直连 github.com 按 SHA fetch，失败重试后仍失败

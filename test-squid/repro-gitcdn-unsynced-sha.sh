@@ -73,18 +73,27 @@ if [ "$code" != "200" ]; then
     exit 2
 fi
 
-# ---- 前置检查 2：runner 实机 gitconfig 确实把 github.com 改写到 git-cdn --------
+# ---- 前置检查 2：runner 实机 gitconfig 是否把 github.com 改写到 git-cdn --------
 # 用 `git ls-remote --get-url` 看展开结果（不发网络请求），比直接读 config 更贴近
 # 客户端真实行为（insteadOf 可能来自 /root/.gitconfig、/etc/gitconfig 或 include）。
+# 无论是否展开都留一份取证：2026-11-04 首跑在 gy-006 job pod 里展开为原始 github
+# URL（同 pod 的 checkout 却走 git-cdn），需要区分「配置未落盘」与「进程看不到」。
 rewritten=$(GIT_TERMINAL_PROMPT=0 git ls-remote --get-url "https://github.com/$REPO_SLUG.git" 2>/dev/null)
+{
+    echo "id=$(id -u) HOME=${HOME:-<空>} cwd=$(pwd)"
+    echo "git ls-remote --get-url → ${rewritten:-<空>}"
+    git config --show-origin --get-regexp '^url\.' 2>/dev/null || echo "(git 可见的 url.* 配置为空)"
+    ls -l /root/.gitconfig /etc/gitconfig 2>&1 | sed 's/^/  /'
+    cat /root/.gitconfig 2>&1 | sed 's/^/  /'
+} >"$results/gitcfg.txt" 2>&1
+# 未展开不是「用例不可跑」：探测面本来就显式打 $GIT_CDN_BASE，与 checkout 经
+# insteadOf 到达的是同一个 Service、同一种客户端凭据形态，继续跑并留档。
 case "$rewritten" in
-    "$GIT_CDN_BASE"*|http://git-cdn-service.*) : ;;
+    "$GIT_CDN_BASE"*|http://git-cdn-service.*)
+        log "   insteadOf 生效：https://github.com/$REPO_SLUG.git → $rewritten" ;;
     *)
-        log "⚠️ insteadOf 未指向 git-cdn（展开为 ${rewritten:-空}）——不是被测形态，记 SKIP"
-        exit 2
-        ;;
+        log "⚠️ runner 侧未见 insteadOf（展开为 ${rewritten:-空}），取证见 gitcfg.txt —— 按显式 git-cdn 基址继续" ;;
 esac
-log "   insteadOf 展开：https://github.com/$REPO_SLUG.git → $rewritten"
 
 if [ -z "$TOKEN" ]; then log "⚠️ 无 GH_TOKEN（需要 contents: write 建临时 ref）——记 SKIP"; exit 2; fi
 
