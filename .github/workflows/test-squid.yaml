@@ -643,6 +643,30 @@ jobs:
             "$R/lsremote-uncached.log" | head -12 | tee -a "$R/report.txt" || true
           head -3 "$R/lsremote-uncached.log" | tee -a "$R/report.txt" || true
 
+          echo "### git-cdn 服务面探测（配置/指标是否可读）" | tee -a "$R/report.txt"
+          base=http://git-cdn-service.git-cdn.svc.cluster.local:8000
+          for p in / /health /healthz /metrics /api /api/v1 /status /config /debug/config /openapi.json; do
+            code=$(curl -sS -m 4 -o "$R/cdn$(echo "$p" | tr '/' '_').body" -w '%{http_code}' "$base$p" 2>/dev/null || echo ERR)
+            echo "$p -> $code" | tee -a "$R/report.txt"
+          done
+          for f in "$R"/cdn_*.body; do
+            [ -s "$f" ] || continue
+            echo "--- $f (head 12) ---" | tee -a "$R/report.txt"
+            head -12 "$f" | tee -a "$R/report.txt" || true
+          done
+
+          echo "### PR merge SHA（GitHub 合成，warmer 未必同步）经 git-cdn 取" | tee -a "$R/report.txt"
+          msha=$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "https://github.com/$repo.git" 'refs/pull/*/merge' 2>/dev/null | head -1 | cut -f1)
+          echo "pr-merge-sha=${msha:-<空>}" | tee -a "$R/report.txt"
+          if [ -n "${msha:-}" ]; then
+            wd3=$(mktemp -d); git -C "$wd3" init -q
+            git -C "$wd3" remote add origin "https://github.com/$repo"
+            timeout 120 git -c http.extraheader="Authorization: basic $auth" \
+              -C "$wd3" fetch --no-tags --depth=1 origin "+$msha:refs/probe-merge" >"$R/fetch-prmerge.log" 2>&1
+            echo "fetch-prmerge rc=$?" | tee -a "$R/report.txt"
+            grep -aE 'redirecting to|fatal:|not our ref|HTTP/[12] [0-9]{3}' "$R/fetch-prmerge.log" | head -8 | tee -a "$R/report.txt" || true
+          fi
+
       - name: 上传证据
         if: always()
         uses: actions/upload-artifact@v7
