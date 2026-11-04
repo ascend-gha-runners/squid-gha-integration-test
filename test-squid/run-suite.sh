@@ -744,90 +744,44 @@ ck_get_inv() {  # name url want_code grep_pat —— direct 策略位：镜像�
 # 这里用 GIT_CONFIG_GLOBAL/SYSTEM=/dev/null 剥掉 insteadOf，让 URL 原样交给 squid，
 # 再断言落点确实是 gh-proxy（响应头 Server: elb / X-Using-Nginx-Controller）；
 # 真 clone 负责覆盖 POST /git-upload-pack 分支（① 的 GET 探头覆盖不到）。
-# 2026-11-04 补 git-cdn 302 形态（ascend-ci-deployment#2470，gy-006 试点）：
-# squid 只对初始 GET info/refs?service=git-upload-pack 回 302，Location 指向集群内
-# git-cdn；POST git-upload-pack 与 receive-pack 必须不被 302 接管（否则 clone/push 失败），
-# 仍回落 gh-proxy。判定：302 落点 + Location 路径同构 + GIT_TRACE_CURL 里
-# git-cdn Host 至少出现 2 次（GET 跟随 + POST），证明 POST 确实也落在 git-cdn。
 GH_GIT_REWRITE_REPO="${GH_GIT_REWRITE_REPO:-https://github.com/minghuaslab/flash-attention-npu.git}"
-GH_GITCDN_HOST_RE="${GH_GITCDN_HOST_RE:-git-cdn-service\.git-cdn\.svc\.cluster\.local}"
 ck_git_rewrite() {
     local repo="$GH_GIT_REWRITE_REPO" wd="$RESULTS_DIR/git-rewrite" hdr="$RESULTS_DIR/parity-hdr"
-    local code loc sig url="${repo%/}/info/refs?service=git-upload-pack" mode=origin
+    local code sig url="${repo%/}/info/refs?service=git-upload-pack"
     rm -rf "$wd"; mkdir -p "$wd"
 
-    # ① 落点断言（GET 分支）：三种形态
-    #    - gitcdn   ：302 + Location 指向集群内 git-cdn（#2470，gy-006）
-    #    - ghproxy  ：200 + Server: elb / X-Using-Nginx-Controller（重写策略）
-    #    - origin   ：200 + Server: GitHub-Babel（direct 策略，HK 等海外出口）
+    # ① 落点断言（GET 分支）：gh-proxy 响应带 Server: elb / X-Using-Nginx-Controller，
+    #    origin 直连是 Server: GitHub-Babel
     code=$(curl -sS -D"$hdr" -o /dev/null -w '%{http_code}' --max-time 90 \
         -H 'Accept: application/x-git-upload-pack-advertisement' "$url" 2>>"$RESULTS_DIR/parity.log")
-    loc=$(grep -i '^location:' "$hdr" 2>/dev/null | tr -d '\r' | sed -E 's/^[Ll]ocation: *//')
     sig=$(grep -iE '^(server|x-using-nginx-controller):' "$hdr" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
-
-    if [ "$code" = 302 ] && printf '%s' "$loc" | grep -qE "$GH_GITCDN_HOST_RE"; then
-        mode=gitcdn
-        if printf '%s' "$loc" | grep -qE "${repo#https://github.com/}/info/refs\?service=git-upload-pack$"; then
-            echo "✓ git-info-refs → 302 git-cdn（路径同构：$loc）"; P_PASS=$((P_PASS+1))
-        else
-            echo "✗ git-info-refs 302 Location 路径不同构（$loc）← <gitCdnUrl> 拼接漂移"; P_FAIL=$((P_FAIL+1)); return 1
-        fi
-        # 负样本：302 只允许接管初始 GET。POST 的 302 默认不跟随（clone 会失败），
-        # push 的 receive-pack 维持 gh-proxy 路径。
-        local cpost crecv
-        cpost=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
-            -H 'Content-Type: application/x-git-upload-pack-request' --data '' \
-            "${repo%/}/git-upload-pack" 2>>"$RESULTS_DIR/parity.log")
-        case "$cpost" in
-            3??) echo "✗ git-upload-pack POST=$cpost ← 被 302 接管，clone 必失败"; P_FAIL=$((P_FAIL+1)); return 1 ;;
-            *) echo "✓ git-upload-pack POST=$cpost（未被 302 接管，回落 gh-proxy）"; P_PASS=$((P_PASS+1)) ;;
-        esac
-        crecv=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
-            "${repo%/}/info/refs?service=git-receive-pack" 2>>"$RESULTS_DIR/parity.log")
-        case "$crecv" in
-            3??) echo "✗ receive-pack info/refs=$crecv ← push 路径被 302 接管"; P_FAIL=$((P_FAIL+1)); return 1 ;;
-            *) echo "✓ receive-pack info/refs=$crecv（未被 302 接管）"; P_PASS=$((P_PASS+1)) ;;
-        esac
-    elif [ "$code" = 200 ] && grep -qiE 'x-using-nginx-controller: true|^server: elb' "$hdr"; then
-        mode=ghproxy
-        if [ "$REWRITE_POLICY" = direct ]; then
+    if [ "$code" != "200" ]; then
+        echo "✗ git-info-refs GET=$code 期望=200（$sig）"; P_FAIL=$((P_FAIL+1)); return 1
+    fi
+    if [ "$REWRITE_POLICY" = direct ]; then
+        if grep -qiE 'x-using-nginx-controller: true|^server: elb' "$hdr"; then
             echo "✗ git-info-refs 落到 gh-proxy（$sig）← direct 策略下被误重写"; P_FAIL=$((P_FAIL+1)); return 1
         fi
-        echo "✓ git-info-refs → gh-proxy（$sig）"; P_PASS=$((P_PASS+1))
+        echo "✓ git-info-refs → 源站直连（direct 策略：$sig）"; P_PASS=$((P_PASS+1))
     else
-        if [ "$code" != "200" ]; then
-            echo "✗ git-info-refs GET=$code 期望=200/302（$sig）"; P_FAIL=$((P_FAIL+1)); return 1
-        fi
-        if [ "$REWRITE_POLICY" != direct ]; then
+        if grep -qiE 'x-using-nginx-controller: true|^server: elb' "$hdr"; then
+            echo "✓ git-info-refs → gh-proxy（$sig）"; P_PASS=$((P_PASS+1))
+        else
             echo "✗ git-info-refs 未落到 gh-proxy（$sig）← 规则13 未生效（clone 靠直连兜底）"; P_FAIL=$((P_FAIL+1)); return 1
         fi
-        echo "✓ git-info-refs → 源站直连（direct 策略：$sig）"; P_PASS=$((P_PASS+1))
     fi
 
     # ② 真 clone（POST /git-upload-pack 分支）：浅克隆 + blob 过滤（约 140K，不拉大文件）
     if git_to "$GIT_OP_TIMEOUT" env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-        GIT_TERMINAL_PROMPT=0 GIT_TRACE_CURL=1 git clone --depth 1 --filter=blob:none --no-checkout \
+        GIT_TERMINAL_PROMPT=0 git clone --depth 1 --filter=blob:none --no-checkout \
         "$repo" "$wd/clone" >"$wd/clone.log" 2>&1 \
         && git -C "$wd/clone" rev-parse --verify -q HEAD >/dev/null 2>&1; then
-        local origin nhost npost
+        local origin
         origin=$(git -C "$wd/clone" config --get remote.origin.url 2>/dev/null)
-        if [ "$origin" != "$repo" ]; then
-            echo "✗ git-clone origin=$origin ← insteadOf 未剥离，测到的不是 squid 层"; P_FAIL=$((P_FAIL+1)); return 1
-        fi
-        if [ "$mode" = gitcdn ]; then
-            # GET（跟随 302）+ POST（git-upload-pack）都应落在 git-cdn；只命中 1 次说明
-            # POST 回落到了 gh-proxy（302 未被 git 跟随或 followRedirects 配置异常）
-            nhost=$(grep -acE "=> Send header: Host: ${GH_GITCDN_HOST_RE}" "$wd/clone.log" || true)
-            npost=$(grep -acE '=> Send header: POST ' "$wd/clone.log" || true)
-            if [ "${nhost:-0}" -ge 2 ] && [ "${npost:-0}" -ge 1 ]; then
-                echo "✓ git-clone 成功且 POST 已落到 git-cdn（HEAD $(git -C "$wd/clone" rev-parse --short HEAD)，Host: git-cdn ×$nhost，POST ×$npost）"; P_PASS=$((P_PASS+1))
-            else
-                echo "✗ git-clone 成功但未落在 git-cdn（Host ×${nhost:-0}，POST ×${npost:-0}）← 302 未被 git 跟随，或 POST 回落 gh-proxy"
-                grep -aE '=> Send header: (GET|POST|Host):' "$wd/clone.log" 2>/dev/null | tail -6 | sed 's/^/    /'
-                P_FAIL=$((P_FAIL+1)); return 1
-            fi
-        else
+        if [ "$origin" = "$repo" ]; then
             echo "✓ git-clone 成功（HEAD $(git -C "$wd/clone" rev-parse --short HEAD)，origin 未被 gitconfig 重写）"; P_PASS=$((P_PASS+1))
+        else
+            echo "✗ git-clone origin=$origin ← insteadOf 未剥离，测到的不是 squid 层"; P_FAIL=$((P_FAIL+1)); return 1
         fi
     else
         echo "✗ git-clone 失败（insteadOf 已剥离，链路为 squid 重写）"; tail -5 "$wd/clone.log" 2>/dev/null | sed 's/^/    /'; P_FAIL=$((P_FAIL+1)); return 1
