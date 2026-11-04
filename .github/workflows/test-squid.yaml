@@ -103,10 +103,6 @@ on:
         description: '1=复现 git-cdn 无法为未同步 SHA 回源（需 runner 已注入 insteadOf→git-cdn，如 gy-006；2026-11-04 checkout 事故守卫）'
         required: false
         default: '0'
-      git_probe:
-        description: '1=只跑 git 路由探针（insteadOf 是否对 checkout 生效 / squid 是否 302 / 剥离重写后能否从 github 取包）'
-        required: false
-        default: '0'
   pull_request:
     paths:
       - 'test-squid/**'
@@ -574,118 +570,51 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
-  git-route-probe:
-    name: git 路由探针（insteadOf / squid / 302 取证）
-    # 目的：一次性回答三个问题，不靠推断——
-    #   ① insteadOf 对「checkout 调起的 git 进程」是否可见（同用户同 HOME 的 shell 取证）
-    #   ② 原样 fetch（与 checkout 同样的命令）到底打到 github.com 还是 git-cdn，
-    #      若出现 HTTP 3xx，把状态码 + Location 原样留档（据此判断 302 是 squid 还是 git-cdn）
-    #   ③ 同一 fetch 剥离 url.*.insteadOf（GIT_CONFIG_GLOBAL/SYSTEM 置空）后能否成功
-    # 故意不写 `- uses: actions/checkout@v7`：checkout 本身若会挂，会把后续步骤一起带走；
-    # 用内联脚本复刻 checkout 的那条 fetch，等价且可留证据。
+  git-container-probe:
+    name: 容器层 git 路由探针（容器内是否可见 insteadOf）
+    # runner 层实测：job 以 uid 1001 / HOME=/home/runner 跑，/root/.gitconfig 读不到
+    # （Permission denied），insteadOf 不生效。容器层是 root，需要单独取证：
+    # 若容器里能看到 /root/.gitconfig，则容器作业的 checkout 会直连 git-cdn（无 302）。
     if: always() && github.event_name == 'workflow_dispatch' && inputs.git_probe == '1'
     runs-on: ${{ fromJSON('["linux-amd64-cpu-2", "gy-006"]') }}
-    timeout-minutes: 20
+    timeout-minutes: 40
+    container:
+      image: ${{ inputs.container_image || 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12' }}
     steps:
-      - name: 取证与三组对照
+      - name: 取证与 fetch
         run: |
           set -uo pipefail
           R=/tmp/git-route-probe; mkdir -p "$R"
           repo="$GITHUB_REPOSITORY"; sha="$GITHUB_SHA"
-
-          echo "### 0) 身份与 git 可见配置" | tee "$R/report.txt"
           {
-            echo "id=$(id -u) user=$(id -un) HOME=${HOME:-<空>} cwd=$(pwd)"
-            echo "--- 代理环境变量 ---"
-            env | grep -iE '^(http|https|no)_proxy=' || echo '(无)'
-            echo "--- git 可见的 url.*（show-origin）---"
-            git config --show-origin --get-regexp '^url\.' || echo '(空)'
-            echo "--- 候选配置文件 ---"
+            echo "id=$(id -u) user=$(id -un) HOME=${HOME:-<空>}"
+            echo "--- 配置文件 ---"
             ls -l /root/.gitconfig /home/runner/.gitconfig /etc/gitconfig 2>&1 || true
-            echo "--- /root/.gitconfig 内容 ---"
+            echo "--- /root/.gitconfig ---"
             cat /root/.gitconfig 2>&1 || true
-            echo "--- /etc/gitconfig 内容 ---"
-            cat /etc/gitconfig 2>&1 || true
-            echo "--- git ls-remote --get-url（客户端展开结果）---"
-            GIT_TERMINAL_PROMPT=0 git ls-remote --get-url "https://github.com/$repo.git" || true
-          } | tee -a "$R/report.txt"
+            echo "--- git 可见 url.* ---"
+            git config --show-origin --get-regexp '^url\.' || echo '(空)'
+            echo "--- ls-remote --get-url ---"
+            git ls-remote --get-url "https://github.com/$repo.git" || true
+          } | tee "$R/report.txt"
 
-          echo "### 1) curl 经 squid 打 git 端点（看是否有 3xx 与 Location）" | tee -a "$R/report.txt"
-          px="${HTTPS_PROXY:-${https_proxy:-}}"
-          curl -x "$px" -sS -o /dev/null -w 'via-proxy status=%{http_code} redirect=%{redirect_url}\n' \
-            "https://github.com/$repo/info/refs?service=git-upload-pack" 2>&1 | tee -a "$R/report.txt" || true
-          curl -sS --noproxy '*' -o /dev/null -w 'direct    status=%{http_code} redirect=%{redirect_url}\n' \
-            "https://github.com/$repo/info/refs?service=git-upload-pack" 2>&1 | tee -a "$R/report.txt" || true
-
-          echo "### 2) 原样配置 fetch（与 checkout 同一条命令）" | tee -a "$R/report.txt"
+          echo "### fetch（容器内，与 checkout 同一条命令）" | tee -a "$R/report.txt"
           wd=$(mktemp -d); git -C "$wd" init -q
           git -C "$wd" remote add origin "https://github.com/$repo"
           start=$(date +%s)
-          GIT_TRACE=1 GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 timeout 180 \
+          GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 timeout 180 \
             git -C "$wd" fetch --no-tags --prune --depth=1 origin "+$sha:refs/probe" \
-            >"$R/fetch-asis.log" 2>&1
+            >"$R/fetch-container.log" 2>&1
           rc=$?; sec=$(( $(date +%s) - start))
-          echo "fetch-asis rc=$rc ${sec}s" | tee -a "$R/report.txt"
-          grep -aE 'redirecting to|Uses proxy env variable|Connected to |HTTP/[12] [0-9]{3}|Location:|fatal:|error:' \
-            "$R/fetch-asis.log" | head -24 | tee -a "$R/report.txt"
-
-          echo "### 3) 剥离 insteadOf 后同一 fetch（对照组）" | tee -a "$R/report.txt"
-          wd2=$(mktemp -d); git -C "$wd2" init -q
-          git -C "$wd2" remote add origin "https://github.com/$repo"
-          start=$(date +%s)
-          GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TRACE_CURL=1 \
-            GIT_TERMINAL_PROMPT=0 timeout 180 \
-            git -C "$wd2" fetch --no-tags --prune --depth=1 origin "+$sha:refs/probe" \
-            >"$R/fetch-norewrite.log" 2>&1
-          rc2=$?; sec2=$(( $(date +%s) - start))
-          echo "fetch-norewrite rc=$rc2 ${sec2}s" | tee -a "$R/report.txt"
-          grep -aE 'redirecting to|Uses proxy env variable|Connected to |HTTP/[12] [0-9]{3}|Location:|fatal:|error:' \
-            "$R/fetch-norewrite.log" | head -24 | tee -a "$R/report.txt"
+          echo "fetch-container rc=$rc ${sec}s" | tee -a "$R/report.txt"
+          grep -aE 'redirecting to|Connected to |CONNECT |Host:|HTTP/[12] [0-9]{3}|Location:|fatal:' \
+            "$R/fetch-container.log" | head -16 | tee -a "$R/report.txt"
 
       - name: 上传证据
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: git-route-probe
-          path: /tmp/git-route-probe/
-          if-no-files-found: warn
-
-  git-route-checkout:
-    name: checkout 实测（剥离 insteadOf，走 squid 到 github）
-    # 与上一个 job 互补：用真正的 actions/checkout@v7，但把全局/系统 gitconfig 置空，
-    # 验证「没有 insteadOf 时，checkout 经 squid 能否从 github.com 取到 SHA」。
-    # 能过 = 302/insteadOf 才是变量；失败 = 链路本身到不了 github，与配置无关。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.git_probe == '1'
-    runs-on: ${{ fromJSON('["linux-amd64-cpu-2", "gy-006"]') }}
-    timeout-minutes: 20
-    steps:
-      - name: 准备空全局 gitconfig
-        run: ': > "$RUNNER_TEMP/empty-gitconfig"'
-
-      - uses: actions/checkout@v7
-        env:
-          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/empty-gitconfig
-          GIT_CONFIG_SYSTEM: /dev/null
-          GIT_TRACE: '1'
-          GIT_TRACE_CURL: '1'
-
-      - name: 记录实际来源
-        if: always()
-        run: |
-          set -uo pipefail
-          R=/tmp/git-route-probe; mkdir -p "$R"
-          {
-            echo "remote=$(git remote get-url origin 2>&1)"
-            echo "head=$(git rev-parse HEAD 2>&1)"
-            echo "--- 该 job 下 git 看到的 url.* ---"
-            git config --show-origin --get-regexp '^url\.' || echo '(空)'
-          } | tee -a "$R/report.txt"
-
-      - name: 上传证据
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: git-route-checkout
+          name: git-container-probe
           path: /tmp/git-route-probe/
           if-no-files-found: warn
 
