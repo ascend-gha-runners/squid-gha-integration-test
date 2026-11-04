@@ -661,10 +661,36 @@ jobs:
           if [ -n "${msha:-}" ]; then
             wd3=$(mktemp -d); git -C "$wd3" init -q
             git -C "$wd3" remote add origin "https://github.com/$repo"
-            timeout 120 git -c http.extraheader="Authorization: basic $auth" \
+
+            # 探针 A：git-cdn 指标快照（前后对照，看回源/错误计数是否增长）
+            curl -sS -m 10 "$base/metrics" >"$R/metrics-before.txt" 2>/dev/null || true
+            grep '^# HELP' "$R/metrics-before.txt" | awk '{print $3}' | sort >"$R/metric-names.txt" || true
+
+            # 探针 B：直接打 HTTP 层（不依赖 git），20s 内必须有响应
+            echo "--- curl POST git-upload-pack（20s 上限） ---" | tee -a "$R/report.txt"
+            curl -sS -m 20 -o /dev/null -w 'upload-pack-post status=%{http_code} time=%{time_total}\n' \
+              -H 'Content-Type: application/x-git-upload-pack-request' \
+              --data-binary '0000' \
+              "http://git-cdn-service.git-cdn.svc.cluster.local:8000/$repo.git/git-upload-pack" \
+              2>&1 | tee -a "$R/report.txt" || echo "upload-pack-post FAILED/timeout" | tee -a "$R/report.txt"
+
+            # 探针 C：fetch 带硬超时 + 每 5s 进度，保证一定拿到 rc 和日志长度
+            echo "--- fetch $msha（硬超时 45s，带进度） ---" | tee -a "$R/report.txt"
+            ( for i in $(seq 1 9); do sleep 5; echo "tick $((i*5))s bytes=$(wc -c <"$R/fetch-prmerge.log" 2>/dev/null || echo 0)" \
+                | tee -a "$R/report.txt"; done ) & ticker=$!
+            timeout 45 git -c http.extraheader="Authorization: basic $auth" \
               -C "$wd3" fetch --no-tags --depth=1 origin "+$msha:refs/probe-merge" >"$R/fetch-prmerge.log" 2>&1
-            echo "fetch-prmerge rc=$?" | tee -a "$R/report.txt"
-            grep -aE 'redirecting to|fatal:|not our ref|HTTP/[12] [0-9]{3}' "$R/fetch-prmerge.log" | head -8 | tee -a "$R/report.txt" || true
+            rc4=$?
+            kill $ticker 2>/dev/null || true
+            echo "fetch-prmerge rc=$rc4 (124=超时)" | tee -a "$R/report.txt"
+            grep -aE 'redirecting to|fatal:|not our ref|HTTP/[12] [0-9]{3}|error' "$R/fetch-prmerge.log" \
+              | head -6 | tee -a "$R/report.txt" || true
+            tail -4 "$R/fetch-prmerge.log" | tee -a "$R/report.txt" || true
+
+            curl -sS -m 10 "$base/metrics" >"$R/metrics-after.txt" 2>/dev/null || true
+            echo "--- 指标 diff（before vs after） ---" | tee -a "$R/report.txt"
+            diff "$R/metrics-before.txt" "$R/metrics-after.txt" 2>/dev/null \
+              | grep -E '^[<>]' | head -20 | tee -a "$R/report.txt" || echo "(无差异或不可读)" | tee -a "$R/report.txt"
           fi
 
       - name: 上传证据
