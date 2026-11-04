@@ -587,6 +587,8 @@ jobs:
     steps:
       - name: 取证与 fetch
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           R=/tmp/git-route-probe; mkdir -p "$R"
@@ -614,6 +616,21 @@ jobs:
           echo "fetch-container rc=$rc ${sec}s" | tee -a "$R/report.txt"
           grep -aE 'redirecting to|Connected to |CONNECT |Host:|HTTP/[12] [0-9]{3}|Location:|fatal:' \
             "$R/fetch-container.log" | head -16 | tee -a "$R/report.txt" || true
+
+          echo "### fetch（容器内 + Basic 凭据，复刻 actions/checkout 真实形态）" | tee -a "$R/report.txt"
+          wd2=$(mktemp -d); git -C "$wd2" init -q
+          git -C "$wd2" remote add origin "https://github.com/$repo"
+          auth=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+          start=$(date +%s)
+          GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 timeout 180 \
+            git -c http.extraheader="Authorization: basic $auth" \
+            -C "$wd2" fetch --no-tags --prune --depth=1 origin "+$sha:refs/probe-auth" \
+            >"$R/fetch-container-auth.log" 2>&1
+          rc2=$?; sec2=$(( $(date +%s) - start))
+          echo "fetch-container-auth rc=$rc2 ${sec2}s" | tee -a "$R/report.txt"
+          grep -aE 'redirecting to|Connected to |Authorization: |Host:|HTTP/[12] [0-9]{3}|Location:|fatal:|not our ref' \
+            "$R/fetch-container-auth.log" | sed -E 's/(Authorization: basic )[A-Za-z0-9+\/=]+/\1<redacted>/' \
+            | head -16 | tee -a "$R/report.txt" || true
 
       - name: 上传证据
         if: always()
