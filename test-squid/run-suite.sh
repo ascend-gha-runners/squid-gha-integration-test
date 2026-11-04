@@ -15,6 +15,8 @@
 #                      2026-10-29 triton-ascend post2 构建失败回归守卫）
 #       pip-metadata —— PEP 658 metadata 不缓存（编码变体毒化守卫，
 #                      2026-10-31 pip hash 校验事故，META R22）
+#       gitcdn-unsynced —— git-cdn 无法为未同步 SHA 回源（insteadOf→git-cdn 集群，
+#                      2026-11-04 gy-006 checkout 事故；独立脚本 repro-gitcdn-unsynced-sha.sh）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -2021,8 +2023,16 @@ elif [ "$MODE" = "pip-metadata" ]; then
     run_timed pip-metadata-mock   "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" mock
     run_timed pip-metadata-real   "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" real
     run_timed pip-metadata-client "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" pip
+elif [ "$MODE" = "gitcdn-unsynced" ]; then
+    # gy-006 专属：runner gitconfig 的 insteadOf 把 github.com 改写到集群内 git-cdn
+    # （.svc.cluster.local 在 NO_PROXY 内，流量不经 squid）。缺陷：客户端带 Basic
+    # 凭据时，git-cdn 回源 URL 被 generate_url 双拼 token → gh-proxy 403，未同步
+    # 的 SHA 无法响应该 → checkout 报 not our ref（2026-11-04 run 41762789640）。
+    # 本阶段正向断言「git-cdn 能回源未同步 SHA」，缺陷未修时红属预期。
+    run_timed env-snapshot        "$LAYER" env-snapshot
+    run_timed gitcdn-unsynced-sha "$LAYER" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced）" >&2
     exit 2
 fi
 

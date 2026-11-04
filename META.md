@@ -203,6 +203,32 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   二连发必须 `hit`——负样本守卫，证明 HIT 检测方法有效且 deny 未误伤大对象。
   真实域阶段另加 pip `--dry-run --no-deps` 端到端（PEP 658 metadata 解析 +
   hash 校验），hash mismatch 判红，索引/网络/版本原因记 SKIP（R17 口径）。
+- **R23 git-cdn 未同步 SHA 回源**（2026-11-04，源自 gy-006 checkout 事故 run
+  41762789640 attempt 1，11 个 job 中 9 个红）：该 runner 的 job pod postStart
+  写 `/root/.gitconfig`：`insteadOf https://github.com/ → http://git-cdn-service
+  .git-cdn.svc.cluster.local:8000/`，且 `NO_PROXY` 含 `.svc.cluster.local`——
+  git 流量**不经 squid**，终点是集群内 git-cdn（裸仓缓存 + cache-warmer 每
+  1800s 同步一次 refs）。当客户端要的 SHA 落在同步窗口外（新 push 的 commit、
+  PR head），git-cdn 走「先按 SHA 回源、再整仓 fetch、再按 SHA」的补丁路径，
+  在 `git_cdn/util.py::generate_url` 处炸：`base` 本身含两个 `https://`
+  （`https://gh-proxy.test.osinfra.cn/https://github.com/`），凭据按每个
+  `proto://` 各插一次 → 形成 token 双拼 URL，`git fetch` 约 0.13s 即 rc=128，
+  gh-proxy 403；退避 0.5/1/2/4/8s 全败后客户端收 `upload-pack: not our ref`。
+  等缓存追平后同一 SHA 200（attempt 2 实测 147602 字节 pack 成功）。
+  判定（正向断言健康行为，缺 SHA 必须能回源）：① 前置——git-cdn 根路径
+  可访问、`git ls-remote --get-url` 展开确为 git-cdn 基址（否则记 SKIP，
+  该 runner 没注入 insteadOf）；② 造"缓存必缺失"的 SHA——经 API 以 main
+  的 tree + main 作 parent 建空提交，再建临时 `refs/heads/gitcdn-unsynced-*`
+  （cache-warmer 30 分钟窗口内必未同步），缺 `contents: write` 记 SKIP；
+  ③ 对照组——剥掉 insteadOf 直连 github.com 按 SHA fetch，失败重试后仍失败
+  记 SKIP（上游自身抖动，R17 口径）；④ 被测面——真实客户端形态（
+  `-c http.extraheader=Authorization: basic <token>`，与 checkout UA 同路径）
+  经 git-cdn 基址按该 SHA fetch：成功 PASS；`401/Authentication failed`
+  记 SKIP；其它失败即缺陷复现判红。收尾用 trap 删除临时 ref，保证幂等（R5）。
+  该用例是**唯一覆盖 git-cdn 链路**的样本——git-cdn 流量属 `.svc.cluster.local`
+  直连，不经过 squid，故不参与 meta-trace / R1 双端证据的 squid 侧断言，
+  证据链改为「客户端 rc + git-cdn pod 日志（fetch_sha / still missing after
+  SHA fetch 行）」。只在容器层之外单列 job（opt-in `gitcdn_unsynced=1`）。
 
 ## 六、与两份前作的关系
 

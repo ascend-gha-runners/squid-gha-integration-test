@@ -99,6 +99,10 @@ on:
         description: 'pip-metadata 组的真实 metadata URL（空=默认 torch wheel 的 PEP 658 metadata）'
         required: false
         default: ''
+      gitcdn_unsynced:
+        description: '1=复现 git-cdn 无法为未同步 SHA 回源（需 runner 已注入 insteadOf→git-cdn，如 gy-006；2026-11-04 checkout 事故守卫）'
+        required: false
+        default: '0'
   pull_request:
     paths:
       - 'test-squid/**'
@@ -534,6 +538,38 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  gitcdn-unsynced:
+    name: git-cdn 未同步 SHA 回源复现
+    # 2026-11-04 gy-006（run 41762789640 attempt 1，9/11 job 红在 actions/checkout）：
+    # runner 的 /root/.gitconfig 有 insteadOf github.com → 集群内 git-cdn，客户端的
+    # fetch 按 SHA 直接打到 git-cdn（不经 squid，故与 squid 的 github 302 规则无关）。
+    # git-cdn 缓存里没有该 SHA 时回源，回源 URL 被 git_cdn/util.py:generate_url 把
+    # base 里的每个 https:// 都插一次凭据（GITSERVER_UPSTREAM 自带 .../https://github.com/
+    # → token 双拼），gh-proxy 立即 403 → git-cdn 回 `upload-pack: not our ref`。
+    # 本 job 正向断言「git-cdn 能回源未同步 SHA」：用 API 建临时 ref 造出一个上游
+    # 可服务而缓存必然缺失的 SHA（cache-warmer 每 30 分钟才同步），再按真实客户端
+    # 形态（Basic 凭据）经 git-cdn 取；缺陷未修时红属预期。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.gitcdn_unsynced == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    permissions:
+      contents: write   # 建/删临时 ref（造缓存缺失的 SHA），仅本 job
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 git-cdn 未同步 SHA 回源复现
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+        run: bash test-squid/run-suite.sh --mode gitcdn-unsynced
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-gitcdn-unsynced
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   container-miss-p95:
     name: 容器层·MISS p95 假慢复现（CANN 镜像）
     timeout-minutes: 60
@@ -642,7 +678,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -656,7 +692,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-gitcdn-unsynced \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
