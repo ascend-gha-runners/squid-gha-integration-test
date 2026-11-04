@@ -103,6 +103,10 @@ on:
         description: '1=复现 git-cdn 无法为未同步 SHA 回源（需 runner 已注入 insteadOf→git-cdn，如 gy-006；2026-11-04 checkout 事故守卫）'
         required: false
         default: '0'
+      git_probe:
+        description: '1=只跑 git 路由探针（insteadOf 是否对 checkout 生效 / squid 是否 302 / 剥离重写后能否从 github 取包）'
+        required: false
+        default: '0'
   pull_request:
     paths:
       - 'test-squid/**'
