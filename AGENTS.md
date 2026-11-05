@@ -63,6 +63,19 @@ gh workflow run probe-domain.yaml --repo ascend-gha-runners/squid-gha-integratio
 结果在 artifact `probe-domain` 的 `probe.tsv`（host/path/attempt/via/code/time），
 `via=proxy` 是经 squid、`via=direct` 是 `--noproxy '*'` 直连对照。
 
+### 3. 独立工作流（单用例 / 探针）
+
+不属于 squid 判定面的用例各自一个 workflow，改动只触发自己：
+
+| workflow | 用途 | 触发 |
+|---|---|---|
+| `test-gitcdn.yaml` | R23 git-cdn 未同步 SHA 回源（复用 `run-suite.sh --mode gitcdn-unsynced`，有 TSV gate） | dispatch + PR（`repro-gitcdn-unsynced-sha.sh`、自身） |
+| `test-gitcode-clone.yaml` | R21 性能面：gitcode/github clone 冷热耗时、并发阶梯、LFS | 仅 dispatch（容器层） |
+| `probe-domain.yaml` | 单 runner 域名出网矩阵 | 仅 dispatch，只留档不判红 |
+| `probe-gitcdn-filter.yaml` | git-cdn 部分克隆（`--filter=blob:none`）能力探针 | 仅 dispatch，一次性，只留 artifact |
+
+完整清单（含入口、实现、层、判定口径、规则号）见 `CASES.md` 的「用例登记表」。
+
 ## 二、前置条件（缺一不可）
 
 1. **runner 注入 squid**：目标 runner set 的 pod 模板必须已注入
@@ -122,6 +135,7 @@ gh workflow run probe-domain.yaml --repo ascend-gha-runners/squid-gha-integratio
 | `PEP 658 metadata 不缓存` | R22 opt-in（`pip_metadata=1`）：2026-10-31 pip hash 校验事故回归守卫。CDN 按 `Accept-Encoding` 实际压缩但不发 `Vary`，squid 存储副本无 Vary 键 → 首个请求者编码定型共享（`reply_header_replace` 只改客户端响应头，不影响存储副本与缓存键）；pip metadata 请求只收 identity 且不解码（`decode_content=False`），拿到 gzip 变体后 sha256 必挂。三个判定：mock origin（三种后缀 `.whl/.tar.gz/.zip.metadata` 的 gzip 预热 + identity 请求，`Cache-Status` 出现 hit/`fwd=stale`/`detail=mismatch` 即**判红**，且 identity 响应体 sha256 必须等于源站 identity、不得是 gzip 魔数；同 host 三种本体二连发必须 HIT 作负样本守卫）+ 真实域 `.whl.metadata`（默认 torch wheel + `.metadata`）经 squid 3 发不得 HIT、identity 体与源站直连 sha256 一致 + 真实 pip 解析（`--dry-run --no-deps`，出现 hash mismatch 判红，网络/版本原因记 SKIP）。修复配置：`acl pip_metadata urlpath_regex -i \.(whl|tar\.gz|zip)\.metadata$` + `cache deny pip_metadata` + `collapsed_forwarding_access deny pip_metadata`（后缀全 host 生效，本体不受影响）。独立脚本 `repro-pip-metadata.sh`，runner 层 only |
 | `真实工具链 e2e` | 真实客户端工具（pip/apt/npm/uv/go/wget/git-lfs/modelscope/model+dataset/git）零镜像配置跑通；另复刻上游仓库 CI 现状：`download.pytorch.org` torch 索引、`hf download` + `HF_ENDPOINT=hf-mirror.com`；`heavy=1` 追加 torch wheel 全量下载 + rustup/conda/cmake/bazel/precommit |
 | `git-cdn 未同步 SHA 回源复现` | R23 opt-in（`gitcdn_unsynced=1`）：2026-11-04 gy-006 9/11 job 红在 checkout 的回归守卫。runner 的 `/root/.gitconfig` 把 github.com `insteadOf` 到集群内 git-cdn（`.svc.cluster.local` 在 NO_PROXY 内，不经 squid，故与 squid 302 无关）；checkout 按 SHA 浅取时，缓存缺该 SHA 会回源，而回源 URL 被 `git_cdn/util.py:generate_url` 把 base 里每个 `https://` 都插一次凭据（`GITSERVER_UPSTREAM` 自带 `.../https://github.com/` → token 双拼）→ gh-proxy 403 → 客户端收 `upload-pack: not our ref`。用例造一个上游可服务而缓存必然缺失的 SHA（API 建临时 ref + 空提交，cache-warmer 30 分钟窗口内不会同步），按真实客户端形态（Basic 凭据）经 git-cdn 取，正向断言应成功；缺陷未修则红。独立脚本 `repro-gitcdn-unsynced-sha.sh`，runner 层 only，需 `contents: write` |
+| `docker build clone test` | R24 opt-in（`docker_build_clone=1`）：复刻 vllm-ascend#20836 把 Dockerfile 取数改成 `-c url.<git-cdn>.insteadOf` 显式重写后的四条命令——vllm 大仓浅 clone（跑两遍留档缓存收益，不判红）、按 SHA `fetch --depth 1 <repo> <commit>`（未同步 SHA 风险面，60s 内必须明确结束且成功）、flash-attention-npu 全量 clone、vllm-ascend 浅 clone + `submodule update --init --recursive`（github+gitcode 双 mirror，验 catlass 检出）。**runner 层 + 容器层各一遍**：脚本内部用内联 `-c`，两层结论应一致，这正是「PR 写法不依赖宿主 `/root/.gitconfig`」的验证。流量属 `.svc.cluster.local` 直连，不经过 squid，故不跑 meta-trace；git-cdn 不可达 → SKIP 不判红。独立脚本 `docker-build-clone-test.sh`。⚠️ 该 job 尚未合并进 main（见分支 `probe-git-route`） |
 | `容器层·*（CANN 镜像）` | 功能/并发/vllm/工具链/miss-p95/镜像构建/no_proxy×CA 矩阵七组在 `cann:9.0.0-a3-ubuntu22.04-py3.12` 容器里各跑一遍（多验 CA 信任路径 + 镜像内 gitconfig 形态）；容器层 job 用 needs 链串行（container hook 并发挂死竞态，issue #2） |
 | `容器层·dnf/yum（openEuler 24.03）` | R20：`swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/openeuler/openeuler:24.03` 里真实跑 `dnf makecache` + `dnf install tree` + `yum install jq`；首步 dnf 装 `git-core` 引导 checkout。这是套件里唯一覆盖 RHEL 系 CA 信任路径（anchors + `update-ca-trust`，不靠 CA env）的样本 |
 | `汇总` | 聚合全部 job 结果表到 GITHUB_STEP_SUMMARY |

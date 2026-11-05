@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# gitcode-clone-bench.sh —— 只测 gitcode clone 的耗时与吞吐（R22）
+# gitcode-clone-bench.sh —— 只测 gitcode clone 的耗时与吞吐（R21 性能面）
 #
 # 前提：pod 模板的 postStart 已把 https://gitcode.com/ 重写到缓存后端
 #       （/root/.gitconfig 里的 url.<backend>.insteadOf），否则本脚本判失败。

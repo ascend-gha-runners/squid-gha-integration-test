@@ -1,5 +1,5 @@
 # =============================================================================
-# test-gitcode-clone —— 只测 gitcode clone 的性能（R22）
+# test-gitcode-clone —— 只测 gitcode clone 的性能（R21 性能面）
 #
 # 与 test-squid.yaml 里的 gitcode 组不同，本 workflow 不做 refs 探测、不做 LFS、
 # 只回答一个问题：同一个仓库重复 clone，走缓存后端到底多快？
