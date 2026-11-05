@@ -674,21 +674,6 @@ jobs:
               "http://git-cdn-service.git-cdn.svc.cluster.local:8000/$repo.git/git-upload-pack" \
               2>&1 | tee -a "$R/report.txt" || echo "upload-pack-post FAILED/timeout" | tee -a "$R/report.txt"
 
-            # 探针 C：fetch 带硬超时 + 每 5s 进度，保证一定拿到 rc 和日志长度
-            echo "--- fetch $msha（硬超时 90s，带进度） ---" | tee -a "$R/report.txt"
-            start4=$(date +%s)
-            ( for i in $(seq 1 18); do sleep 5; echo "tick $((i*5))s bytes=$(wc -c <"$R/fetch-prmerge.log" 2>/dev/null || echo 0)" \
-                | tee -a "$R/report.txt"; done ) & ticker=$!
-            timeout 90 git -c http.extraheader="Authorization: basic $auth" \
-              -C "$wd3" fetch --no-tags --depth=1 origin "+$msha:refs/probe-merge" >"$R/fetch-prmerge.log" 2>&1
-            rc4=$?
-            kill $ticker 2>/dev/null || true
-            printf 'rc=%s sec=%s\n' "$rc4" "$(( $(date +%s) - start4))" >"$R/fetch-prmerge.rc"
-            echo "fetch-prmerge rc=$rc4 sec=$(( $(date +%s) - start4)) (124=超时)" | tee -a "$R/report.txt"
-            grep -aE 'redirecting to|fatal:|not our ref|HTTP/[12] [0-9]{3}|error' "$R/fetch-prmerge.log" \
-              | head -6 | tee -a "$R/report.txt" || true
-            tail -4 "$R/fetch-prmerge.log" | tee -a "$R/report.txt" || true
-
             # 探针 D：同一个 SHA 直连 github（GIT_CONFIG_GLOBAL=/dev/null 剥掉 insteadOf）
             # 若这里成功 → 上游(github)能服务该 SHA，问题在 git-cdn 的回源构造
             echo "--- 直连 github 取同一 SHA（剥掉 insteadOf） ---" | tee -a "$R/report.txt"
@@ -696,7 +681,7 @@ jobs:
             git -C "$wd4" remote add origin "https://github.com/$repo.git"
             start5=$(date +%s)
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 \
-              timeout 60 git -c http.extraheader="Authorization: basic $auth" \
+              timeout 45 git -c http.extraheader="Authorization: basic $auth" \
               -C "$wd4" fetch --no-tags --depth=1 origin "+$msha:refs/direct" >"$R/fetch-direct-github.log" 2>&1
             rc5=$?
             echo "fetch-direct-github rc=$rc5 $(( $(date +%s) - start5))s" | tee -a "$R/report.txt"
@@ -712,6 +697,21 @@ jobs:
                 | tee -a "$R/report.txt" || echo "gh-proxy FAILED $u" | tee -a "$R/report.txt"
             done
             head -c 300 "$R/ghproxy.body" 2>/dev/null | tee -a "$R/report.txt" || true
+
+            # 探针 C：fetch 带硬超时 + 每 5s 进度，保证一定拿到 rc 和日志长度
+            echo "--- fetch $msha（硬超时 90s，带进度） ---" | tee -a "$R/report.txt"
+            start4=$(date +%s)
+            ( for i in $(seq 1 18); do sleep 5; echo "tick $((i*5))s bytes=$(wc -c <"$R/fetch-prmerge.log" 2>/dev/null || echo 0)" \
+                | tee -a "$R/report.txt"; done ) & ticker=$!
+            timeout 90 git -c http.extraheader="Authorization: basic $auth" \
+              -C "$wd3" fetch --no-tags --depth=1 origin "+$msha:refs/probe-merge" >"$R/fetch-prmerge.log" 2>&1
+            rc4=$?
+            kill $ticker 2>/dev/null || true
+            printf 'rc=%s sec=%s\n' "$rc4" "$(( $(date +%s) - start4))" >"$R/fetch-prmerge.rc"
+            echo "fetch-prmerge rc=$rc4 sec=$(( $(date +%s) - start4)) (124=超时)" | tee -a "$R/report.txt"
+            grep -aE 'redirecting to|fatal:|not our ref|HTTP/[12] [0-9]{3}|error' "$R/fetch-prmerge.log" \
+              | head -6 | tee -a "$R/report.txt" || true
+            tail -4 "$R/fetch-prmerge.log" | tee -a "$R/report.txt" || true
 
             curl -sS -m 10 "$base/metrics" >"$R/metrics-after.txt" 2>/dev/null || true
             echo "--- 指标 diff（before vs after） ---" | tee -a "$R/report.txt"
