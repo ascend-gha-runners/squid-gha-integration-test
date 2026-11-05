@@ -125,8 +125,11 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   外网流量——① checkout@v7 submodules:recursive 按 .gitmodules 拉
   gitcode.com/cann/catlass（pinned commit）；② COMPILE_CUSTOM_KERNELS=1 时
   csrc cmake 拉 gitcode.com/cann-src-third-party 5 个 release 压缩包（REQ_URL，
-  protobuf 两个 cmake 重复出现算一个）；③ Dockerfile L92 经 GIT_PROXY
-  insteadOf clone github.com/vllm-project/vllm。mock 复刻这三路真实 URL/commit/
+  protobuf 两个 cmake 重复出现算一个）；③ clone github.com/vllm-project/vllm
+  ——2026-11-05（PR #2470）起链路改为 squid 对 github.com 返回 302、客户端就近
+  落到集群内 git-cdn，不再显式 insteadOf 到 gh-proxy；本项**必须看到
+  `redirecting to ...git-cdn` 才算通过**，没有 302 即判红（否则 clone 走了直连
+  兜底，测到的不是被测面）。mock 复刻这三路真实 URL/commit/
   tag（外网面全量口径）；集群内 cache-service（pypi/yum/rustup/crates）已入
   NO_PROXY 直连，不测不过 squid 的流量（与 R17 收窄同口径）。
   判定：fetch/下载/clone 成功且内容落盘 + tarball 两遍 sha256 一致（缓存内容
