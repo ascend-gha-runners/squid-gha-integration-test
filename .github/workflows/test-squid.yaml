@@ -106,6 +106,8 @@ on:
   pull_request:
     paths:
       - 'test-squid/**'
+      # git-cdn 用例已独立成 test-gitcdn.yaml，改它不再触发整套 squid 套件
+      - '!test-squid/repro-gitcdn-unsynced-sha.sh'
       - '.github/workflows/test-squid.yaml'
 
 permissions:
