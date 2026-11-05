@@ -757,6 +757,19 @@ ck_git_rewrite() {
     code=$(curl -sS -D"$hdr" -o /dev/null -w '%{http_code}' --max-time 90 \
         -H 'Accept: application/x-git-upload-pack-advertisement' "$url" 2>>"$RESULTS_DIR/parity.log")
     sig=$(grep -iE '^(server|x-using-nginx-controller):' "$hdr" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+    # 新策略（PR #2470，gy-006）：client-first bump 下 rewrite 到 http 会被 Squid 强制
+    # TLS 打挂，改为 helper 对初始 GET 返回 302，把 clone 就近甩到集群内 git-cdn。
+    # 判定：302 + Location 命中 git-cdn base = 重写生效。
+    if [ "$REWRITE_POLICY" != "direct" ] && [ "$code" = "302" ]; then
+        local loc
+        loc=$(grep -i '^location:' "$hdr" 2>/dev/null | tr -d '\r' | sed 's/^[Ll]ocation: *//')
+        case "$loc" in
+            *git-cdn-service*.svc.cluster.local:8000*)
+                echo "✓ git-info-refs 302 → git-cdn（新策略生效：$loc）"; P_PASS=$((P_PASS+1)); return 0 ;;
+            *)
+                echo "✗ git-info-refs 302 但 Location 未命中 git-cdn（$loc）"; P_FAIL=$((P_FAIL+1)); return 1 ;;
+        esac
+    fi
     if [ "$code" != "200" ]; then
         echo "✗ git-info-refs GET=$code 期望=200（$sig）"; P_FAIL=$((P_FAIL+1)); return 1
     fi
