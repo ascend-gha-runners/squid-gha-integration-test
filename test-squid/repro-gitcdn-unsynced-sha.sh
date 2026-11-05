@@ -26,8 +26,8 @@
 #      —— 成功才说明上游确实有这个对象，否则是环境问题，记 SKIP；
 #   ②b 上游通道入参形态对照：直接问 gh-proxy「正确形态（含 https://github.com/
 #      前缀段）」与「缺前缀形态」分别怎么判 —— 前者 200、后者 403 Invalid input.
-#      这是机理留档（不判红）：git-cdn 若把回源 URL 拼成后者，就会 403 → 50s
-#      后 not our ref；
+#      正确形态非 200 → 判红（上游通道不可用）；缺前缀形态的码只留档，因为
+#      gh-proxy 拒绝畸形输入本就是健康行为，其校验文案也可能调整；
 #   ③ 被测面：按真实客户端形态（`http.extraheader: Authorization: basic`）向
 #      git-cdn 按 SHA 取 —— 健康 = 成功；当前缺陷下 = 立即 `not our ref`。
 #
@@ -200,10 +200,14 @@ probe_ghproxy() {  # probe_ghproxy <form-name> <url>
 refs_path="$REPO_SLUG.git/info/refs?service=git-upload-pack"
 code_ok=$(probe_ghproxy ok-form "$GH_PROXY""https://github.com/$refs_path")
 code_bad=$(probe_ghproxy no-prefix-form "$GH_PROXY$refs_path")
+# ok-form 必须是 200：上游通道（gh-proxy 正确形态）不可用 → 判红。缺前缀形态的
+# 返回码只留档（gh-proxy 校验口径可能调整，403 亦属正常拒绝）。
+upstream_ok=0
 if [ "$code_ok" = "200" ]; then
+    upstream_ok=1
     log "②b gh-proxy 形态对照：正确形态=${code_ok}（ok）；缺前缀形态=${code_bad}（预期 403）"
 else
-    log "⚠️ gh-proxy 正确形态返回 ${code_ok}（预期 200）——上游通道异常或校验口径变化，留档见 ghproxy.tsv"
+    log "❌ gh-proxy 正确形态返回 ${code_ok}（预期 200）——上游通道异常，详见 ghproxy.tsv"
 fi
 
 # ---- ③ 被测面：按真实客户端形态（Basic 凭据）向 git-cdn 按 SHA 取 -----------
@@ -222,6 +226,10 @@ sec=$(( $(date +%s) - start ))
 
 if [ "$rc" -eq 0 ]; then
     log "③ 经 git-cdn 按 SHA 取成功（${sec}s）——git-cdn 能回源未同步对象（缺陷已修复）"
+    if [ "$upstream_ok" != "1" ]; then
+        log "❌ 但 ②b 显示上游通道异常（gh-proxy 正确形态非 200）——判红"
+        exit 1
+    fi
     exit 0
 fi
 
