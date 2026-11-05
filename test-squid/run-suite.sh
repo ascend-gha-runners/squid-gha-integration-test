@@ -70,10 +70,8 @@ URL_HEAVY="${URL_HEAVY:-https://files.pythonhosted.org/packages/78/89/f5554b13eb
 
 # imagebuild 组：vllm-ascend Dockerfile.310p 外网流量面复刻参数
 #   CATLASS_COMMIT  catlass 子模块 .gitmodules 固定 commit（checkout submodules:recursive 形态）
-#   IB_GIT_PROXY    镜像内 gitconfig insteadOf 前缀（GIT_PROXY build-arg）；置空 = 直连（本地冒烟）
 #   IB_VLLM_REF     vllm tag（Dockerfile VLLM_TAG）；不存在时自动改用最新 tag，避免上游发版打失效 mock
 CATLASS_COMMIT="${CATLASS_COMMIT:-41bf90da655bba3c66d0acd7e00abe33960ecfd6}"
-IB_GIT_PROXY="${IB_GIT_PROXY:-https://gh-proxy.test.osinfra.cn/}"
 IB_VLLM_REF="${IB_VLLM_REF:-v0.11.0}"
 
 # 上游仓库真实 CI 面（2026-10-20，按 sgl-project / vllm-project / volcengine /
@@ -1445,32 +1443,37 @@ ib-tarballs() {
     return 0
 }
 
-# ③ vllm clone：Dockerfile.310p L92 形态 = gitconfig url.insteadOf 把 github.com
-#    重写到 GIT_PROXY 后 clone --depth 1 -b <VLLM_TAG>（大 pack 吞吐通道）
-ib-vllm-gitproxy() {
-    local dir="$RESULTS_DIR/vllm-clone" ref="$IB_VLLM_REF"
+# ③ vllm clone：大 pack 吞吐通道。链路 = squid 对 github.com 返回 302 →
+#    客户端就近落到集群内 git-cdn（PR #2470），不再显式 insteadOf 到 gh-proxy
+ib-vllm-clone() {
+    local dir="$RESULTS_DIR/vllm-clone" ref="$IB_VLLM_REF" err="$RESULTS_DIR/vllm-clone.err" n redirect
     rm -rf "$dir"
-    # insteadOf 形态与 Dockerfile L86 一致；IB_GIT_PROXY 为空 → 不加配置（直连，本地冒烟逃生门）
-    local g=()
-    [ -n "$IB_GIT_PROXY" ] && g=(-c "url.${IB_GIT_PROXY}https://github.com/.insteadOf=https://github.com/")
-    echo "--- github.com/vllm-project/vllm --depth 1 -b $ref（insteadOf → ${IB_GIT_PROXY:-直连}）---"
+    # 2026-11-05 起不再显式 insteadOf → gh-proxy：由 squid 对 github.com 返回 302，
+    # 客户端就近落到集群内 git-cdn（PR #2470）。本阶段判定「链路真的由 302 承载」——
+    # 没出现 redirecting → git-cdn 就判红（302 策略未生效，clone 走了直连兜底，
+    # 测到的不是被测面）。
+    echo "--- github.com/vllm-project/vllm --depth 1 -b $ref（期望 squid 302 → git-cdn）---"
     # tag 预检：Dockerfile 用固定 VLLM_TAG；上游发版后旧 tag 不存在则改用最新 tag
-    if ! git "${g[@]}" ls-remote --exit-code --tags https://github.com/vllm-project/vllm "refs/tags/$ref" >/dev/null 2>&1; then
-        ref=$(git "${g[@]}" ls-remote --tags https://github.com/vllm-project/vllm \
+    if ! git ls-remote --exit-code --tags https://github.com/vllm-project/vllm "refs/tags/$ref" >/dev/null 2>&1; then
+        ref=$(git ls-remote --tags https://github.com/vllm-project/vllm \
               | awk -F'/' '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
         [ -n "$ref" ] || { echo "❌ vllm tag 预检失败（$IB_VLLM_REF 不存在且取不到最新 tag）"; return 1; }
         echo "⚠️ 指定 tag $IB_VLLM_REF 不存在，改用最新 tag $ref"
     fi
-    if timeout 600 git "${g[@]}" clone -q --depth 1 -b "$ref" \
-        https://github.com/vllm-project/vllm "$dir" 2>"$RESULTS_DIR/vllm-clone.err"; then
-        local n
-        n=$(find "$dir" -type f -not -path '*/.git/*' | wc -l)
-        [ "$n" -gt 100 ] || { echo "❌ vllm 工作区仅 $n 个文件，clone 不完整"; return 1; }
-        echo "✅ vllm@$ref clone 完成：$n 个文件（大 pack 吞吐经 ${IB_GIT_PROXY:-直连}）"
-    else
-        echo "❌ vllm clone 失败：$(head -c 200 "$RESULTS_DIR/vllm-clone.err" | tr '\n' ' ')"
+    if ! timeout 600 git clone --depth 1 -b "$ref" \
+        https://github.com/vllm-project/vllm "$dir" 2>"$err"; then
+        echo "❌ vllm clone 失败：$(head -c 200 "$err" | tr '\n' ' ')"
         return 1
     fi
+    if ! grep -qi 'redirecting to .*git-cdn' "$err"; then
+        echo "❌ vllm clone 未出现 302 → git-cdn 跳转（squid 302 策略未生效，clone 走了直连兜底）"
+        head -3 "$err" | sed 's/^/    /'
+        return 1
+    fi
+    redirect=$(grep -i 'redirecting to' "$err" | head -1 | sed 's/.*redirecting to //')
+    n=$(find "$dir" -type f -not -path '*/.git/*' | wc -l)
+    [ "$n" -gt 100 ] || { echo "❌ vllm 工作区仅 $n 个文件，clone 不完整"; return 1; }
+    echo "✅ vllm@$ref clone 完成：$n 个文件（302 → $redirect）"
 }
 
 # ④ OBS 静态资产：CANN 安装包 + CI 覆盖率工件 + 代码扫描二进制（R18 镜像构建外网面）
@@ -1965,7 +1968,7 @@ elif [ "$MODE" = "imagebuild" ]; then
     run_timed meta-trace        "$LAYER" meta-trace
     run_timed ib-catlass        "$LAYER" ib-catlass
     run_timed ib-tarballs       "$LAYER" ib-tarballs
-    run_timed ib-vllm-gitproxy  "$LAYER" ib-vllm-gitproxy
+    run_timed ib-vllm-clone     "$LAYER" ib-vllm-clone
     run_timed ib-ascend-obs     "$LAYER" ib-ascend-obs
 elif [ "$MODE" = "cabundle" ]; then
     # no_proxy 直连 × CA 注入变量组矩阵（runner/容器两层）：
