@@ -17,6 +17,9 @@
 #                      2026-10-31 pip hash 校验事故，META R22）
 #       gitcdn-unsynced —— git-cdn 无法为未同步 SHA 回源（insteadOf→git-cdn 集群，
 #                      2026-11-04 gy-006 checkout 事故；独立脚本 repro-gitcdn-unsynced-sha.sh）
+#       dockerbuild —— docker build clone test：vllm-ascend#20836 的 Dockerfile 取数面
+#                      （-c insteadOf 重写后 clone vllm / 按 SHA fetch / flash-attention
+#                      全量 clone / submodule 双 mirror；独立脚本 docker-build-clone-test.sh）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -1954,6 +1957,12 @@ elif [ "$MODE" = "imagebuild" ]; then
     run_timed ib-tarballs       "$LAYER" ib-tarballs
     run_timed ib-vllm-gitproxy  "$LAYER" ib-vllm-gitproxy
     run_timed ib-ascend-obs     "$LAYER" ib-ascend-obs
+elif [ "$MODE" = "dockerbuild" ]; then
+    # vllm-ascend Dockerfile 的 git-cdn clone 面（PR #20836）：显式 -c insteadOf
+    # 重写后 clone vllm / 按 SHA fetch / 全量 clone flash-attention / submodule
+    # 双 mirror。流量走 *.svc.cluster.local 直连，不经 squid，故不跑 meta-trace。
+    run_timed env-snapshot        "$LAYER" env-snapshot
+    run_timed dockerbuild-clone   "$LAYER" env RESULTS="$RESULTS_DIR/dockerbuild" bash "$SCRIPT_DIR/docker-build-clone-test.sh"
 elif [ "$MODE" = "cabundle" ]; then
     # no_proxy 直连 × CA 注入变量组矩阵（runner/容器两层）：
     # CA 形态取证 + no_proxy 生效性 + 排他/union/追加三语义工具的直连/MITM 双路径
@@ -2034,7 +2043,7 @@ elif [ "$MODE" = "gitcdn-unsynced" ]; then
     # 套件结果目录里才会被 artifact 上传（RESULTS_DIR 未 export 到子进程）
     run_timed gitcdn-unsynced-sha "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-unsynced" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | dockerbuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced）" >&2
     exit 2
 fi
 

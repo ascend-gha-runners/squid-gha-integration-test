@@ -107,6 +107,10 @@ on:
         description: '1=只跑 git 路由探针（insteadOf 是否对 checkout 生效 / squid 是否 302 / 剥离重写后能否从 github 取包）'
         required: false
         default: '0'
+      docker_build_clone:
+        description: '1=启用 docker build clone test（vllm-ascend#20836 的 -c insteadOf clone/fetch/submodule 面，runner+容器两层；耗时较长）'
+        required: false
+        default: '0'
   pull_request:
     paths:
       - 'test-squid/**'
@@ -383,6 +387,31 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-squid-imagebuild
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  dockerbuild:
+    name: docker build clone test
+    # R24 opt-in（docker_build_clone=1）：vllm-ascend#20836 把 Dockerfile 里所有
+    # github.com 取数改成 -c url.<git-cdn>.insteadOf 显式重写（clone vllm /
+    # fetch --depth 1 <repo> <commit> / 全量 clone flash-attention / submodule 双
+    # mirror）。这些 RUN 跑在 build 容器里，用不到 job 的 /root/.gitconfig，只能靠
+    # 内联 -c —— 本组按原样复刻并两层验证。流量属 .svc.cluster.local 直连，
+    # 不经过 squid，故不跑 meta-trace。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.docker_build_clone == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 docker build clone test（runner 层）
+        run: bash test-squid/run-suite.sh --mode dockerbuild
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-dockerbuild
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
@@ -802,6 +831,31 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  container-dockerbuild:
+    name: 容器层·docker build clone test（CANN 镜像）
+    timeout-minutes: 40
+    needs: [dockerbuild, container-imagebuild]
+    # 容器层是 root + HOME=/root，pod 模板 postStart 写的 /root/.gitconfig 可见
+    # （runner 层 uid 1001 读不到）；脚本内部是显式 -c 重写，两层应给同一结论 ——
+    # 这个对称性本身就是对「PR 写法不依赖宿主 gitconfig」的验证
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.docker_build_clone == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    container:
+      image: ${{ inputs.container_image || 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 docker build clone test（容器层）
+        run: bash test-squid/run-suite.sh --mode dockerbuild --container
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-container-dockerbuild
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   container-cabundle:
     name: 容器层·no_proxy × CA 注入矩阵（CANN 镜像）
     timeout-minutes: 60
@@ -860,7 +914,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, dockerbuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-dockerbuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -874,8 +928,8 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-gitcdn-unsynced \
-                   test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-dockerbuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-gitcdn-unsynced \
+                   test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-dockerbuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
