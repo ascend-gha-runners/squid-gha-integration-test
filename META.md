@@ -185,6 +185,17 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   与 Debian 系的 `update-ca-certificates` 分叉）。repo 同步面收窄到 OS/everything/EPOL/
   update 四个源（镜像默认还开 debuginfo/source/update-source，元数据 100MB+
   且与安装无关），源 URL 保持镜像默认（零换源，R16）。
+- **R21 gitcode.com → 缓存后端重写**（2026-10-23 增补）：`https://gitcode.com/` 由 job
+  pod 模板的 postStart 重写到集群内缓存后端（`smart-git-proxy` 带 `/gitcode.com`
+  前缀段；`git-cdn-gitcode` 以仓库路径直挂根），后端属 `.svc.cluster.local`、在
+  `NO_PROXY` 内 → 流量**不经 squid**，故本组不跑 meta-trace，结论只代表后端行为。
+  判定三面：① 重写生效性——`git ls-remote --get-url` 展开结果反推基址必须等于期望
+  后端（`GITCODE_STRICT=1` 固定开启），未重写 / 指向本机判红，`GITCODE_DIRECT=1`
+  时只留档（验后端服务本身）；② refs 端点——两次
+  `info/refs?service=git-upload-pack` 均 200 且响应非空；③ 缓存收益——同仓两次
+  `--depth 1` clone，命中缓存头 / 耗时 ≤70% / 两遍均 ≤5s 任一成立即 PASS。
+  **只能跑容器层**（重写写在 `/root/.gitconfig`，runner 层 uid 1001 读不到）。
+  性能面（冷/热/并发阶梯/LFS）单列 `test-gitcode-clone.yaml`，只留耗时对比不设门禁。
 - **R22 PEP 658 metadata 不缓存**（2026-10-31，源自 pip hash 校验事故）：
   编码变体毒化机理——CDN（download-r2.pytorch.org / files.pythonhosted.org /
   repo.huaweicloud.com 等）按 `Accept-Encoding` 实际压缩，但响应不带 `Vary`；
@@ -232,6 +243,17 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   直连，不经过 squid，故不参与 meta-trace / R1 双端证据的 squid 侧断言，
   证据链改为「客户端 rc + git-cdn pod 日志（fetch_sha / still missing after
   SHA fetch 行）」。只在容器层之外单列 job（opt-in `gitcdn_unsynced=1`）。
+
+- **R24 docker build clone**（2026-11-05，源自 vllm-ascend#20836 把 Dockerfile 取数改成
+  `-c url.<git-cdn>.insteadOf` 显式重写）：验证 PR 写法不依赖宿主 `/root/.gitconfig`
+  ——脚本内用内联 `-c`，runner 层与容器层各跑一遍、结论应一致。四条命令复刻真实
+  取数面：vllm 大仓浅 clone（两遍，仅留档缓存收益不判红）、按 SHA
+  `fetch --depth 1 <repo> <commit>`（未同步 SHA 风险面，60s 内必须明确结束且成功）、
+  flash-attention-npu 全量 clone、vllm-ascend 浅 clone +
+  `submodule update --init --recursive`（github + gitcode 双 mirror，验 catlass 检出）。
+  流量属 `.svc.cluster.local` 直连，不跑 meta-trace；git-cdn 不可达记 SKIP 不判红。
+  入口为 test-squid 的 opt-in `docker_build_clone=1`（独立脚本
+  `docker-build-clone-test.sh`）；截至本条版本尚未合并进 main（见分支 `probe-git-route`）。
 
 ## 六、与两份前作的关系
 

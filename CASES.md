@@ -3,6 +3,35 @@
 > 按 [META.md](./META.md) 元规则推导的场景矩阵。
 > 每个场景：独立阶段、失败不传染（R7）、结果写 TSV（R2/R7）。
 
+## 用例登记表（唯一事实来源）
+
+新增用例先在此表登记（含规则号），再落 workflow / 脚本；规则号以 `META.md` 为准，
+只增不改。判定口径统一为「阶段状态写 TSV，`status=1` → job 红，`status=2` → SKIP」。
+
+| # | 用例 | 入口（workflow#job） | 实现 | 层 | 判定 | 规则 |
+|---|---|---|---|---|---|---|
+| 1 | squid 功能面 | `test-squid#function` / `#container-function` | run-suite `--mode function` | runner + 容器 | TSV gate | R1–R4、R6、R7、R11 |
+| 2 | squid 并发面 | `test-squid#concurrency` / `#container-concurrency` | `--mode concurrency` | runner + 容器 | 正确性一票否决，吞吐只记录 | R8–R10 |
+| 3 | vllm 通信模拟 | `test-squid#vllm` / `#container-vllm` | `--mode vllm` | runner + 容器 | TSV gate | R6 |
+| 4 | 透明重写同构校验 | `test-squid#parity` | `--mode parity` | runner | 内容签名 + 负样本 | R12–R14 |
+| 5 | 上游通道健康 | `test-squid#upstream` | `--mode upstream` | runner | p50 预算 | R17 |
+| 6 | 镜像构建网络模拟 | `test-squid#imagebuild` / `#container-imagebuild` | `--mode imagebuild` | runner + 容器 | TSV gate | R18 |
+| 7 | no_proxy × CA 矩阵 | `test-squid#cabundle` / `#container-cabundle` | `--mode cabundle` | runner + 容器 | TLS-FAIL / NO_PROXY-MISS 红 | R19 |
+| 8 | 真实工具链 e2e | `test-squid#tools` / `#container-tools` | `--mode tools` | runner + 容器 | TSV gate（`HEAVY=1` 追加） | R16 |
+| 9 | dnf/yum 包管理 | `test-squid#container-pkg` | `--mode pkg --container` | 容器（openEuler） | TSV gate | R20 |
+| 10 | gitcode → 缓存后端 | `test-squid#gitcode` | `--mode gitcode --container` | 容器 | 基址展开 + refs 200 + 缓存收益 | R21 |
+| 11 | 索引页陈旧复现 | `test-squid#stale-index` | `--mode stale-index` | runner | 真实域 HIT 即红 | R15 |
+| 12 | PEP 658 metadata 不缓存 | `test-squid#pip-metadata` | `--mode pip-metadata` | runner | 缓存作答即红 | R22 |
+| 13 | git-cdn 未同步 SHA 回源 | **`test-gitcdn#gitcdn-unsynced`** | `--mode gitcdn-unsynced` | runner | 取到 PASS / `not our ref` 红 | R23 |
+| 14 | gitcode clone 性能 | `test-gitcode-clone#clone-bench` | `gitcode-clone-bench.sh` | 容器 | 冷/热耗时与吞吐，`summary.md` 留档 + job 退出码 | R21（性能面） |
+| 15 | docker build clone | `test-squid#dockerbuild`（**未合并**，见分支 `probe-git-route`） | `docker-build-clone-test.sh` | runner + 容器 | 按 SHA fetch 60s 内成功；git-cdn 不可达 SKIP | R24 |
+| P1 | 域名出网探测 | `probe-domain#probe` | 内联 | runner | 只留 `probe.tsv`，不判红 | — |
+| P2 | git-cdn 部分克隆探针 | `probe-gitcdn-filter#probe` | 内联 | 容器 | 只留 `probe-gitcdn.tsv`，不判红（一次性） | — |
+
+遗留说明：`test-squid.yaml` 里仍保留 `gitcdn-unsynced` job（与 #13 同 mode 的重复入口，
+待删）；`test-squid#git-container-probe` 引用了未声明的 `inputs.git_probe`，在 main 上
+永远不会执行。
+
 ## 两层测试对象
 
 squid 注入在两种执行形态下必须**都**生效，测试分两层覆盖：
