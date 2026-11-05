@@ -689,6 +689,30 @@ jobs:
               | head -6 | tee -a "$R/report.txt" || true
             tail -4 "$R/fetch-prmerge.log" | tee -a "$R/report.txt" || true
 
+            # 探针 D：同一个 SHA 直连 github（GIT_CONFIG_GLOBAL=/dev/null 剥掉 insteadOf）
+            # 若这里成功 → 上游(github)能服务该 SHA，问题在 git-cdn 的回源构造
+            echo "--- 直连 github 取同一 SHA（剥掉 insteadOf） ---" | tee -a "$R/report.txt"
+            wd4=$(mktemp -d); git -C "$wd4" init -q
+            git -C "$wd4" remote add origin "https://github.com/$repo.git"
+            start5=$(date +%s)
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 \
+              timeout 60 git -c http.extraheader="Authorization: basic $auth" \
+              -C "$wd4" fetch --no-tags --depth=1 origin "+$msha:refs/direct" >"$R/fetch-direct-github.log" 2>&1
+            rc5=$?
+            echo "fetch-direct-github rc=$rc5 $(( $(date +%s) - start5))s" | tee -a "$R/report.txt"
+            grep -aE 'Connected to |HTTP/[12] [0-9]{3}|fatal:|not our ref|Location:' "$R/fetch-direct-github.log" \
+              | head -8 | tee -a "$R/report.txt" || true
+
+            # 探针 E：模拟 git-cdn 的回源形态（gh-proxy 前缀 + Basic 凭据），看响应码
+            echo "--- gh-proxy 回源形态（info/refs） ---" | tee -a "$R/report.txt"
+            for u in "https://gh-proxy.test.osinfra.cn/https://github.com/$repo.git/info/refs?service=git-upload-pack" \
+                     "https://gh-proxy.test.osinfra.cn/$repo.git/info/refs?service=git-upload-pack"; do
+              curl -sS -m 20 -o "$R/ghproxy.body" -w "status=%{http_code} time=%{time_total} url=$u\n" \
+                -H "Authorization: basic $auth" "$u" 2>&1 | sed -E 's/(basic )[A-Za-z0-9+\/=]+/\1<redacted>/' \
+                | tee -a "$R/report.txt" || echo "gh-proxy FAILED $u" | tee -a "$R/report.txt"
+            done
+            head -c 300 "$R/ghproxy.body" 2>/dev/null | tee -a "$R/report.txt" || true
+
             curl -sS -m 10 "$base/metrics" >"$R/metrics-after.txt" 2>/dev/null || true
             echo "--- 指标 diff（before vs after） ---" | tee -a "$R/report.txt"
             diff "$R/metrics-before.txt" "$R/metrics-after.txt" 2>/dev/null \
