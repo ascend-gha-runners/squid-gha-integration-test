@@ -60,12 +60,10 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$TSV"; }
 FAILED=0
 
-# 统一的「带重写的 git」包装：完全复刻 Dockerfile 里的 -c 形态
-gcdn() { git -c url."$MIRROR".insteadOf="https://github.com/" "$@"; }
-gcdn_both() {
-    git -c url."$MIRROR".insteadOf="https://github.com/" \
-        -c url."$GITCODE_MIRROR".insteadOf="https://gitcode.com/" "$@"
-}
+# 重写参数：完全复刻 Dockerfile 里的 -c 形态。用数组而不是 shell 函数，
+# 因为 timeout(1) 只能 exec 外部命令，不能调用函数（rc=127）。
+CDN_CFG=(-c "url.$MIRROR.insteadOf=https://github.com/")
+BOTH_CFG=("${CDN_CFG[@]}" -c "url.$GITCODE_MIRROR.insteadOf=https://gitcode.com/")
 
 # ---- T0：前置取证 + mirror 可达性 -------------------------------------------
 log "=== T0 前置取证 ==="
@@ -93,7 +91,7 @@ clone_once() {
     local dest="$1" logf="$2" start sec rc
     start=$(date +%s)
     GIT_TERMINAL_PROMPT=0 timeout 420 \
-        gcdn clone --depth 1 -b "$VLLM_TAG" "$VLLM_REPO" "$dest" >"$logf" 2>&1
+        git "${CDN_CFG[@]}" clone --depth 1 -b "$VLLM_TAG" "$VLLM_REPO" "$dest" >"$logf" 2>&1
     rc=$?
     sec=$(( $(date +%s) - start ))
     echo "$rc $sec"
@@ -129,7 +127,7 @@ start=$(date +%s)
 {
     t="$WORK/vllm-sha"; mkdir -p "$t"; git -C "$t" init -q
     GIT_TERMINAL_PROMPT=0 timeout 60 \
-        gcdn -C "$t" fetch --no-tags --depth=1 "$VLLM_REPO" "$VLLM_COMMIT" \
+        git "${CDN_CFG[@]}" -C "$t" fetch --no-tags --depth=1 "$VLLM_REPO" "$VLLM_COMMIT" \
         >"$RESULTS/fetch-sha-cdn.log" 2>&1
     echo $?
 } >"$RESULTS/fetch-sha-cdn.rc"
@@ -151,7 +149,7 @@ fi
 log "=== T3 flash-attention-npu 全量 clone ==="
 start=$(date +%s)
 GIT_TERMINAL_PROMPT=0 timeout 420 \
-    gcdn clone "$FLASH_REPO" "$WORK/flash-attention-npu" >"$RESULTS/flash-clone.log" 2>&1
+    git "${CDN_CFG[@]}" clone "$FLASH_REPO" "$WORK/flash-attention-npu" >"$RESULTS/flash-clone.log" 2>&1
 rc_fl=$?
 sec_fl=$(( $(date +%s) - start ))
 log "rc=$rc_fl ${sec_fl}s"
@@ -168,11 +166,11 @@ rm -rf "$WORK/flash-attention-npu"
 log "=== T4 submodule（github + gitcode 双 mirror）==="
 start=$(date +%s)
 GIT_TERMINAL_PROMPT=0 timeout 300 \
-    gcdn clone --depth 1 "$ASCEND_REPO" "$WORK/vllm-ascend" >"$RESULTS/ascend-clone.log" 2>&1
+    git "${CDN_CFG[@]}" clone --depth 1 "$ASCEND_REPO" "$WORK/vllm-ascend" >"$RESULTS/ascend-clone.log" 2>&1
 rc_cl=$?
 if [ "$rc_cl" -eq 0 ]; then
     GIT_TERMINAL_PROMPT=0 timeout 300 \
-        gcdn_both -C "$WORK/vllm-ascend" submodule update --init --recursive \
+        git "${BOTH_CFG[@]}" -C "$WORK/vllm-ascend" submodule update --init --recursive \
         >"$RESULTS/submodule.log" 2>&1
     rc_sub=$?
 else
