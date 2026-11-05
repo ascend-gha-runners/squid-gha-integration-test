@@ -675,14 +675,16 @@ jobs:
               2>&1 | tee -a "$R/report.txt" || echo "upload-pack-post FAILED/timeout" | tee -a "$R/report.txt"
 
             # 探针 C：fetch 带硬超时 + 每 5s 进度，保证一定拿到 rc 和日志长度
-            echo "--- fetch $msha（硬超时 45s，带进度） ---" | tee -a "$R/report.txt"
-            ( for i in $(seq 1 9); do sleep 5; echo "tick $((i*5))s bytes=$(wc -c <"$R/fetch-prmerge.log" 2>/dev/null || echo 0)" \
+            echo "--- fetch $msha（硬超时 90s，带进度） ---" | tee -a "$R/report.txt"
+            start4=$(date +%s)
+            ( for i in $(seq 1 18); do sleep 5; echo "tick $((i*5))s bytes=$(wc -c <"$R/fetch-prmerge.log" 2>/dev/null || echo 0)" \
                 | tee -a "$R/report.txt"; done ) & ticker=$!
-            timeout 45 git -c http.extraheader="Authorization: basic $auth" \
+            timeout 90 git -c http.extraheader="Authorization: basic $auth" \
               -C "$wd3" fetch --no-tags --depth=1 origin "+$msha:refs/probe-merge" >"$R/fetch-prmerge.log" 2>&1
             rc4=$?
             kill $ticker 2>/dev/null || true
-            echo "fetch-prmerge rc=$rc4 (124=超时)" | tee -a "$R/report.txt"
+            printf 'rc=%s sec=%s\n' "$rc4" "$(( $(date +%s) - start4))" >"$R/fetch-prmerge.rc"
+            echo "fetch-prmerge rc=$rc4 sec=$(( $(date +%s) - start4)) (124=超时)" | tee -a "$R/report.txt"
             grep -aE 'redirecting to|fatal:|not our ref|HTTP/[12] [0-9]{3}|error' "$R/fetch-prmerge.log" \
               | head -6 | tee -a "$R/report.txt" || true
             tail -4 "$R/fetch-prmerge.log" | tee -a "$R/report.txt" || true
@@ -692,6 +694,31 @@ jobs:
             diff "$R/metrics-before.txt" "$R/metrics-after.txt" 2>/dev/null \
               | grep -E '^[<>]' | head -20 | tee -a "$R/report.txt" || echo "(无差异或不可读)" | tee -a "$R/report.txt"
           fi
+
+      - name: 补采证据（上一步被中断也能拿到指标）
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          R=/tmp/git-route-probe; mkdir -p "$R"
+          base=http://git-cdn-service.git-cdn.svc.cluster.local:8000
+          echo "=== 补采 ===" | tee -a "$R/report.txt"
+          if [ -f "$R/fetch-prmerge.rc" ]; then
+            echo "fetch-prmerge.rc: $(cat "$R/fetch-prmerge.rc")" | tee -a "$R/report.txt"
+          else
+            echo "fetch-prmerge.rc 缺失 → fetch 步骤被外部中断，未拿到 rc" | tee -a "$R/report.txt"
+          fi
+          echo "fetch-prmerge.log 长度: $(wc -c <"$R/fetch-prmerge.log" 2>/dev/null || echo 0)" | tee -a "$R/report.txt"
+          tail -6 "$R/fetch-prmerge.log" 2>/dev/null | tee -a "$R/report.txt" || true
+          curl -sS -m 10 "$base/metrics" >"$R/metrics-final.txt" 2>/dev/null || true
+          for f in metrics-before.txt metrics-final.txt; do
+            [ -s "$R/$f" ] || continue
+            echo "--- $f 里的 upstream 计数器 ---" | tee -a "$R/report.txt"
+            grep -E '^git_cdn_upstream' "$R/$f" | tee -a "$R/report.txt" || true
+          done
+          echo "--- before vs final diff ---" | tee -a "$R/report.txt"
+          diff "$R/metrics-before.txt" "$R/metrics-final.txt" 2>/dev/null \
+            | grep -E '^[<>]' | head -20 | tee -a "$R/report.txt" || echo "(无差异或不可读)" | tee -a "$R/report.txt"
 
       - name: 上传证据
         if: always()
