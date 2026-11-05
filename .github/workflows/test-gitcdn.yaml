@@ -1,0 +1,71 @@
+name: test-gitcdn
+
+# git-cdn 服务本身的回归工作流（与 test-squid.yaml 分开）
+#
+# 区别：test-squid.yaml 测的是 squid（代理/CONNECT/MITM/缓存/重写），
+# 本工作流只测 git-cdn 的**回源能力**，显式打 git-cdn 基址，
+# 不依赖宿主的 insteadOf、不经过 squid。
+#
+# 用例：test-squid/repro-gitcdn-unsynced-sha.sh（META R23）
+#   ① 用 API 造一个「上游可服务、git-cdn 缓存必定没有」的 SHA（临时 ref + 空提交）
+#   ② 对照组：直连 github.com 取该 SHA，确认上游确实有（否则 SKIP）
+#   ②b gh-proxy 入参形态对照：正确形态必须 200（否则判红）；缺前缀形态只留档
+#   ③ 经 git-cdn 按真实客户端形态（Basic 凭据）取该 SHA
+#      —— 成功 = git-cdn 回源健康；50s 后 not our ref = 缺陷复现（2026-11-04 事故）
+#
+# 需要 contents: write（建/删临时 ref）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签 JSON 数组（数组内多标签为 AND 关系）'
+        required: false
+        default: '["linux-amd64-cpu-2", "gy-006"]'
+        type: string
+
+  pull_request:
+    paths:
+      - 'test-squid/repro-gitcdn-unsynced-sha.sh'
+      - '.github/workflows/test-gitcdn.yaml'
+
+permissions:
+  contents: write
+
+jobs:
+  gitcdn-unsynced:
+    name: git-cdn 未同步 SHA 回源
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    permissions:
+      contents: write   # 建/删临时 ref（造缓存缺失的 SHA）
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 git-cdn 未同步 SHA 回源
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+        run: bash test-squid/run-suite.sh --mode gitcdn-unsynced
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## test-gitcdn 汇总"
+            echo '```'
+            cat /tmp/test-squid-results/timings.tsv 2>/dev/null || echo '(无 timings.tsv)'
+            echo '```'
+            echo
+            echo "### gh-proxy 形态对照（机理留档）"
+            echo '```'
+            cat /tmp/test-squid-results/gitcdn-unsynced/ghproxy.tsv 2>/dev/null || echo '(无 ghproxy.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-unsynced
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn

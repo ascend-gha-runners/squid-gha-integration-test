@@ -24,6 +24,10 @@
 #      （cache-warmer 每 1800s 才同步一次 refs，窗口内必然未同步；结束后删 ref）；
 #   ② 对照组：剥离 insteadOf 直连 github.com（经 squid/gh-proxy 透传）取该 SHA
 #      —— 成功才说明上游确实有这个对象，否则是环境问题，记 SKIP；
+#   ②b 上游通道入参形态对照：直接问 gh-proxy「正确形态（含 https://github.com/
+#      前缀段）」与「缺前缀形态」分别怎么判 —— 前者 200、后者 403 Invalid input.
+#      正确形态非 200 → 判红（上游通道不可用）；缺前缀形态的码只留档，因为
+#      gh-proxy 拒绝畸形输入本就是健康行为，其校验文案也可能调整；
 #   ③ 被测面：按真实客户端形态（`http.extraheader: Authorization: basic`）向
 #      git-cdn 按 SHA 取 —— 健康 = 成功；当前缺陷下 = 立即 `not our ref`。
 #
@@ -36,6 +40,7 @@
 #
 # 可覆盖：
 #   GIT_CDN_BASE   git-cdn 基址（默认 gy-006 的 svc 域名）
+#   GH_PROXY       gh-proxy 基址（默认 https://gh-proxy.test.osinfra.cn/）
 #   REPO_SLUG      目标仓库（默认 $GITHUB_REPOSITORY）
 #   GH_TOKEN       建/删临时 ref 与客户端 Basic 认证用的 token
 #   RESULTS        结果目录
@@ -45,6 +50,7 @@
 set -uo pipefail
 
 GIT_CDN_BASE="${GIT_CDN_BASE:-http://git-cdn-service.git-cdn.svc.cluster.local:8000/}"
+GH_PROXY="${GH_PROXY:-https://gh-proxy.test.osinfra.cn/}"
 REPO_SLUG="${REPO_SLUG:-${GITHUB_REPOSITORY:-}}"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 API="${GITHUB_API_URL:-https://api.github.com}"
@@ -173,6 +179,37 @@ if [ "$control_ok" != "1" ]; then
 fi
 log "② 对照组 OK：上游能服务该 SHA（直连 github.com 成功）"
 
+# ---- ②b 上游通道入参形态对照（gh-proxy 合法性校验，留档不判红）--------------
+# 2026-11-04 的事故机理：git-cdn 回源 URL 少拼 `https://github.com/` 前缀段 /
+# 双插凭据 → gh-proxy 以 403 `Invalid input.` 快拒不合法输入 → git-cdn 重试到
+# 约 50s 才回 not our ref。这里直接对照 gh-proxy 对两种形态的判定，作为机理证据：
+#   正确形态: ${GH_PROXY}https://github.com/<org>/<repo>.git/info/refs?service=...
+#   缺前缀  : ${GH_PROXY}<org>/<repo>.git/info/refs?service=...
+# 判定口径：只留档 + 正确形态非 200 时打 ⚠️，不影响本用例 PASS/FAIL（gh-proxy
+# 的校验文案可能变，判红会制造无关噪声；对象能否取到由 ③ 的实证覆盖）。
+printf 'form\thttp_code\tseconds\tnote\n' >"$results/ghproxy.tsv"
+probe_ghproxy() {  # probe_ghproxy <form-name> <url>
+    local form=$1 url=$2 out code sec
+    out=$(curl -sS -m 20 -o "$results/ghproxy-$form.body" \
+        -w '%{http_code} %{time_total}' "$url" 2>/dev/null) || out="000 0"
+    code=${out%% *}; sec=${out##* }
+    printf '%s\t%s\t%s\t%s\n' "$form" "$code" "$sec" \
+        "$(head -c 60 "$results/ghproxy-$form.body" 2>/dev/null | tr '\n\t' '  ')" >>"$results/ghproxy.tsv"
+    echo "$code"
+}
+refs_path="$REPO_SLUG.git/info/refs?service=git-upload-pack"
+code_ok=$(probe_ghproxy ok-form "$GH_PROXY""https://github.com/$refs_path")
+code_bad=$(probe_ghproxy no-prefix-form "$GH_PROXY$refs_path")
+# ok-form 必须是 200：上游通道（gh-proxy 正确形态）不可用 → 判红。缺前缀形态的
+# 返回码只留档（gh-proxy 校验口径可能调整，403 亦属正常拒绝）。
+upstream_ok=0
+if [ "$code_ok" = "200" ]; then
+    upstream_ok=1
+    log "②b gh-proxy 形态对照：正确形态=${code_ok}（ok）；缺前缀形态=${code_bad}（预期 403）"
+else
+    log "❌ gh-proxy 正确形态返回 ${code_ok}（预期 200）——上游通道异常，详见 ghproxy.tsv"
+fi
+
 # ---- ③ 被测面：按真实客户端形态（Basic 凭据）向 git-cdn 按 SHA 取 -----------
 AUTH_B64=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 \
@@ -189,6 +226,10 @@ sec=$(( $(date +%s) - start ))
 
 if [ "$rc" -eq 0 ]; then
     log "③ 经 git-cdn 按 SHA 取成功（${sec}s）——git-cdn 能回源未同步对象（缺陷已修复）"
+    if [ "$upstream_ok" != "1" ]; then
+        log "❌ 但 ②b 显示上游通道异常（gh-proxy 正确形态非 200）——判红"
+        exit 1
+    fi
     exit 0
 fi
 
