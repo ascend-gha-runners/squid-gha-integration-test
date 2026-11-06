@@ -222,9 +222,10 @@ for slug in $REPOS; do
     # ③ 真值 commit 若不在本地（clone 姿势看对象是否已在 clone 里；fetch 姿势看 HEAD 是否一致）
     #    则按真值 SHA 回源 —— CI 的 checkout 就按 SHA 取，事故形态在此暴露
     if ! git -C "$repo_dir" cat-file -e "${truth}^{commit}" 2>/dev/null; then
+        t_sha0=$(now_ms)
         timeout "$tmo" git -C "$repo_dir" fetch -q "$url" "$truth" 2>"$d/sha.err"; rc=$?
         if [ "$rc" = 0 ]; then
-            note="$note,sha-fetch-ok"
+            note="$note,sha-fetch-ok=$(( $(now_ms) - t_sha0 ))ms"
         else
             reason=$(classify "$d/sha.err" "$rc")
             note="$note,sha-$reason"
@@ -236,10 +237,13 @@ for slug in $REPOS; do
 
     # 真值 commit 必须能 checkout（对象完整）
     if [ "$verdict" = PASS ]; then
+        t_co0=$(now_ms)
         if ! git -C "$repo_dir" checkout -q --detach "$truth" 2>"$d/co.err"; then
             note="$note,checkout-$(classify "$d/co.err" 1)"; verdict=FAIL
         elif ! git -C "$repo_dir" ls-tree --name-only "$truth" >/dev/null 2>&1; then
             note="$note,tree-missing"; verdict=FAIL
+        else
+            note="$note,checkout=$(( $(now_ms) - t_co0 ))ms"
         fi
     fi
 

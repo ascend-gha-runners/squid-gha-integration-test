@@ -47,6 +47,11 @@ on:
         options:
           - fetch
           - clone
+      clone_timeout:
+        description: '单仓取对象超时秒（0 = 按仓库体积自动估：体积/2+120，180~1200）'
+        required: false
+        default: '0'
+        type: string
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -121,6 +126,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOS: ${{ inputs.latest_repos }}
           POSE: ${{ inputs.pose || 'fetch' }}
+          CLONE_TIMEOUT: ${{ inputs.clone_timeout || '0' }}
         run: bash test-squid/repro-gitcdn-latest.sh
 
       - name: 写入 Step Summary
