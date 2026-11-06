@@ -39,7 +39,7 @@
 #   GIT302_REPO            小仓库（默认 https://github.com/octocat/Hello-World.git）
 #   GIT302_REPO2           第二个仓库，验证规则不绑定单仓库
 #                          （默认 https://github.com/minghuaslab/flash-attention-npu.git）
-#   GIT302_SUBMODULE_REPO  带子模块的仓库（默认 dmlc/xgboost，子模块 dmlc-core 也在 GitHub）
+#   GIT302_SUBMODULE_REPO  带子模块的仓库（默认 jqlang/jq，子模块 kkos/oniguruma 也在 GitHub）
 #   GIT302_LFS_REPO        带 LFS 对象的仓库（默认 honeynet/forensic_challenges，
 #                          单个对象 ~1MB，bounded）
 #   GIT302_PUSH_URL        push 目标（空=SKIP，需凭据）
@@ -61,7 +61,7 @@ printf 'case\tresult\tdetail\n' > "$DETAIL"
 
 GIT302_REPO="${GIT302_REPO:-https://github.com/octocat/Hello-World.git}"
 GIT302_REPO2="${GIT302_REPO2:-https://github.com/minghuaslab/flash-attention-npu.git}"
-GIT302_SUBMODULE_REPO="${GIT302_SUBMODULE_REPO:-https://github.com/dmlc/xgboost.git}"
+GIT302_SUBMODULE_REPO="${GIT302_SUBMODULE_REPO:-https://github.com/jqlang/jq.git}"
 GIT302_LFS_REPO="${GIT302_LFS_REPO:-https://github.com/honeynet/forensic_challenges.git}"
 GIT302_PUSH_URL="${GIT302_PUSH_URL:-}"
 GIT302_TIMEOUT="${GIT302_TIMEOUT:-300}"
@@ -159,7 +159,8 @@ run_git_plain_case() {  # run_git_plain_case <case> <workdir> <command...>
 
 # runner 未预装 git-lfs 时按架构拉官方 release（与 tool-14 同一套自举形态）
 lfs_bootstrap() {
-    local ver=3.7.0 dir="$WORK/git-lfs-$ver" arch
+    local ver=3.7.0 arch dir
+    dir="$WORK/git-lfs-$ver"
     if [ -x "$dir/git-lfs" ]; then PATH="$dir:$PATH"; export PATH; return 0; fi
     case "$(uname -m)" in
         x86_64)        arch=amd64 ;;
@@ -347,9 +348,15 @@ fi
 # ---------------------------------------------------------------------------
 if [ -n "$GIT302_SUBMODULE_REPO" ]; then
     rm -rf "$WORK/clone-submodule"
-    if run_git_case "clone-recurse-submodules" "$WORK" git clone --depth 1 \
-        --shallow-submodules --recurse-submodules \
-        "$GIT302_SUBMODULE_REPO" "$WORK/clone-submodule"; then
+    # 两步形态：先用 blob:none + no-checkout 把超级仓库压到最小（jq ~8MB 仓库只取
+    # commit/tree，实传百 KB），read-tree 把 gitlink 放进 index，再浅拉子模块。
+    # 一步 `clone --recurse-submodules` 会连同超级仓库全部 blob 一起下，冷缓存下
+    # 300s 超时（gy-006 实测 rc=124）。
+    if run_git_case "clone-recurse-submodules" "$WORK" bash -c '
+        git clone --depth 1 --filter=blob:none --no-checkout "$1" "$2" &&
+        git -C "$2" read-tree HEAD &&
+        git -C "$2" submodule update --init --depth 1
+    ' _ "$GIT302_SUBMODULE_REPO" "$WORK/clone-submodule"; then
         subs=$(git -C "$WORK/clone-submodule" submodule status 2>/dev/null)
         n=$(printf '%s\n' "$subs" | grep -c . || true)
         if [ "$n" -gt 0 ]; then
