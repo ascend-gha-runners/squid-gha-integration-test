@@ -89,29 +89,32 @@ gh workflow run test-git302.yaml --ref main \
 脚本内用 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` 剥掉宿主机 insteadOf——否则测到的是
 `/root/.gitconfig` 的重写，而不是 squid 的 302。
 
-### 5. git-cdn 并发 clone 压测（test-gitcdn 的 opt-in job）
+### 5. git-cdn 最新 commit 滚动校验（test-gitcdn 的 gitcdn-latest job）
 
-`test-gitcdn.yaml` 里 `pressure=1` 时追加 `gitcdn-pressure` job，脚本
-`test-squid/pressure-gitcdn-clone.sh`，只压 git-cdn 本体（显式打
+`test-gitcdn.yaml` 每 **30 分钟**（`schedule`）跑一次滚动校验，脚本
+`test-squid/repro-gitcdn-latest.sh`，只测 git-cdn 本体（显式打
 `git-cdn-service.git-cdn.svc.cluster.local:8000`，不经 squid、不依赖 insteadOf）：
 
 ```bash
+# 手动立刻跑一轮（默认定时任务会自己跑）
 gh workflow run test-gitcdn.yaml --repo ascend-gha-runners/squid-gha-integration-test \
-  --ref main -f pressure=1
-# 自定义阶梯/仓库（gitcode: 前缀走 git-cdn-gitcode 上游）
-gh workflow run test-gitcdn.yaml --ref main -f pressure=1 \
-  -f pressure_ladder='8 16 32 64 128 256' \
-  -f pressure_repos='vllm-project/vllm-ascend gitcode:cann/catlass'
+  --ref main -f latest=1
+# 只验一部分仓库（gitcode: 前缀走 git-cdn-gitcode 上游）
+gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
+  -f latest_repos='vllm-project/vllm-ascend gitcode:cann/catlass'
 ```
 
 - 仓库清单 = `ascend-ci-deployment#2048` 里跑在本套 runner 上的构建仓（vllm-ascend /
   triton-ascend / sglang / verl / pytorch …）**+ 它们的依赖仓**（vllm、triton、
-  catlass、pto-isa、AscendNPU-IR），可用 `pressure_repos` 覆盖。
-- 流程：先逐仓 `--depth 1` 预热并量体积（同时灌缓存，压测量的是缓存命中吞吐），
-  再按 8/16/32/64/128/256 并发跑 clone；仓库按磁盘预算自动分层（大仓库只出现在
-  低并发），剩余磁盘低于 5GB 直接跳过后续层级。
-- 判定：任一级任一 clone 失败 → job 红；结果在 artifact `test-gitcdn-pressure` 的
-  `timings.tsv`（各级 wall/ok/fail/p50/p95/max）与 `clones.tsv`（逐 clone 明细）。
+  catlass、pto-isa、AscendNPU-IR），可用 `latest_repos` 覆盖。
+- 每仓三步（模拟正常用 github.com 的姿势）：① 先取上游最新 commit 作真值
+  （GitHub API / gitcode `ls-remote`）→ ② 经 git-cdn `fetch --depth 1` 默认分支
+  HEAD 并 checkout → ③ HEAD 落后时按真值 SHA 再经 git-cdn 回源一次。
+- 判定：拿不到上游最新 commit（`not our ref`、refs 长期落后、checkout 失败）即
+  job 红；真值 API 异常记 WARN；结果在 artifact `test-gitcdn-latest` 的
+  `latest.tsv`（repo / 真值 SHA / cdn HEAD / 结论 / 备注 / 耗时）。
+- 定时轮次不跑 `gitcdn-unsynced` job（避免每 30 分钟造一次临时 ref），该 job 仍
+  在 workflow_dispatch / PR 上执行。
 
 ## 二、前置条件（缺一不可）
 
