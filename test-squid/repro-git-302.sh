@@ -178,13 +178,16 @@ lfs_bootstrap() {
 # ---------------------------------------------------------------------------
 # curl 契约探头：不跟随跳转（不加 -L）
 # ---------------------------------------------------------------------------
-probe_location() {  # probe_location <case> <url> [method]  → 输出 "code<TAB>location"
-    local c="$1" url="$2" method="${3:-GET}"
-    local hdr="$WORK/$c.hdr" code loc arg=(-X "$method")
+probe_location() {  # probe_location <case> <url> [method] [direct]  → 输出 "code<TAB>location"
+    local c="$1" url="$2" method="${3:-GET}" mode="${4:-}"
+    local sfx="" hdr code loc arg=(-X "$method")
     # curl -X HEAD 会等响应体（HEAD 无体）直到超时，必须用 -I
     [ "$method" = "HEAD" ] && arg=(-I)
+    # direct：绕开代理直连作对照（源站自身状态码）
+    if [ "$mode" = "direct" ]; then sfx="-direct"; arg+=(--noproxy '*'); fi
+    hdr="$WORK/$c$sfx.hdr"
     code=$(curl -sS "${arg[@]}" -D "$hdr" -o /dev/null -w '%{http_code}' --max-time 60 \
-        -H 'Accept: application/x-git-upload-pack-advertisement' "$url" 2>"$WORK/$c.err") || code="000"
+        -H 'Accept: application/x-git-upload-pack-advertisement' "$url" 2>"$WORK/$c$sfx.err") || code="000"
     loc=$(grep -i '^location:' "$hdr" 2>/dev/null | head -1 | tr -d '\r' | sed 's/^[Ll]ocation: *//')
     printf '%s\t%s\n' "$code" "$loc"
 }
@@ -253,14 +256,27 @@ else
     mark "probe-head" WARN "HEAD=$code（GET 才是 git 实际使用的分支，仅留档）"
 fi
 
-# 无 service query：git 客户端不会这样请求，仅留档形态
-out=$(probe_location "probe-noquery" "${GIT302_REPO%/}/info/refs")
+# 无 service query：git 客户端不会这样请求；判据 = 未跳 git-cdn 且状态码与源站直连一致
+# （源站自己就答 403，出现差异才说明 squid 改写了不该改的请求）
+NOQUERY_URL="${GIT302_REPO%/}/info/refs"
+out=$(probe_location "probe-noquery" "$NOQUERY_URL")
 code=${out%%$'\t'*}; loc=${out#*$'\t'}
-phase_row "probe-noquery" 0 0
-case "$loc" in
-    *git-cdn*) mark "probe-noquery" PASS "无 query 也 302 → $loc" ;;
-    *)         mark "probe-noquery" WARN "无 query GET=$code（规则仅匹配带 service 的形态，git 不触发）" ;;
-esac
+dout=$(probe_location "probe-noquery" "$NOQUERY_URL" GET direct)
+dcode=${dout%%$'\t'*}
+r=0
+if [[ "$loc" == *git-cdn* ]]; then
+    mark "probe-noquery" PASS "无 query 也 302 → $loc（规则覆盖更宽，git 不触发）"
+elif [ "$code" = "000" ]; then
+    mark "probe-noquery" WARN "经 squid 请求失败（curl=000），无法判定"
+elif [ "$dcode" = "000" ]; then
+    mark "probe-noquery" WARN "源站直连不可达（curl=000），仅留档：经 squid GET=$code"
+elif [ "$code" = "$dcode" ]; then
+    mark "probe-noquery" PASS "未跳 git-cdn，状态码与源站直连一致（GET=$code）"
+else
+    mark "probe-noquery" FAIL "未跳 git-cdn 但状态码与源站直连不一致：经 squid=$code 直连=$dcode"
+    r=1
+fi
+phase_row "probe-noquery" 0 "$r"
 
 # receive-pack（push 形态）：200=push 不经缓存（合理）；302 git-cdn=需确认其支持 receive-pack
 out=$(probe_location "probe-receive-pack" "${GIT302_REPO%/}/info/refs?service=git-receive-pack")
