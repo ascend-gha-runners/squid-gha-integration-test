@@ -110,9 +110,11 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 - 每仓三步（模拟正常用 github.com 的姿势）：① 先取上游最新 commit 作真值
   （GitHub API / gitcode `ls-remote`）→ ② 经 git-cdn `fetch --depth 1` 默认分支
   HEAD 并 checkout → ③ HEAD 落后时按真值 SHA 再经 git-cdn 回源一次。
-- 判定：拿不到上游最新 commit（`not our ref`、refs 长期落后、checkout 失败）即
-  job 红；真值 API 异常记 WARN；结果在 artifact `test-gitcdn-latest` 的
-  `latest.tsv`（repo / 真值 SHA / cdn HEAD / 结论 / 备注 / 耗时）。
+- 判定：拿不到上游最新 commit（`not our ref`、refs 落后且按 SHA 回源失败、
+  checkout 失败）即 job 红；真值 API 异常、大仓库冷缓存 fetch 超时记 WARN
+  （单仓上限按仓库体积估算，180~1200s）；单轮总预算 55 分钟，超出后剩余仓库记
+  SKIP。结果在 artifact `test-gitcdn-latest` 的 `latest.tsv`
+  （repo / 真值 SHA / cdn HEAD / 结论 / 备注 / 耗时）。
 - 定时轮次不跑 `gitcdn-unsynced` job（避免每 30 分钟造一次临时 ref），该 job 仍
   在 workflow_dispatch / PR 上执行。
 
