@@ -4,8 +4,10 @@
 #
 # 每轮对清单内每个仓库做三件事（模拟正常使用 github.com 的姿势）：
 #   ① 先取上游最新 commit 作为真值（GitHub API / gitcode ls-remote）
-#   ② 再经 git-cdn 取默认分支 HEAD：fetch --depth 1 + checkout
-#   ③ 若 cdn 的 HEAD 落后于真值，再按真值 SHA 经 git-cdn 回源取一次
+#   ② 经 git-cdn 取对象，两种姿势（POSE 选择，默认 fetch）：
+#        fetch = `git init` + `fetch --depth 1 HEAD`（CI 常见姿势；depth → pack 不可缓存）
+#        clone = `git clone` 全量（所有分支、无 depth → pack 可缓存），然后再切 commit
+#   ③ 真值 commit 不在本地时，再按真值 SHA 经 git-cdn 回源取一次
 #      —— 成功 = 回源健康；`not our ref` = 2026-11-04 事故形态（判红）
 #
 # 判定：每个仓库都必须能拿到「上游最新 commit」（HEAD 命中，或按 SHA 回源成功），
@@ -19,6 +21,7 @@
 #
 # 可覆盖：GIT_CDN_BASE / GIT_CDN_GITCODE_BASE / REPOS / CLONE_TIMEOUT（0=按体积自动）
 #         / RUN_BUDGET（单轮总预算秒）/ RESULTS / WORK / GH_TOKEN
+#         / POSE（fetch|clone，取对象姿势，默认 fetch）
 #
 # 超时口径：单仓 fetch 上限按 GitHub 仓库体积估（约 2MB/s 回源，180~1200s）。
 #           大仓库冷缓存超时只记 WARN（不是正确性问题）；`not our ref` /
@@ -31,6 +34,8 @@ set -uo pipefail
 GIT_CDN_BASE="${GIT_CDN_BASE:-http://git-cdn-service.git-cdn.svc.cluster.local:8000/}"
 GIT_CDN_GITCODE_BASE="${GIT_CDN_GITCODE_BASE:-http://git-cdn-service.git-cdn-gitcode.svc.cluster.local:8000/}"
 CLONE_TIMEOUT="${CLONE_TIMEOUT:-0}"   # 0 = 按仓库体积自动算（见 timeout_for）
+POSE="${POSE:-fetch}"                 # fetch=init+depth1 fetch；clone=全量 clone 后切 commit
+case "$POSE" in fetch|clone) ;; *) echo "未知 POSE=$POSE（只支持 fetch / clone）" >&2; exit 1 ;; esac
 RUN_BUDGET="${RUN_BUDGET:-3300}"      # 单轮总预算秒，超出后剩余仓库记 SKIP（防 job 超时）
 RESULTS="${RESULTS:-${RESULTS_DIR:-/tmp/test-squid-results}/gitcdn-latest}"
 WORK="${WORK:-/tmp/gitcdn-latest}"
@@ -170,44 +175,71 @@ for slug in $REPOS; do
     fi
 
     size_mb=$(repo_size_mb "$slug"); tmo=$(timeout_for "$size_mb")
-    d="$WORK/$i"; mkdir -p "$d"; git -C "$d" init -q
-    # ② 经 git-cdn 取默认分支 HEAD（正常 fetch 姿势）
-    timeout "$tmo" git -C "$d" fetch -q --depth 1 "$url" HEAD 2>"$d/fetch.err"; rc=$?
-    if [ "$rc" = 124 ]; then
-        # 超时 ≠ 回源缺陷：大仓库（sglang 495MB / triton 827MB）冷缓存回源会超限，留档
-        log "$slug —— ⚠️ fetch 超时（上限 ${tmo}s，体积 ${size_mb}MB）"
-        printf '%s\t%s\t%s\t-\t-\tWARN\ttimeout(size=%sMB,limit=%ss)\t%s\n' \
-            "$slug" "$family" "$truth" "$size_mb" "$tmo" "$(( $(now_ms) - t0 ))" >>"$TSV"
-        WARN=$((WARN+1)); rm -rf "$d"; continue
+    d="$WORK/$i"; mkdir -p "$d"
+    t_fetch0=$(now_ms)
+    if [ "$POSE" = "clone" ]; then
+        # ② clone 姿势：全量 clone（所有分支、无 depth → pack 可缓存），HEAD 即默认分支最新
+        timeout "$tmo" git clone -q "$url" "$d/repo" 2>"$d/clone.err"; rc=$?
+        if [ "$rc" = 124 ]; then
+            log "$slug —— ⚠️ clone 超时（上限 ${tmo}s，体积 ${size_mb}MB）"
+            printf '%s\t%s\t%s\t-\t-\tWARN\tclone-timeout(size=%sMB,limit=%ss)\t%s\n' \
+                "$slug" "$family" "$truth" "$size_mb" "$tmo" "$(( $(now_ms) - t0 ))" >>"$TSV"
+            WARN=$((WARN+1)); rm -rf "$d"; continue
+        fi
+        if [ "$rc" != 0 ]; then
+            reason=$(classify "$d/clone.err" "$rc")
+            log "$slug —— ❌ clone 失败：$reason"
+            printf '%s\t%s\t%s\t-\t-\tFAIL\tclone-%s\t%s\n' "$slug" "$family" "$truth" "$reason" "$(( $(now_ms) - t0 ))" >>"$TSV"
+            FAIL=$((FAIL+1)); rm -rf "$d"; continue
+        fi
+        repo_dir="$d/repo"
+        cdn_head=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)
+        fetch_ms=$(( $(now_ms) - t_fetch0 ))
+        note="clone=${fetch_ms}ms"
+    else
+        # ② fetch 姿势：只取默认分支 HEAD 一层（depth=1）
+        git -C "$d" init -q
+        timeout "$tmo" git -C "$d" fetch -q --depth 1 "$url" HEAD 2>"$d/fetch.err"; rc=$?
+        if [ "$rc" = 124 ]; then
+            # 超时 ≠ 回源缺陷：大仓库（sglang 495MB / triton 827MB）冷缓存回源会超限，留档
+            log "$slug —— ⚠️ fetch 超时（上限 ${tmo}s，体积 ${size_mb}MB）"
+            printf '%s\t%s\t%s\t-\t-\tWARN\ttimeout(size=%sMB,limit=%ss)\t%s\n' \
+                "$slug" "$family" "$truth" "$size_mb" "$tmo" "$(( $(now_ms) - t0 ))" >>"$TSV"
+            WARN=$((WARN+1)); rm -rf "$d"; continue
+        fi
+        if [ "$rc" != 0 ]; then
+            reason=$(classify "$d/fetch.err" "$rc")
+            log "$slug —— ❌ fetch 失败：$reason"
+            printf '%s\t%s\t%s\t-\t-\tFAIL\t%s\t%s\n' "$slug" "$family" "$truth" "$reason" "$(( $(now_ms) - t0 ))" >>"$TSV"
+            FAIL=$((FAIL+1)); rm -rf "$d"; continue
+        fi
+        repo_dir="$d"
+        cdn_head=$(git -C "$repo_dir" rev-parse FETCH_HEAD 2>/dev/null)
+        note="-"
     fi
-    if [ "$rc" != 0 ]; then
-        reason=$(classify "$d/fetch.err" "$rc")
-        log "$slug —— ❌ fetch 失败：$reason"
-        printf '%s\t%s\t%s\t-\t-\tFAIL\t%s\t%s\n' "$slug" "$family" "$truth" "$reason" "$(( $(now_ms) - t0 ))" >>"$TSV"
-        FAIL=$((FAIL+1)); rm -rf "$d"; continue
-    fi
-    cdn_head=$(git -C "$d" rev-parse FETCH_HEAD 2>/dev/null)
-    note="-"; verdict=PASS
+    verdict=PASS
 
-    if [ "$cdn_head" != "$truth" ]; then
-        # ③ refs 落后：按真值 SHA 回源（CI 的 checkout 就按 SHA 取，事故形态在此暴露）
-        timeout "$tmo" git -C "$d" fetch -q --depth 1 "$url" "$truth" 2>"$d/sha.err"; rc=$?
+    # ③ 真值 commit 若不在本地（clone 姿势看对象是否已在 clone 里；fetch 姿势看 HEAD 是否一致）
+    #    则按真值 SHA 回源 —— CI 的 checkout 就按 SHA 取，事故形态在此暴露
+    if ! git -C "$repo_dir" cat-file -e "${truth}^{commit}" 2>/dev/null; then
+        timeout "$tmo" git -C "$repo_dir" fetch -q "$url" "$truth" 2>"$d/sha.err"; rc=$?
         if [ "$rc" = 0 ]; then
-            note="refs-lag(sha-ok)"
+            note="$note,sha-fetch-ok"
         else
             reason=$(classify "$d/sha.err" "$rc")
-            note="refs-lag(sha-$reason)"
+            note="$note,sha-$reason"
             verdict=FAIL
         fi
+    elif [ "$cdn_head" != "$truth" ]; then
+        note="$note,head-lag(same-pack)"   # 对象已在本地（全量 clone 覆盖所有分支）
     fi
 
     # 真值 commit 必须能 checkout（对象完整）
     if [ "$verdict" = PASS ]; then
-        cur=$(git -C "$d" rev-parse FETCH_HEAD 2>/dev/null)
-        if ! git -C "$d" checkout -q --detach "$cur" 2>"$d/co.err"; then
-            note="checkout-$(classify "$d/co.err" 1)"; verdict=FAIL
-        elif ! git -C "$d" ls-tree --name-only "$cur" >/dev/null 2>&1; then
-            note="tree-missing"; verdict=FAIL
+        if ! git -C "$repo_dir" checkout -q --detach "$truth" 2>"$d/co.err"; then
+            note="$note,checkout-$(classify "$d/co.err" 1)"; verdict=FAIL
+        elif ! git -C "$repo_dir" ls-tree --name-only "$truth" >/dev/null 2>&1; then
+            note="$note,tree-missing"; verdict=FAIL
         fi
     fi
 
@@ -216,7 +248,7 @@ for slug in $REPOS; do
         PASS) PASS=$((PASS+1)); log "$slug —— ✅ 最新 commit ${truth:0:9}（$note，${ms}ms）" ;;
         *)    FAIL=$((FAIL+1)); log "$slug —— ❌ $note（truth=${truth:0:9} cdn=${cdn_head:0:9}）" ;;
     esac
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$family" "$truth" "$cdn_head" "${cur:-$cdn_head}" "$verdict" "$note" "$ms" >>"$TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$family" "$truth" "$cdn_head" "$truth" "$verdict" "$note" "$ms" >>"$TSV"
     rm -rf "$d"
 done
 

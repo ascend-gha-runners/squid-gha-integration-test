@@ -17,9 +17,9 @@ name: test-gitcdn
 #
 # 另含「最新 commit 滚动校验」job（gitcdn-latest）：
 #   每 30 分钟（schedule）对 ascend-ci-deployment#2048 的构建仓及其依赖仓，
-#   ① 先取上游最新 commit（真值），② 再经 git-cdn fetch 默认分支 HEAD 并 checkout，
-#   ③ HEAD 落后则按真值 SHA 回源取一次。取不到最新 commit 即判红
-#   —— 持续守 2026-11-04「缓存缺新 SHA → not our ref」这一类问题。
+#   ① 先取上游最新 commit（真值），② 再经 git-cdn 取对象（POSE=fetch 默认：fetch --depth 1；
+#   POSE=clone：全量 clone 后切 commit），③ 真值 commit 不在本地则按真值 SHA 回源取一次。
+#   取不到最新 commit 即判红 —— 持续守 2026-11-04「缓存缺新 SHA → not our ref」这一类问题。
 
 on:
   workflow_dispatch:
@@ -39,6 +39,14 @@ on:
         required: false
         default: ''
         type: string
+      pose:
+        description: '取对象姿势：fetch = init + fetch --depth 1（默认）；clone = 全量 clone 后再切 commit'
+        required: false
+        default: 'fetch'
+        type: choice
+        options:
+          - fetch
+          - clone
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -112,6 +120,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOS: ${{ inputs.latest_repos }}
+          POSE: ${{ inputs.pose || 'fetch' }}
         run: bash test-squid/repro-gitcdn-latest.sh
 
       - name: 写入 Step Summary
