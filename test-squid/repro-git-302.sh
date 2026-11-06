@@ -21,12 +21,15 @@
 #      - pull --ff-only、remote show、remote update
 #      - 按 SHA fetch（actions/checkout 形态）
 #      - http.followRedirects=false 反证（必须失败，证明 302 真实存在）
-#      - 默认 SKIP：submodule / LFS / push（需额外仓库或写权限，用环境变量打开）
+#   - 默认 SKIP：push（需写权限，用环境变量打开）
 #
 # 判定：
 #   - 真实命令 must rc=0 且 stderr 出现 `redirecting to ...git-cdn`
 #   - 契约探头 must 302 且 Location 命中 git-cdn 且路径/查询串保留
 #   - 负样本 must 不跳 git-cdn
+#   - submodule：clone 后 `git submodule status` 必须非空（子模块真的被拉下来）
+#   - LFS：clone 用 GIT_LFS_SKIP_SMUDGE=1（先只验 302），再 git lfs pull 单个
+#     对象，落盘内容不得仍是 pointer（证明对象真的下载了）
 #
 # 前置：runner 已注入 squid（HTTP(S)_PROXY + CA）。脚本用
 #   GIT_CONFIG_GLOBAL/SYSTEM=/dev/null 剥掉宿主机 insteadOf，否则测到的是
@@ -36,8 +39,9 @@
 #   GIT302_REPO            小仓库（默认 https://github.com/octocat/Hello-World.git）
 #   GIT302_REPO2           第二个仓库，验证规则不绑定单仓库
 #                          （默认 https://github.com/minghuaslab/flash-attention-npu.git）
-#   GIT302_SUBMODULE_REPO  带子模块的仓库（空=SKIP）
-#   GIT302_LFS_REPO        带 LFS 文件的仓库（空=SKIP）
+#   GIT302_SUBMODULE_REPO  带子模块的仓库（默认 dmlc/xgboost，子模块 dmlc-core 也在 GitHub）
+#   GIT302_LFS_REPO        带 LFS 对象的仓库（默认 honeynet/forensic_challenges，
+#                          单个对象 ~1MB，bounded）
 #   GIT302_PUSH_URL        push 目标（空=SKIP，需凭据）
 #   GIT302_TIMEOUT         单条 git 命令超时秒数（默认 300）
 #
@@ -57,8 +61,8 @@ printf 'case\tresult\tdetail\n' > "$DETAIL"
 
 GIT302_REPO="${GIT302_REPO:-https://github.com/octocat/Hello-World.git}"
 GIT302_REPO2="${GIT302_REPO2:-https://github.com/minghuaslab/flash-attention-npu.git}"
-GIT302_SUBMODULE_REPO="${GIT302_SUBMODULE_REPO:-}"
-GIT302_LFS_REPO="${GIT302_LFS_REPO:-}"
+GIT302_SUBMODULE_REPO="${GIT302_SUBMODULE_REPO:-https://github.com/dmlc/xgboost.git}"
+GIT302_LFS_REPO="${GIT302_LFS_REPO:-https://github.com/honeynet/forensic_challenges.git}"
 GIT302_PUSH_URL="${GIT302_PUSH_URL:-}"
 GIT302_TIMEOUT="${GIT302_TIMEOUT:-300}"
 
@@ -132,6 +136,42 @@ run_git_expect_fail() {  # run_git_expect_fail <case> <workdir> <git args...>
 skip_case() {  # skip_case <case> <reason>
     phase_row "$1" 0 SKIP
     mark "$1" SKIP "$2"
+}
+
+# 只断言 rc=0：LFS 对象下载走 batch API + 预签名对象域，不经 info/refs 302
+run_git_plain_case() {  # run_git_plain_case <case> <workdir> <command...>
+    local c="$1" dir="$2"; shift 2
+    local log="$WORK/$c.log" rc t0 sec
+    t0=$(now)
+    ( cd "$dir" && timeout "$GIT302_TIMEOUT" \
+        env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 \
+        "$@" ) >"$log" 2>&1
+    rc=$?
+    sec=$(( $(now) - t0 ))
+    if [ "$rc" -ne 0 ]; then
+        phase_row "$c" "$sec" 1
+        mark "$c" FAIL "rc=$rc: $(tail -3 "$log" | tr '\n' ' ' | cut -c1-240)"
+        return 1
+    fi
+    phase_row "$c" "$sec" 0
+    mark "$c" PASS "$(tail -1 "$log" | cut -c1-160)"
+}
+
+# runner 未预装 git-lfs 时按架构拉官方 release（与 tool-14 同一套自举形态）
+lfs_bootstrap() {
+    local ver=3.7.0 dir="$WORK/git-lfs-$ver" arch
+    if [ -x "$dir/git-lfs" ]; then PATH="$dir:$PATH"; export PATH; return 0; fi
+    case "$(uname -m)" in
+        x86_64)        arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *)             return 1 ;;
+    esac
+    curl -fsSL --max-time 180 \
+        "https://github.com/git-lfs/git-lfs/releases/download/v$ver/git-lfs-linux-$arch-v$ver.tar.gz" \
+        | tar -xz -C "$WORK" >/dev/null 2>&1 || return 1
+    [ -x "$dir/git-lfs" ] || return 1
+    PATH="$dir:$PATH"; export PATH
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -301,20 +341,62 @@ else
     skip_case "fetch-by-sha" "取不到 HEAD SHA 或 git init 失败"
 fi
 
-# 需要额外仓库/凭据的形态：默认 SKIP
+# ---------------------------------------------------------------------------
+# submodule：顶层 clone 走 302，子模块 URL 也是 github.com → 同一条 302 规则
+# 断言：clone rc=0 + 出现 redirecting + `git submodule status` 非空（真拉下来了）
+# ---------------------------------------------------------------------------
 if [ -n "$GIT302_SUBMODULE_REPO" ]; then
-    run_git_case "clone-recurse-submodules" "$WORK" git clone --depth 1 --recurse-submodules \
-        "$GIT302_SUBMODULE_REPO" "$WORK/clone-submodule"
+    rm -rf "$WORK/clone-submodule"
+    if run_git_case "clone-recurse-submodules" "$WORK" git clone --depth 1 \
+        --shallow-submodules --recurse-submodules \
+        "$GIT302_SUBMODULE_REPO" "$WORK/clone-submodule"; then
+        subs=$(git -C "$WORK/clone-submodule" submodule status 2>/dev/null)
+        n=$(printf '%s\n' "$subs" | grep -c . || true)
+        if [ "$n" -gt 0 ]; then
+            phase_row "submodule-populated" 0 0
+            mark "submodule-populated" PASS "$n 个子模块已拉取: $(printf '%s\n' "$subs" | awk '{print $2}' | tr '\n' ' ')"
+        else
+            phase_row "submodule-populated" 0 1
+            mark "submodule-populated" FAIL "clone rc=0 但 submodule status 为空（子模块未拉取）"
+        fi
+    fi
 else
     skip_case "clone-recurse-submodules" "未设置 GIT302_SUBMODULE_REPO"
 fi
 
+# ---------------------------------------------------------------------------
+# LFS：clone 先 SKIP_SMUDGE（只验 302 覆盖到 repo 发现），再单独 pull 一个对象，
+# 断言落盘内容不再是 pointer（batch API + 对象下载真的成功）
+# ---------------------------------------------------------------------------
 if [ -n "$GIT302_LFS_REPO" ]; then
-    # LFS 的 batch API 本身不走 info/refs，但仓库发现（list refs）仍走 302
-    run_git_case "clone-lfs-repo" "$WORK" git clone --depth 1 \
-        "$GIT302_LFS_REPO" "$WORK/clone-lfs"
+    if command -v git-lfs >/dev/null 2>&1 || lfs_bootstrap; then
+        rm -rf "$WORK/clone-lfs"
+        if run_git_case "clone-lfs-repo" "$WORK" env GIT_LFS_SKIP_SMUDGE=1 \
+            git clone --depth 1 "$GIT302_LFS_REPO" "$WORK/clone-lfs"; then
+            git -C "$WORK/clone-lfs" lfs install --local >/dev/null 2>&1 || true
+            obj=$(git -C "$WORK/clone-lfs" lfs ls-files -n 2>/dev/null | head -1)
+            if [ -z "$obj" ]; then
+                skip_case "lfs-pull-one" "HEAD 无 LFS 跟踪文件（git lfs ls-files 为空）"
+            else
+                phase_row "lfs-tracked" 0 0
+                mark "lfs-tracked" PASS "LFS 跟踪文件 $obj"
+                if run_git_plain_case "lfs-pull-one" "$WORK/clone-lfs" \
+                    git lfs pull --include="$obj"; then
+                    if head -c 64 "$WORK/clone-lfs/$obj" 2>/dev/null | grep -q 'version https://git-lfs'; then
+                        phase_row "lfs-object-real" 0 1
+                        mark "lfs-object-real" FAIL "$obj 仍是 pointer（对象未真正下载）"
+                    else
+                        phase_row "lfs-object-real" 0 0
+                        mark "lfs-object-real" PASS "$obj 已落盘 $(wc -c <"$WORK/clone-lfs/$obj" 2>/dev/null) 字节（非 pointer）"
+                    fi
+                fi
+            fi
+        fi
+    else
+        skip_case "clone-lfs-repo" "无 git-lfs 且官方 release 自举失败（$GIT302_LFS_REPO 无法校验对象）"
+    fi
 else
-    skip_case "clone-lfs-repo" "未设置 GIT302_LFS_REPO（LFS batch API 不经 info/refs 302 面）"
+    skip_case "clone-lfs-repo" "未设置 GIT302_LFS_REPO"
 fi
 
 if [ -n "$GIT302_PUSH_URL" ]; then

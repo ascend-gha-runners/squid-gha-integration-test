@@ -14,7 +14,9 @@ name: test-git302
 #   B. 真实 git：ls-remote（plain/heads-tags/symref/指定 ref/protocol v0,v2）、
 #      clone（full/depth1/filter/single-branch/bare）、fetch（tags/prune/deepen/
 #      unshallow/按 SHA）、pull --ff-only、remote show/update、反证
-#      http.followRedirects=false 必须失败；submodule/LFS/push 默认 SKIP
+#      http.followRedirects=false 必须失败
+#   C. submodule（dmlc/xgboost → dmlc-core）与 LFS（honeynet/forensic_challenges）
+#      默认开启：submodule 断言真的被拉下来，LFS 断言 pull 后不是 pointer
 #
 # 前置：runner 已注入 squid（HTTP(S)_PROXY + CA）。脚本用
 #       GIT_CONFIG_GLOBAL/SYSTEM=/dev/null 剥掉宿主机 insteadOf，
@@ -39,14 +41,14 @@ on:
         default: 'https://github.com/minghuaslab/flash-attention-npu.git'
         type: string
       submodule_repo:
-        description: 'GIT302_SUBMODULE_REPO 带子模块的仓库（空=SKIP）'
+        description: 'GIT302_SUBMODULE_REPO 带子模块的仓库（空=默认 dmlc/xgboost）'
         required: false
-        default: ''
+        default: 'https://github.com/dmlc/xgboost.git'
         type: string
       lfs_repo:
-        description: 'GIT302_LFS_REPO 带 LFS 的仓库（空=SKIP）'
+        description: 'GIT302_LFS_REPO 带 LFS 对象的仓库（空=默认 honeynet/forensic_challenges）'
         required: false
-        default: ''
+        default: 'https://github.com/honeynet/forensic_challenges.git'
         type: string
       timeout:
         description: '单条 git 命令超时秒数'
@@ -74,8 +76,8 @@ jobs:
         env:
           GIT302_REPO: ${{ github.event_name == 'pull_request' && 'https://github.com/octocat/Hello-World.git' || inputs.repo }}
           GIT302_REPO2: ${{ github.event_name == 'pull_request' && 'https://github.com/minghuaslab/flash-attention-npu.git' || inputs.repo2 }}
-          GIT302_SUBMODULE_REPO: ${{ github.event_name == 'pull_request' && '' || inputs.submodule_repo }}
-          GIT302_LFS_REPO: ${{ github.event_name == 'pull_request' && '' || inputs.lfs_repo }}
+          GIT302_SUBMODULE_REPO: ${{ github.event_name == 'pull_request' && 'https://github.com/dmlc/xgboost.git' || inputs.submodule_repo }}
+          GIT302_LFS_REPO: ${{ github.event_name == 'pull_request' && 'https://github.com/honeynet/forensic_challenges.git' || inputs.lfs_repo }}
           GIT302_TIMEOUT: ${{ github.event_name == 'pull_request' && '300' || inputs.timeout }}
         run: bash test-squid/repro-git-302.sh
 
