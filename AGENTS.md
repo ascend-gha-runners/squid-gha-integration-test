@@ -63,6 +63,32 @@ gh workflow run probe-domain.yaml --repo ascend-gha-runners/squid-gha-integratio
 结果在 artifact `probe-domain` 的 `probe.tsv`（host/path/attempt/via/code/time），
 `via=proxy` 是经 squid、`via=direct` 是 `--noproxy '*'` 直连对照。
 
+### 4. squid 302 × git 命令矩阵（test-git302，独立 workflow）
+
+PR #2470 起 squid 对 github.com 的 `/<owner>/<repo>(.git)?/info/refs?service=git-upload-pack`
+初始 GET 返回 302 → 集群内 git-cdn。test-squid 里的 parity 规则13 与 imagebuild 只覆盖
+`clone --depth 1` 一种形态，本 workflow 用 `test-squid/repro-git-302.sh` 补齐常见远端
+git 命令（ls-remote / clone / fetch / pull / remote / 按 SHA fetch / 反证），验证 302
+策略对各类客户端形态都成立：
+
+```bash
+# gy-006（默认 runner）
+gh workflow run test-git302.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+  --ref main
+
+# 换仓库 / 打开 submodule、LFS 形态
+gh workflow run test-git302.yaml --ref main \
+  -f repo='https://github.com/octocat/Hello-World.git' \
+  -f lfs_repo='https://github.com/git-lfs/git-lfs-test.git'
+```
+
+判定：真实 git 命令必须 `rc=0` 且 stderr 出现 `redirecting to ...git-cdn`；curl 契约探头
+必须 302 且 `Location` 命中 `git-cdn-service*.svc.cluster.local:8000` 并保留路径/查询串；
+负样本（archive tar.gz、仓库 HTML 页）不得跳 git-cdn；`followRedirects=false` 必须失败
+（证明 302 真实存在）。结果在 artifact `test-git302` 的 `git302.tsv`。
+脚本内用 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` 剥掉宿主机 insteadOf——否则测到的是
+`/root/.gitconfig` 的重写，而不是 squid 的 302。
+
 ## 二、前置条件（缺一不可）
 
 1. **runner 注入 squid**：目标 runner set 的 pod 模板必须已注入

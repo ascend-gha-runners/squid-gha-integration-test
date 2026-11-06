@@ -1,0 +1,103 @@
+name: test-git302
+
+# squid 302 → git-cdn 契约 × 真实 git 命令矩阵（与 test-squid.yaml 分开）
+#
+# 背景：PR #2470 起 squid 对 github.com 的
+#   /<owner>/<repo>(.git)?/info/refs?service=git-upload-pack 初始 GET 返回 302，
+#   Location 指向集群内 git-cdn。test-squid 的 parity 规则13 与 imagebuild 的
+#   vllm clone 只覆盖「clone --depth 1」一种形态，本工作流补齐常见远端 git 命令，
+#   回答「302 策略是否对所有 git 客户端形态都成立」。
+#
+# 用例：test-squid/repro-git-302.sh
+#   A. curl 契约：upload-pack（带/不带 .git、两个仓库）、HEAD、无 query、
+#      receive-pack 留档；负样本 archive tar.gz / 仓库 HTML 页不得跳 git-cdn
+#   B. 真实 git：ls-remote（plain/heads-tags/symref/指定 ref/protocol v0,v2）、
+#      clone（full/depth1/filter/single-branch/bare）、fetch（tags/prune/deepen/
+#      unshallow/按 SHA）、pull --ff-only、remote show/update、反证
+#      http.followRedirects=false 必须失败；submodule/LFS/push 默认 SKIP
+#
+# 前置：runner 已注入 squid（HTTP(S)_PROXY + CA）。脚本用
+#       GIT_CONFIG_GLOBAL/SYSTEM=/dev/null 剥掉宿主机 insteadOf，
+#       否则测到的是 /root/.gitconfig 的重写而不是 squid 的 302。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签 JSON 数组（数组内多标签为 AND 关系；需已注入 squid）'
+        required: false
+        default: '["linux-amd64-cpu-2", "gy-006"]'
+        type: string
+      repo:
+        description: 'GIT302_REPO 小仓库（默认 octocat/Hello-World）'
+        required: false
+        default: 'https://github.com/octocat/Hello-World.git'
+        type: string
+      repo2:
+        description: 'GIT302_REPO2 第二个仓库（验证规则不绑定单仓库）'
+        required: false
+        default: 'https://github.com/minghuaslab/flash-attention-npu.git'
+        type: string
+      submodule_repo:
+        description: 'GIT302_SUBMODULE_REPO 带子模块的仓库（空=SKIP）'
+        required: false
+        default: ''
+        type: string
+      lfs_repo:
+        description: 'GIT302_LFS_REPO 带 LFS 的仓库（空=SKIP）'
+        required: false
+        default: ''
+        type: string
+      timeout:
+        description: '单条 git 命令超时秒数'
+        required: false
+        default: '300'
+        type: string
+
+  pull_request:
+    paths:
+      - 'test-squid/repro-git-302.sh'
+      - '.github/workflows/test-git302.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  git302:
+    name: git 远端命令 × squid 302 → git-cdn
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 git302 矩阵
+        env:
+          GIT302_REPO: ${{ github.event_name == 'pull_request' && 'https://github.com/octocat/Hello-World.git' || inputs.repo }}
+          GIT302_REPO2: ${{ github.event_name == 'pull_request' && 'https://github.com/minghuaslab/flash-attention-npu.git' || inputs.repo2 }}
+          GIT302_SUBMODULE_REPO: ${{ github.event_name == 'pull_request' && '' || inputs.submodule_repo }}
+          GIT302_LFS_REPO: ${{ github.event_name == 'pull_request' && '' || inputs.lfs_repo }}
+          GIT302_TIMEOUT: ${{ github.event_name == 'pull_request' && '300' || inputs.timeout }}
+        run: bash test-squid/repro-git-302.sh
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## test-git302 汇总"
+            echo '```'
+            cat /tmp/test-squid-results/timings.tsv 2>/dev/null || echo '(无 timings.tsv)'
+            echo '```'
+            echo
+            echo "### 用例明细（case / result / detail）"
+            echo '```'
+            cat /tmp/test-squid-results/git302.tsv 2>/dev/null || echo '(无 git302.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-git302
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
