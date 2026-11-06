@@ -90,6 +90,26 @@ gh workflow run probe-domain.yaml --repo ascend-gha-runners/squid-gha-integratio
 ./test-squid/test-production-runners.sh --no-watch
 ```
 
+git-cdn / gitcode-cdn 两个独立 workflow（`test-gitcdn.yaml`、`test-gitcode-clone.yaml`）
+用同一份注册表批量触发，脚本为 `test-gitcdn-production-runners.sh`：
+
+```bash
+# 全部生产 runner × 两个 workflow（默认容器镜像用 quay 就近源）
+./test-squid/test-gitcdn-production-runners.sh
+
+# 只跑其中一个 workflow / 只跑一个 runner
+./test-squid/test-gitcdn-production-runners.sh --workflow gitcdn
+./test-squid/test-gitcdn-production-runners.sh --only linux-amd64-cpu-2-hk001
+
+# 跨集群拉 cn-north-12 镜像慢时显式换 quay（默认已是 quay）
+./test-squid/test-gitcdn-production-runners.sh \
+  --container-image quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.12
+```
+
+判定口径：`test-gitcode-clone` 需要 runner 已注入 `gitcode.com → git-cdn-gitcode`
+的 insteadOf（目前 gy-001 / wlcb-001），未注入的 runner 会红在重写断言；
+`test-gitcdn` 显式打本地 git-cdn，集群无实例时记 SKIP（不判红）。
+
 生产 runner 注册表（脚本内 `RUNNERS` 数组维护；每个 runner 有 3 个可选标签，
 脚本统一用**全局唯一名**做单标签触发，避免多标签 AND 语义）：
 
