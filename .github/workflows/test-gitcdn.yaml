@@ -14,6 +14,9 @@ name: test-gitcdn
 #      —— 成功 = git-cdn 回源健康；50s 后 not our ref = 缺陷复现（2026-11-04 事故）
 #
 # 需要 contents: write（建/删临时 ref）。
+#
+# 另含 opt-in 并发 clone 压测 job（pressure=1）：8x/16x/32x/64x/128x/256x 同时
+# clone，仓库 = ascend-ci-deployment#2048 的构建仓 + 其依赖仓，只压 git-cdn 本体。
 
 on:
   workflow_dispatch:
@@ -23,10 +26,26 @@ on:
         required: false
         default: '["linux-amd64-cpu-2", "gy-006"]'
         type: string
+      pressure:
+        description: '1 = 追加并发 clone 压测（8x~256x）；0 = 只跑未同步 SHA 回源'
+        required: false
+        default: '0'
+        type: string
+      pressure_ladder:
+        description: '压测并发阶梯（空格分隔）'
+        required: false
+        default: '8 16 32 64 128 256'
+        type: string
+      pressure_repos:
+        description: '压测仓库清单（空格/逗号分隔 owner/repo；gitcode: 前缀走 gitcode 上游；空 = 默认清单：issue #2048 构建仓 + 其依赖仓）'
+        required: false
+        default: ''
+        type: string
 
   pull_request:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
+      - 'test-squid/pressure-gitcdn-clone.sh'
       - '.github/workflows/test-gitcdn.yaml'
 
 permissions:
@@ -67,5 +86,48 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-gitcdn-unsynced
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  # 并发 clone 压测（opt-in）：8x/16x/32x/64x/128x/256x 同时 clone，
+  # 仓库来自 ascend-ci-deployment#2048 的构建仓清单，压 git-cdn 服务本体。
+  gitcdn-pressure:
+    name: git-cdn 并发 clone 压测
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.pressure == '1' }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行并发 clone 压测
+        env:
+          LADDER: ${{ inputs.pressure_ladder }}
+          REPOS: ${{ inputs.pressure_repos }}
+        run: bash test-squid/pressure-gitcdn-clone.sh
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## test-gitcdn 并发 clone 压测"
+            echo '```'
+            cat /tmp/test-squid-results/gitcdn-pressure/timings.tsv 2>/dev/null || echo '(无 timings.tsv)'
+            echo '```'
+            echo
+            echo "### 失败明细（level / idx / repo / rc / ms / reason）"
+            echo '```'
+            awk -F'\t' '$4!="" && $4!="0" && $1!="warm"' \
+              /tmp/test-squid-results/gitcdn-pressure/clones.tsv 2>/dev/null | head -50 \
+              || echo '(无失败)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-pressure
           path: /tmp/test-squid-results/
           if-no-files-found: warn

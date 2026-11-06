@@ -89,6 +89,30 @@ gh workflow run test-git302.yaml --ref main \
 脚本内用 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` 剥掉宿主机 insteadOf——否则测到的是
 `/root/.gitconfig` 的重写，而不是 squid 的 302。
 
+### 5. git-cdn 并发 clone 压测（test-gitcdn 的 opt-in job）
+
+`test-gitcdn.yaml` 里 `pressure=1` 时追加 `gitcdn-pressure` job，脚本
+`test-squid/pressure-gitcdn-clone.sh`，只压 git-cdn 本体（显式打
+`git-cdn-service.git-cdn.svc.cluster.local:8000`，不经 squid、不依赖 insteadOf）：
+
+```bash
+gh workflow run test-gitcdn.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+  --ref main -f pressure=1
+# 自定义阶梯/仓库（gitcode: 前缀走 git-cdn-gitcode 上游）
+gh workflow run test-gitcdn.yaml --ref main -f pressure=1 \
+  -f pressure_ladder='8 16 32 64 128 256' \
+  -f pressure_repos='vllm-project/vllm-ascend gitcode:cann/catlass'
+```
+
+- 仓库清单 = `ascend-ci-deployment#2048` 里跑在本套 runner 上的构建仓（vllm-ascend /
+  triton-ascend / sglang / verl / pytorch …）**+ 它们的依赖仓**（vllm、triton、
+  catlass、pto-isa、AscendNPU-IR），可用 `pressure_repos` 覆盖。
+- 流程：先逐仓 `--depth 1` 预热并量体积（同时灌缓存，压测量的是缓存命中吞吐），
+  再按 8/16/32/64/128/256 并发跑 clone；仓库按磁盘预算自动分层（大仓库只出现在
+  低并发），剩余磁盘低于 5GB 直接跳过后续层级。
+- 判定：任一级任一 clone 失败 → job 红；结果在 artifact `test-gitcdn-pressure` 的
+  `timings.tsv`（各级 wall/ok/fail/p50/p95/max）与 `clones.tsv`（逐 clone 明细）。
+
 ## 二、前置条件（缺一不可）
 
 1. **runner 注入 squid**：目标 runner set 的 pod 模板必须已注入
