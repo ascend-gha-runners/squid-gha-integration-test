@@ -52,6 +52,21 @@ on:
         required: false
         default: '0'
         type: string
+      pytorch_submodule:
+        description: '1 = 启用 pytorch/pytorch「depth=1 + 全量子模块」经 git-cdn 的克隆耗时用例（大流量，仅手动）'
+        required: false
+        default: '0'
+        type: string
+      pytorch_runs:
+        description: 'pytorch 用例轮数：1 = 只测一轮（冷缓存）；2 = 追加一轮热缓存对照'
+        required: false
+        default: '1'
+        type: string
+      pytorch_submodules:
+        description: '限定子模块路径（空格分隔，如 third_party/cutlass third_party/flash-attention；空 = 全量 36 个）'
+        required: false
+        default: ''
+        type: string
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -61,6 +76,7 @@ on:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
       - 'test-squid/repro-gitcdn-latest.sh'
+      - 'test-squid/repro-gitcdn-pytorch-submodule.sh'
       - '.github/workflows/test-gitcdn.yaml'
 
 permissions:
@@ -148,3 +164,55 @@ jobs:
           name: test-gitcdn-latest
           path: /tmp/test-squid-results/
           if-no-files-found: warn
+
+  # pytorch/pytorch「depth=1 + 子模块」耗时用例（opt-in，大流量）：
+  # 主仓浅取 + 36 个子模块浅取全部经 git-cdn，分段计时回答「慢在主仓还是子模块」。
+  gitcdn-pytorch-submodule:
+    name: git-cdn pytorch depth1 + 子模块耗时
+    if: ${{ inputs.pytorch_submodule == '1' }}
+    runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 经 git-cdn 克隆 pytorch 主仓 + 子模块（分段计时）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNS: ${{ inputs.pytorch_runs || '1' }}
+          SUBMODULES: ${{ inputs.pytorch_submodules }}
+          CLONE_TIMEOUT: ${{ inputs.clone_timeout || '0' }}
+        run: bash test-squid/repro-gitcdn-pytorch-submodule.sh
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## git-cdn pytorch depth=1 + 子模块耗时"
+            echo "| 轮次 | 阶段 | 耗时(ms) | 体积(MB) | 子模块数 | 结论 | 备注 |"
+            echo "|---|---|---|---|---|---|---|"
+            awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7}' \
+              /tmp/test-squid-results/gitcdn-pytorch/pytorch-submodule.tsv 2>/dev/null \
+              || echo "| - | - | - | - | - | 无结果 | - |"
+            echo
+            echo "### 子模块明细（体积 Top 15）"
+            echo '```'
+            sort -t$'\t' -k4,4nr /tmp/test-squid-results/gitcdn-pytorch/submodules.tsv 2>/dev/null | head -15 \
+              || echo '(无 submodules.tsv)'
+            echo '```'
+            echo
+            echo "### git-cdn 缓存头（info/refs 探头）"
+            echo '```'
+            cat /tmp/test-squid-results/gitcdn-pytorch/refs-probe-run*.txt 2>/dev/null || echo '(无探头结果)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-pytorch-submodule
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
