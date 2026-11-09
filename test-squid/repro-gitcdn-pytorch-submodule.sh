@@ -158,7 +158,8 @@ for run in $(seq 1 "$RUNS"); do
         printf '%s\ttotal\t%s\t%s\t0\tPASS\tmain=%sms,sub=0ms\n' "$tag" "$main_ms" "$main_mb" "$main_ms" >>"$TSV"
         rm -rf "$d"; continue
     fi
-    sub_args=(submodule update --init --recursive --depth 1 --shallow-submodules --jobs "$SUBMODULE_JOBS")
+    # 注意：--shallow-submodules 是 git clone 的选项，submodule update 不认识（会直接 usage 退出）
+    sub_args=(submodule update --init --recursive --depth 1 --jobs "$SUBMODULE_JOBS")
     [ -n "$SUBMODULES" ] && sub_args+=(-- $SUBMODULES)
     t1=$(now_ms)
     # clone 下的 insteadOf 需落到仓库配置里，否则子模块（独立进程、独立 repo）看不到
@@ -167,12 +168,15 @@ for run in $(seq 1 "$RUNS"); do
     sub_ms=$(( $(now_ms) - t1 ))
     total_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     sub_mb=$(( ${total_mb:-0} - ${main_mb:-0} ))
+    # stderr 留档 + 首行入备注（否则只剩 rc=1 无法定位）
+    [ -s "$d/sub.err" ] && sed -n '1,10p' "$d/sub.err" >"$RESULTS/submodule-err-run$run.txt"
+    err1=$(grep -om1 -E '(fatal|error): .*' "$d/sub.err" 2>/dev/null | cut -c1-90 | tr '\t' ' ')
 
     sub_verdict=PASS; sub_note="declared=$n_sub,jobs=$SUBMODULE_JOBS"
     if [ "$rc" = 124 ]; then
         sub_verdict=WARN; sub_note="$sub_note,submodule-timeout(limit=${SUBMODULE_TIMEOUT}s)"; WARN=$((WARN+1))
     elif [ "$rc" != 0 ]; then
-        sub_verdict=FAIL; sub_note="$sub_note,$(classify "$d/sub.err" "$rc")"; FAIL=$((FAIL+1))
+        sub_verdict=FAIL; sub_note="$sub_note,$(classify "$d/sub.err" "$rc")${err1:+[$err1]}"; FAIL=$((FAIL+1))
     fi
     done_sub=$(git -C "$d/pytorch" submodule status --recursive 2>/dev/null | awk '$1 !~ /^-/{c++} END{print c+0}')
     sub_note="$sub_note,inited=$done_sub"
