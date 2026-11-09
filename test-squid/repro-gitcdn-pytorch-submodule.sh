@@ -66,12 +66,12 @@ truth_sha() {  # 上游默认分支最新 commit（真值），仅用于 head-la
     printf '%s' "$body" | jq -r 'if type=="array" and length>0 then .[0].sha else empty end' 2>/dev/null
 }
 
-timeout_for() {  # 主仓：~2MB/s 回源估，600s 起步、3600s 封顶（pytorch 约 1.7GB）
+timeout_for() {  # 主仓：pytorch 缓存缺新 SHA 时 git-cdn 回源要 18min+，按 1.5MB/s 估
     local mb="$1"
     [ "$CLONE_TIMEOUT" -gt 0 ] 2>/dev/null && { echo "$CLONE_TIMEOUT"; return; }
-    local t=$(( ${mb:-0} / 2 + 120 ))
-    [ "$t" -lt 600 ] && t=600
-    [ "$t" -gt 3600 ] && t=3600
+    local t=$(( ${mb:-0} * 2 / 3 + 300 ))
+    [ "$t" -lt 900 ] && t=900
+    [ "$t" -gt 5400 ] && t=5400
     echo "$t"
 }
 
