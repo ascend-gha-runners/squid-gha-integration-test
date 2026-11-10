@@ -67,6 +67,11 @@ on:
         required: false
         default: ''
         type: string
+      pytorch_jobs_ladder:
+        description: '子模块并发拨测档位（空格分隔，如 "1 8 32"）；非空时每档一轮全新克隆，忽略 pytorch_runs'
+        required: false
+        default: ''
+        type: string
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -182,6 +187,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUNS: ${{ inputs.pytorch_runs || '1' }}
           SUBMODULES: ${{ inputs.pytorch_submodules }}
+          JOBS_LADDER: ${{ inputs.pytorch_jobs_ladder }}
           CLONE_TIMEOUT: ${{ inputs.clone_timeout || '0' }}
         run: bash test-squid/repro-gitcdn-pytorch-submodule.sh
 

@@ -22,6 +22,7 @@
 #           本地：REPO=pytorch/pytorch RUNS=1 bash repro-gitcdn-pytorch-submodule.sh
 #
 # 可覆盖：GIT_CDN_BASE / REPO / RUNS / SUBMODULES / SUBMODULE_JOBS
+#         / JOBS_LADDER（并发拨测，如 "1 8 32"，每档一轮全新克隆，替代 RUNS）
 #         / CLONE_TIMEOUT（主仓，0=按体积估）/ SUBMODULE_TIMEOUT
 #         / RESULTS / WORK / GH_TOKEN
 #
@@ -34,8 +35,9 @@ REPO="${REPO:-pytorch/pytorch}"
 RUNS="${RUNS:-1}"                          # >1 时第 2 轮起为热缓存对照
 SUBMODULES="${SUBMODULES:-}"               # 空 = 全量；可给 "third_party/cutlass third_party/flash-attention"
 SUBMODULE_JOBS="${SUBMODULE_JOBS:-8}"      # 子模块并发数（36 个并发 8 既不压垮 git-cdn 也不至于太慢）
+JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此并发档位逐档跑（如 "1 8 32"），忽略 RUNS
 CLONE_TIMEOUT="${CLONE_TIMEOUT:-0}"        # 主仓超时，0 = 按仓库体积估
-SUBMODULE_TIMEOUT="${SUBMODULE_TIMEOUT:-2400}"
+SUBMODULE_TIMEOUT="${SUBMODULE_TIMEOUT:-3600}"   # 并发 1 档串行 61 个 clone 可能 20min+，留足余量
 RESULTS="${RESULTS:-${RESULTS_DIR:-/tmp/test-squid-results}/gitcdn-pytorch}"
 WORK="${WORK:-/tmp/gitcdn-pytorch}"
 export GIT_TERMINAL_PROMPT=0
@@ -117,11 +119,27 @@ log "git-cdn 基址：$GIT_CDN_BASE；真值 HEAD：${truth:0:9}"
 [ -n "$SUBMODULES" ] && log "限定子模块：$SUBMODULES"
 
 FAIL=0; WARN=0
-for run in $(seq 1 "$RUNS"); do
+# 轮次计划：JOBS_LADDER 非空 → 每档并发一轮（都从空目录起，排除工作树复用的干扰）；
+#           否则按 RUNS 跑冷/热对照
+if [ -n "$JOBS_LADDER" ]; then
+    plan=(); for j in $JOBS_LADDER; do plan+=("jobs:$j"); done
+    log "并发拨测档位：$JOBS_LADDER"
+else
+    plan=(); for i in $(seq 1 "$RUNS"); do plan+=("run:$i"); done
+fi
+n_round=0
+for item in "${plan[@]}"; do
+    run=$((n_round+1)); n_round=$run
+    kind="${item%%:*}"; val="${item#*:}"
+    if [ "$kind" = jobs ]; then
+        SUBMODULE_JOBS="$val"
+        tag="jobs$val"
+    else
+        tag="run$val"; [ "$val" -gt 1 ] && tag="run$val(warm)"
+    fi
     d="$WORK/run$run"; mkdir -p "$d"
-    tag="run$run"; [ "$run" -gt 1 ] && tag="run$run(warm)"
     probe_refs "$RESULTS/refs-probe-run$run.txt"
-    log "===== 第 $run 轮（$tag）====="
+    log "===== 第 $run 轮（$tag，子模块并发 $SUBMODULE_JOBS）====="
 
     # ① 主仓浅取（显式 --no-recurse-submodules，先拿到分段耗时）
     t0=$(now_ms)
