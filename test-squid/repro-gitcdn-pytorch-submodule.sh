@@ -20,12 +20,13 @@
 #
 # 执行方式：test-gitcdn.yaml 的手动 job（pytorch_submodule=1）
 #           本地：REPO=pytorch/pytorch RUNS=1 bash repro-gitcdn-pytorch-submodule.sh
-#
-# 可覆盖：GIT_CDN_BASE / REPO / RUNS / SUBMODULES / SUBMODULE_JOBS
-#         / JOBS_LADDER（并发拨测，如 "1 8 32"，每档一轮全新克隆，替代 RUNS）
+## 可覆盖：GIT_CDN_BASE / REPO / RUNS / SUBMODULES / SUBMODULE_JOBS
+#         / JOBS_LADDER（并发拨测，如 "1 8 32"；或 "update:8 par:8" 对比两种模式）
+#         / SUB_MODE（update = git 原生 --recursive --jobs；par = 脚本分层并行）
+#         / SAMPLE_CONC（1 = 每秒采样在跑的 git 进程数，写 conc-run*.tsv）
 #         / CLONE_TIMEOUT（主仓，0=按体积估）/ SUBMODULE_TIMEOUT
-#         / TRACE_PERF（1 = 打开 GIT_TRACE_PERFORMANCE，把每个 git 子命令的耗时留档）
 #         / RESULTS / WORK / GH_TOKEN
+#         / TRACE_PERF（1 = 打开 GIT_TRACE_PERFORMANCE，把每个 git 子命令的耗时留档）
 #
 # TRACE_PERF=1 时：
 #   ① 完整 stderr 落盘到 perf-main-run<N>.txt / perf-sub-run<N>.txt（不再只留前 10 行）
@@ -41,9 +42,14 @@ REPO="${REPO:-pytorch/pytorch}"
 RUNS="${RUNS:-1}"                          # >1 时第 2 轮起为热缓存对照
 SUBMODULES="${SUBMODULES:-}"               # 空 = 全量；可给 "third_party/cutlass third_party/flash-attention"
 SUBMODULE_JOBS="${SUBMODULE_JOBS:-8}"      # 子模块并发数（36 个并发 8 既不压垮 git-cdn 也不至于太慢）
-JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此并发档位逐档跑（如 "1 8 32"），忽略 RUNS
+SUB_MODE="${SUB_MODE:-update}"             # update = git submodule update --recursive --jobs（默认）
+                                           # par    = 脚本自己分层并行（每层都开满 N 个进程）
+JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此档位逐轮跑，如 "1 8 32"（全部 update 模式）
+                                           # 或 "update:8 par:8"（同轮对比两种模式），忽略 RUNS
 SPLIT_PHASE="${SPLIT_PHASE:-1}"            # 1 = 主仓拆成「取数(纯网络)/checkout(纯落盘)」两段计时
 TRACE_PERF="${TRACE_PERF:-0}"              # 1 = GIT_TRACE_PERFORMANCE 留档每个 git 子命令耗时
+SAMPLE_CONC="${SAMPLE_CONC:-1}"            # 1 = 子模块阶段每秒采样「同时在跑的 git 进程数」
+SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-1}"    # 采样间隔秒
 CLONE_TIMEOUT="${CLONE_TIMEOUT:-0}"        # 主仓超时，0 = 按仓库体积估
 SUBMODULE_TIMEOUT="${SUBMODULE_TIMEOUT:-3600}"   # 并发 1 档串行 61 个 clone 可能 20min+，留足余量
 RESULTS="${RESULTS:-${RESULTS_DIR:-/tmp/test-squid-results}/gitcdn-pytorch}"
@@ -126,6 +132,93 @@ summarize_perf() {  # summarize_perf <tracefile> → 每行 "phase<TAB>sum_ms<TA
         | sort -k2,2nr
 }
 
+# ---------------------------------------------------------------------------
+# 并发采样：证明「同一时刻到底有几个 git 在跑」（只扫 /proc，不依赖 pgrep）
+# ---------------------------------------------------------------------------
+sample_once() {  # 输出：net index_pack fetch_or_clone checkout total_git
+    local net=0 ipk=0 fet=0 co=0 tot=0 f cmd
+    for f in /proc/[0-9]*/cmdline; do
+        [ -r "$f" ] || continue
+        cmd=$(tr '\0' ' ' <"$f" 2>/dev/null) || continue
+        case "$cmd" in *git*) ;; *) continue ;; esac
+        tot=$((tot + 1))
+        case "$cmd" in *git-remote-http*|*git-remote-https*) net=$((net + 1)) ;; esac
+        case "$cmd" in *index-pack*|*unpack-objects*) ipk=$((ipk + 1)) ;; esac
+        case "$cmd" in *" fetch "*|*" clone "*) fet=$((fet + 1)) ;; esac
+        case "$cmd" in *" checkout "*|*checkout-index*) co=$((co + 1)) ;; esac
+    done
+    printf '%s\t%s\t%s\t%s\t%s' "$net" "$ipk" "$fet" "$co" "$tot"
+}
+
+start_sampler() {  # $1 = 输出文件
+    local out="$1"
+    (
+        local t0=$SECONDS
+        printf 'elapsed\tnet\tindex_pack\tfetch_or_clone\tcheckout\ttotal_git\n' >"$out"
+        while :; do
+            printf '%s\t%s\n' "$((SECONDS - t0))" "$(sample_once)" >>"$out"
+            sleep "$SAMPLE_INTERVAL"
+        done
+    ) &
+    SAMPLER_PID=$!
+}
+
+stop_sampler() {
+    [ -n "${SAMPLER_PID:-}" ] || return 0
+    kill "$SAMPLER_PID" 2>/dev/null
+    wait "$SAMPLER_PID" 2>/dev/null
+    SAMPLER_PID=""
+}
+
+summarize_conc() {  # $1 = 采样文件；输出一行 max/mean（net=HTTP 会话，即真正的在飞请求数）
+    awk -F'\t' 'NR > 1 { n++
+        for (i = 2; i <= 6; i++) { s[i] += $i; if ($i > m[i]) m[i] = $i } }
+        END {
+            if (!n) { print "no-samples"; exit }
+            printf "samples=%d net:mean=%.2f,max=%d index_pack:max=%d fetch:max=%d total:mean=%.2f,max=%d",
+                n, s[2] / n, m[2], m[3], m[4], s[6] / n, m[6] }' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# 分层并行（SUB_MODE=par）：git 的 --recursive 只在顶层并行，往下每一层都是
+# 父进程 for 循环串行下降，所以这里自己按层扇出——每一层都用满 jobs 个进程。
+# 先把本层所有路径 init 掉（避免并发写 .git/config 抢锁），再并发 update。
+# ---------------------------------------------------------------------------
+PAR_DEADLINE=0
+par_update_recursive() {  # $1 = 仓库目录（含 .gitmodules）；$2 = 日志；$3 = 顶层路径白名单（可空）
+    local dir="$1" log="$2" filter="${3:-}"
+    local -a paths=() keep=()
+    local p
+    [ -f "$dir/.gitmodules" ] || return 0
+    while IFS= read -r p; do [ -n "$p" ] && paths+=("$p"); done < <(
+        git -C "$dir" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+    [ "${#paths[@]}" -eq 0 ] && return 0
+    if [ -n "$filter" ]; then
+        for p in "${paths[@]}"; do
+            case " $filter " in *" $p "*) keep+=("$p") ;; esac
+        done
+        paths=("${keep[@]}")
+        [ "${#paths[@]}" -eq 0 ] && return 0
+    fi
+    git -C "$dir" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/"
+    git -C "$dir" submodule init -- "${paths[@]}" >>"$log" 2>&1
+    for p in "${paths[@]}"; do
+        if [ "$PAR_DEADLINE" -gt 0 ] && [ "$(date +%s)" -gt "$PAR_DEADLINE" ]; then
+            echo "[par] 超过 SUBMODULE_TIMEOUT，中止剩余子模块（$dir → $p）" >>"$log"
+            kill $(jobs -p) 2>/dev/null
+            return 124
+        fi
+        while [ "$(jobs -rp | wc -l)" -ge "$SUBMODULE_JOBS" ]; do wait -n 2>/dev/null || break; done
+        ( git -C "$dir" submodule update --depth 1 -- "$p" >>"$log" 2>&1 ) &
+    done
+    wait
+    # 本层全部落地后再下降一层（每层内部仍然是满并发）
+    for p in "${paths[@]}"; do
+        [ -f "$dir/$p/.gitmodules" ] && par_update_recursive "$dir/$p" "$log" "" 
+    done
+    return 0
+}
+
 probe_refs() {  # 记录 git-cdn 对 info/refs 的缓存类响应头（每轮一次，作缓存证据）
     local out="$1"
     {
@@ -172,15 +265,14 @@ n_round=0
 for item in "${plan[@]}"; do
     run=$((n_round+1)); n_round=$run
     kind="${item%%:*}"; val="${item#*:}"
-    if [ "$kind" = jobs ]; then
-        SUBMODULE_JOBS="$val"
-        tag="jobs$val"
-    else
-        tag="run$val"; [ "$val" -gt 1 ] && tag="run$val(warm)"
-    fi
+    case "$kind" in
+        jobs)       SUBMODULE_JOBS="$val"; tag="jobs$val" ;;
+        update|par) SUB_MODE="$kind"; SUBMODULE_JOBS="$val"; tag="$kind$val" ;;
+        *)          tag="run$val"; [ "$val" -gt 1 ] && tag="run$val(warm)" ;;
+    esac
     d="$WORK/run$run"; mkdir -p "$d"
     probe_refs "$RESULTS/refs-probe-run$run.txt"
-    log "===== 第 $run 轮（$tag，子模块并发 $SUBMODULE_JOBS）====="
+    log "===== 第 $run 轮（$tag，模式 $SUB_MODE，子模块并发 $SUBMODULE_JOBS）====="
 
     # ① 主仓浅取：--no-checkout 只拉对象（纯网络），checkout 单独计时（纯本地落盘）
     #    两者分开才能回答「280s 是网络慢还是写盘慢」
@@ -248,12 +340,24 @@ for item in "${plan[@]}"; do
         rm -rf "$d"; continue
     fi
     # 注意：--shallow-submodules 是 git clone 的选项，submodule update 不认识（会直接 usage 退出）
-    sub_args=(submodule update --init --recursive --depth 1 --jobs "$SUBMODULE_JOBS")
-    [ -n "$SUBMODULES" ] && sub_args+=(-- $SUBMODULES)
     t1=$(now_ms)
     # clone 下的 insteadOf 需落到仓库配置里，否则子模块（独立进程、独立 repo）看不到
     git -C "$d/pytorch" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/"
-    timeout "$SUBMODULE_TIMEOUT" git -C "$d/pytorch" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+    : >"$d/sub.err"
+    [ "$SAMPLE_CONC" = 1 ] && start_sampler "$RESULTS/conc-run$run.tsv"
+    if [ "$SUB_MODE" = par ]; then
+        PAR_DEADLINE=$(( $(date +%s) + SUBMODULE_TIMEOUT ))
+        par_update_recursive "$d/pytorch" "$d/par.log" "$SUBMODULES"; rc=$?
+        [ -s "$d/par.log" ] && cp "$d/par.log" "$RESULTS/par-run$run.log"
+        # 失败行抽到 sub.err，供下面的 classify/留档复用
+        grep -E '^(fatal|error|\[par\])' "$d/par.log" 2>/dev/null | head -20 >"$d/sub.err"
+        [ "$rc" = 0 ] && [ -s "$d/sub.err" ] && rc=1
+    else
+        sub_args=(submodule update --init --recursive --depth 1 --jobs "$SUBMODULE_JOBS")
+        [ -n "$SUBMODULES" ] && sub_args+=(-- $SUBMODULES)
+        timeout "$SUBMODULE_TIMEOUT" git -C "$d/pytorch" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+    fi
+    stop_sampler
     sub_ms=$(( $(now_ms) - t1 ))
     total_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     sub_mb=$(( ${total_mb:-0} - ${main_mb:-0} ))
@@ -275,6 +379,12 @@ for item in "${plan[@]}"; do
     sub_note="$sub_note,inited=$done_sub"
     log "子模块 —— ${sub_verdict} ${sub_ms}ms（${sub_mb}MB，已初始化 $done_sub/$n_sub）"
     printf '%s\tsubmodules\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$sub_ms" "$sub_mb" "$done_sub" "$sub_verdict" "$sub_note" >>"$TSV"
+    # 并发采样汇总：net 的 max/mean 直接回答「8 路线程是不是只用了 1 条」
+    if [ "$SAMPLE_CONC" = 1 ] && [ -s "$RESULTS/conc-run$run.tsv" ]; then
+        conc=$(summarize_conc "$RESULTS/conc-run$run.tsv")
+        log "子模块并发采样（$tag）：$conc"
+        printf '%s\tconc\t-\t-\t-\tINFO\t%s\n' "$tag" "$conc" >>"$TSV"
+    fi
     if [ "$TRACE_PERF" = 1 ]; then
         # 各子命令的耗时之和 = 各 clone 内部阶段，可与 sub_ms（墙钟）对照：
         #   index-pack 之和 ≈ 网络取数占比；checkout/other ≈ 本地落盘占比
