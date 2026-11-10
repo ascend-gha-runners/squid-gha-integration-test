@@ -38,6 +38,17 @@ topk(10, sum by (cluster, host) (
   说明该集群仍是旧规则（旧规则把 `_TIMEDOUT`/`_ABORTED` 排除在 5xx 外），
   结论要按版本说明，不能横向直接比较。
 
+### 面板错误率（ABORT 进分子）会放大
+
+面板口径 `(ABORT+TIMEDOUT+OTHER+5xx) / 全部` 里，`ABORT` 包含 `TCP_MISS_ABORTED/4xx`
+（客户端拿到 403/404 后主动断开）和客户端取消下载。pip / dnf 探测**不存在的索引路径**时，
+上游回 403/404、客户端立刻断开，就会成对产生 `TCP_MISS/403` 与 `TCP_MISS_ABORTED/403`，
+错误率被抬到 20%~50%，但这**不是代理或缓存故障**。
+
+排查顺序固定为：先 `sum by (host) (increase(... by result))` 看 ABORT/5xx/TIMEDOUT 各多少，
+再 `sum by (result) (rate(...))` 对齐面板数值，最后才按 host 看 URL 与 TAG/status。
+只有一个域名的 ABORT 占比高、且没有任何 5xx/TIMEDOUT 时，优先怀疑客户端探测/取消。
+
 ## 2. 五步巡检
 
 ### 第 1 步：当前快照（10m / 1h）

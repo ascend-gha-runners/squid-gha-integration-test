@@ -140,6 +140,39 @@ topk(10, sum by (cluster, host) (
 
 ---
 
+## 2026-11-10 aiframework 面板错误率排查（非 5xx）
+
+面板口径 `(ABORT+TIMEDOUT+OTHER+5xx)/全部` 在 aiframework 上把 pip/dnf 探测行为放大：
+
+| 域名 | 面板错误率（5m） | 24h result 拆解 | 结论 |
+|---|---:|---|---|
+| download.pytorch.org | 28.2% | MISS 41115 / ABORT 19826 / HIT 9719 / REVAL 1729，**无 5xx 无 TIMEDOUT** | 客户端探测 |
+| mirrors.huaweicloud.com | 11.0% | MISS_404 119933 / ABORT 14153 / MISS 2791 / HIT 2312 | 客户端探测 + 404 |
+| repo.huaweicloud.com | 0.0% | HIT 227133 / MISS 121497 / REVAL 58295 / MISS_404 5736 / ABORT 143 | 健康 |
+| www.modelscope.cn | nan（24h ABORT 仅 8） | MISS 1434 / MISS_404 26 / ABORT 8 | 面板噪声 |
+
+access.log 证据（aiframework，窗口 1794272059~1794295189，约 6.4h，cache-0）：
+
+```text
+4685 TCP_MISS/403          paths = /whl/cpu/<pkg>/（attrs、typer、fastapi、xgrammar…）
+2295 TCP_MISS_ABORTED/403  同一批路径，客户端拿到 403 后断开
+ 568 TCP_CF_MISS/403       collapsed forwarding 复用 403
+ 928 TCP_MEM_HIT/200 + 244 TCP_REFRESH_UNMODIFIED/200 + 88 TCP_HIT/200（真实 wheel/metadata）
+```
+
+- download.pytorch.org 的 403 由上游 `HIER_DIRECT/52.85.128.85`（CloudFront）返回，body 为
+  706~711B `application/xml`（AccessDenied）：pip 配了 `--extra-index-url .../whl/cpu` 后会把
+  **所有依赖**都去 torch 源探测，源上不存在的包回 403 而非 404。
+- mirrors.huaweicloud.com 的 15k+/副本是 `/ascend/repos/pypi/nightly/<pkg>/` 的 404，
+  其中 1.9k 被客户端断开记为 `TCP_MISS_ABORTED/404` → 进入 ABORT → 面板错误率分子。
+- `MISS_404` 按设计不进错误率分母，但 `_ABORTED/404` 会进 ABORT，这是面板抬高的直接原因，
+  不是 squid/缓存故障。
+
+建议：pip 只在装 torch 时用 `--index-url https://download.pytorch.org/whl/cpu`，其余依赖走内部源，
+不要全局 `extra-index-url`；面板侧把 ABORT 拆分或从错误分子移除（与 #2556 后续一致）。
+
+---
+
 ## 与既有 issue 的对应
 
 | 域名 | issue | 处理 |
