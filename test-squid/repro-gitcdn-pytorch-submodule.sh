@@ -100,15 +100,26 @@ classify() {  # classify <errfile> <rc>
 summarize_perf() {  # summarize_perf <tracefile> → 每行 "phase<TAB>sum_ms<TAB>calls"
     local f="$1"
     [ -s "$f" ] || return 0
-    sed -n 's/.*| \([0-9.]*\) s: git command: \(.*\)$/\1\t\2/p' "$f" \
+    # 本环境 GIT_TRACE_PERFORMANCE 行格式（无 "| " 前缀）：
+    #   08:06:14.192038 trace.c:416  performance: 19.959131058 s: git command: /usr/lib/git-core/git remote-http ...
+    sed -n 's/.*performance: \([0-9.]*\) s: git command: \(.*\)$/\1\t\2/p' "$f" \
         | awk -F'\t' '
             {
                 ms = $1 * 1000
-                cmd = $2
-                if (cmd ~ /index-pack/)       k = "index-pack"
-                else if (cmd ~ /checkout/)    k = "checkout"
-                else if (cmd ~ /fetch/)       k = "fetch"
-                else                          k = "other"
+                # 取命令行里第一个「叶子子命令」token 归类，避免 wrapper
+                # （clone ⊃ remote-http + index-pack）重复计数，也避免 --no-checkout 误判成 checkout：
+                #   net = HTTP 会话（取数）；checkout = 本地落盘；index-pack/unpack-objects = 解包
+                n = split($2, a, " ")
+                k = ""
+                for (i = 1; i <= n && i <= 4; i++) {
+                    t = a[i]; sub(/.*\//, "", t)
+                    if (t == "remote-http" || t == "remote-https" ||
+                        t == "index-pack" || t == "unpack-objects" ||
+                        t == "checkout"   || t == "checkout-index") { k = t; break }
+                }
+                if (k == "remote-http" || k == "remote-https") k = "net"
+                # wrapper 行与 net/index-pack 重叠，不可相加，只作对照
+                if (k == "") k = "wrapper"
                 sum[k] += ms; cnt[k]++
             }
             END { for (k in sum) printf "%s\t%d\t%d\n", k, sum[k], cnt[k] }' \
