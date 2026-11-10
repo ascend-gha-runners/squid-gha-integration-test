@@ -82,6 +82,11 @@ on:
         required: false
         default: '0'
         type: string
+      pytorch_git_upgrade:
+        description: '1 = 先升级 runner 上的 git（<2.36 不支持 submodule update --filter，官方 blobless/treeless 姿势用不了）'
+        required: false
+        default: '0'
+        type: string
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -191,6 +196,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+
+      - name: 打印 git 版本
+        run: git --version
+
+      - name: 升级 git（需要 >=2.36 才支持 submodule update --filter）
+        if: ${{ inputs.pytorch_git_upgrade == '1' }}
+        run: |
+          set -x
+          if git submodule update -h 2>&1 | grep -q -- '--filter'; then
+            echo "当前 git 已支持 submodule update --filter，无需升级"
+            git --version
+            exit 0
+          fi
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO=sudo
+          $SUDO apt-get update -qq || true
+          $SUDO apt-get install -y -qq software-properties-common || true
+          $SUDO add-apt-repository -y ppa:git-core/ppa
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq git
+          git --version
+          git submodule update -h 2>&1 | grep -q -- '--filter' \
+            && echo "升级成功：已支持 --filter" \
+            || { echo "升级后仍不支持 --filter"; exit 1; }
 
       - name: 经 git-cdn 克隆 pytorch 主仓 + 子模块（分段计时）
         env:
