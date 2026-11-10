@@ -271,8 +271,12 @@ FAIL=0; WARN=0
 if [ -n "$JOBS_LADDER" ]; then
     plan=()
     for j in $JOBS_LADDER; do
-        # 裸数字 = 并发档（jobs:N）；带冒号的 "update:8" / "par:8" 原样保留
-        case "$j" in *:*) plan+=("$j") ;; *) plan+=("jobs:$j") ;; esac
+        # 只有纯数字才补成 jobs:N；"update:8" / "par:8" / "fetchjobs0" / "filter:blob:none" 原样保留
+        case "$j" in
+            *:*)      plan+=("$j") ;;
+            *[!0-9]*) plan+=("$j") ;;
+            *)        plan+=("jobs:$j") ;;
+        esac
     done
     log "并发拨测档位：$JOBS_LADDER"
 else
