@@ -183,7 +183,7 @@ access.log 证据（aiframework，窗口 1794272059~1794295189，约 6.4h，cach
 | archive.ubuntu.com | 0.0% / 100% | HIT 2562 / REVAL 1032 / MISS 9 / ABORT 6 | 低流量瞬时 |
 | security.ubuntu.com | 0.0% / 63.6% | REVAL 410 / MISS 12 / ABORT 5 | 低流量瞬时 |
 | www.modelscope.cn | 11.8% / 82.6% | MISS 874 / ABORT 45 | 客户端取消刷新 |
-| gitcode.com | 0.0% / 60% | MISS 384 / ABORT 20 | 低流量瞬时 |
+| gitcode.com | 0.0% / 60% | MISS 384 / ABORT 20 | 小样本 burst |
 | download.pytorch.org | 4.8% / 19% | MISS 36154 / HIT 7001 / ABORT 1733 | 403 探测 + 断开 |
 | repo.huaweicloud.com | 0.0% / 13.6% | MISS_404 6209 / ABORT 129 | 404 探测 |
 | mirrors.huaweicloud.com | 2.2% / 12.9% | MISS_404 80641 / ABORT 1397 | 404 探测 |
@@ -217,7 +217,17 @@ access.log 证据（aiframework，窗口 1794272059~1794295189，约 6.4h，cach
   （8070+8324/副本），客户端断开记 `TCP_MISS_ABORTED/403`（342+422/副本）；真实 wheel 是 MEM_HIT/200。
 - **archive/security.ubuntu.com**：HIT/REVAL 占绝对多数（2562+1032 / 410），
   100% 只出现在两次 apt 之间的 5m 空窗（1 个 ABORT、0 个命中）。
-- **gitcode.com**：`insteadOf → git-cdn` 走集群内直连，squid 只剩残量（MISS 384/h），峰值 60% 是分母小。
+- **gitcode.com**：hk-001 上就是**小样本 burst**（不是 insteadOf 残量：日志里是真实克隆
+  `cann/catlass.git/git-upload-pack`、`GitHub_Trending/go/googletest.git`）。5m 序列实测：
+
+  ```text
+  14:53 总=70  ABORT=16 → 22.9%
+  15:03 总=11  ABORT=5  → 44.4%
+  15:18 总=186 ABORT=0  →  0.0%
+  ```
+
+  请求只在 CI 起 clone 时成串出现，空闲窗口只有 1~10 个；5 个请求里 3 个 ABORT 就是 60%，
+  但 1h 平均只有 `20/(384+20)≈4.7%`，且 0 个 5xx/TIMEDOUT。
 - **repo/mirrors.huaweicloud.com**：`MISS_404` 6.2k/h、80.6k/h（pip 探测 nightly/不存在的包），
   404 不进分子，但 `_ABORTED/404` 进 ABORT，峰值随 5m 分母波动。
 
