@@ -68,7 +68,7 @@ on:
         default: ''
         type: string
       pytorch_jobs_ladder:
-        description: '子模块并发拨测档位（空格分隔，如 "1 8 32"）；非空时每档一轮全新克隆，忽略 pytorch_runs'
+        description: '拨测档位（空格分隔）：jobs:N / update:N / par:N / fetchjobs0 / filter:blob:none；非空时每档一轮全新克隆，忽略 pytorch_runs'
         required: false
         default: ''
         type: string

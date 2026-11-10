@@ -20,8 +20,13 @@
 #
 # 执行方式：test-gitcdn.yaml 的手动 job（pytorch_submodule=1）
 #           本地：REPO=pytorch/pytorch RUNS=1 bash repro-gitcdn-pytorch-submodule.sh
-## 可覆盖：GIT_CDN_BASE / REPO / RUNS / SUBMODULES / SUBMODULE_JOBS
-#         / JOBS_LADDER（并发拨测，如 "1 8 32"；或 "update:8 par:8" 对比两种模式）
+# 可覆盖：GIT_CDN_BASE / REPO / RUNS / SUBMODULES / SUBMODULE_JOBS
+#         / JOBS_LADDER（拨测档位，如 "update:8 par:8 fetchjobs0 filter:blob:none"）
+#           jobs:N     = update 模式 + --jobs N
+#           update:N   = git 原生 `submodule update --recursive --jobs N`
+#           par:N      = 脚本按层扇出（每层最多 N 个并发）
+#           fetchjobs0 = PyTorch CI 的官方配置：submodule.fetchJobs=0 + fetch.parallel=0
+#           filter:X   = submodule update 加 --filter=X（如 blob:none，partial clone）
 #         / SUB_MODE（update = git 原生 --recursive --jobs；par = 脚本分层并行）
 #         / SAMPLE_CONC（1 = 每秒采样在跑的 git 进程数，写 conc-run*.tsv）
 #         / CLONE_TIMEOUT（主仓，0=按体积估）/ SUBMODULE_TIMEOUT
@@ -44,8 +49,9 @@ SUBMODULES="${SUBMODULES:-}"               # 空 = 全量；可给 "third_party/
 SUBMODULE_JOBS="${SUBMODULE_JOBS:-8}"      # 子模块并发数（36 个并发 8 既不压垮 git-cdn 也不至于太慢）
 SUB_MODE="${SUB_MODE:-update}"             # update = git submodule update --recursive --jobs（默认）
                                            # par    = 脚本自己分层并行（每层都开满 N 个进程）
-JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此档位逐轮跑，如 "1 8 32"（全部 update 模式）
-                                           # 或 "update:8 par:8"（同轮对比两种模式），忽略 RUNS
+JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此档位逐轮跑，如 "1 8 32" / "update:8 par:8"，忽略 RUNS
+SUB_FILTER="${SUB_FILTER:-}"               # 非空则子模块加 --filter=<值>（如 blob:none），partial clone
+FETCH_JOBS_AUTO="${FETCH_JOBS_AUTO:-0}"    # 1 = 不传 --jobs，改用 submodule.fetchJobs=0 + fetch.parallel=0（PyTorch CI 官方配置）
 SPLIT_PHASE="${SPLIT_PHASE:-1}"            # 1 = 主仓拆成「取数(纯网络)/checkout(纯落盘)」两段计时
 TRACE_PERF="${TRACE_PERF:-0}"              # 1 = GIT_TRACE_PERFORMANCE 留档每个 git 子命令耗时
 SAMPLE_CONC="${SAMPLE_CONC:-1}"            # 1 = 子模块阶段每秒采样「同时在跑的 git 进程数」
@@ -275,13 +281,23 @@ fi
 n_round=0
 for item in "${plan[@]}"; do
     run=$((n_round+1)); n_round=$run
-    kind="${item%%:*}"; val="${item#*:}"
+    kind="${item%%:*}"; case "$item" in *:*) val="${item#*:}" ;; *) val="" ;; esac
+    # 每档重置，避免上一档的配置渗到下一档
+    SUB_FILTER=""; FETCH_JOBS_AUTO=0
     case "$kind" in
         jobs)       SUBMODULE_JOBS="$val"; tag="jobs$val" ;;
         update|par) SUB_MODE="$kind"; SUBMODULE_JOBS="$val"; tag="$kind$val" ;;
-        *)          tag="run$val"; [ "$val" -gt 1 ] && tag="run$val(warm)" ;;
+        fetchjobs0) SUB_MODE=update; FETCH_JOBS_AUTO=1; SUBMODULE_JOBS=""; tag="fetchjobs0" ;;
+        filter)     SUB_MODE=update; SUB_FILTER="${val:-blob:none}"; tag="filter-${SUB_FILTER//:/-}" ;;
+        *)          tag="run$val"; [ "${val:-0}" -gt 1 ] 2>/dev/null && tag="run$val(warm)" ;;
     esac
     d="$WORK/run$run"; mkdir -p "$d"
+    # 老版本 git 的 `submodule update` 没有 --filter：这一档直接跳过，别白跑主仓
+    if [ -n "$SUB_FILTER" ] && ! git submodule update -h 2>&1 | grep -q -- '--filter'; then
+        log "⚠️ 当前 git 不支持 submodule update --filter，跳过该档（$tag）"
+        printf '%s\tsubmodules\t0\t0\t-\tSKIP\tgit-no-submodule-filter\n' "$tag" >>"$TSV"
+        rm -rf "$d"; continue
+    fi
     probe_refs "$RESULTS/refs-probe-run$run.txt"
     log "===== 第 $run 轮（$tag，模式 $SUB_MODE，子模块并发 $SUBMODULE_JOBS）====="
 
@@ -364,9 +380,16 @@ for item in "${plan[@]}"; do
         grep -E '^(fatal|error|\[par\])' "$d/par.log" 2>/dev/null | head -20 >"$d/sub.err"
         [ "$rc" = 0 ] && [ -s "$d/sub.err" ] && rc=1
     else
-        sub_args=(submodule update --init --recursive --depth 1 --jobs "$SUBMODULE_JOBS")
+        sub_args=(submodule update --init --recursive --depth 1)
+        # fetchjobs0 档：交给 git 自己的自动并发（PyTorch CI 官方配置），不传 --jobs
+        [ -n "$SUBMODULE_JOBS" ] && sub_args+=(--jobs "$SUBMODULE_JOBS")
+        [ -n "$SUB_FILTER" ] && sub_args+=(--filter="$SUB_FILTER")
         [ -n "$SUBMODULES" ] && sub_args+=(-- $SUBMODULES)
-        timeout "$SUBMODULE_TIMEOUT" git -C "$d/pytorch" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+        git_cfg=(-C "$d/pytorch")
+        if [ "$FETCH_JOBS_AUTO" = 1 ]; then
+            git_cfg+=(-c submodule.fetchJobs=0 -c fetch.parallel=0)
+        fi
+        timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
     fi
     stop_sampler
     sub_ms=$(( $(now_ms) - t1 ))
@@ -380,11 +403,22 @@ for item in "${plan[@]}"; do
     fi
     err1=$(grep -om1 -E '(fatal|error): .*' "$d/sub.err" 2>/dev/null | cut -c1-90 | tr '\t' ' ')
 
-    sub_verdict=PASS; sub_note="declared=$n_sub,jobs=$SUBMODULE_JOBS"
+    sub_verdict=PASS
+    if [ "$FETCH_JOBS_AUTO" = 1 ]; then
+        sub_note="declared=$n_sub,jobs=auto(fetchJobs0)"
+    else
+        sub_note="declared=$n_sub,jobs=${SUBMODULE_JOBS:-default}"
+    fi
+    [ -n "$SUB_FILTER" ] && sub_note="$sub_note,filter=$SUB_FILTER"
     if [ "$rc" = 124 ]; then
         sub_verdict=WARN; sub_note="$sub_note,submodule-timeout(limit=${SUBMODULE_TIMEOUT}s)"; WARN=$((WARN+1))
     elif [ "$rc" != 0 ]; then
-        sub_verdict=FAIL; sub_note="$sub_note,$(classify "$d/sub.err" "$rc")${err1:+[$err1]}"; FAIL=$((FAIL+1))
+        if [ -n "$SUB_FILTER" ] && grep -qiE 'filtering not recognized|does not support filter|filter.*not supported' "$d/sub.err" 2>/dev/null; then
+            # git-cdn 侧 upload-pack 不支持 filter：留档但不判红
+            sub_verdict=SKIP; sub_note="$sub_note,server-no-filter-support"
+        else
+            sub_verdict=FAIL; sub_note="$sub_note,$(classify "$d/sub.err" "$rc")${err1:+[$err1]}"; FAIL=$((FAIL+1))
+        fi
     fi
     done_sub=$(git -C "$d/pytorch" submodule status --recursive 2>/dev/null | awk '$1 !~ /^-/{c++} END{print c+0}')
     sub_note="$sub_note,inited=$done_sub"
