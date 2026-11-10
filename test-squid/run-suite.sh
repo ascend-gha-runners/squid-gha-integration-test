@@ -292,7 +292,7 @@ conc-same-object() {
             total_bytes=$(awk -F'\t' '{s+=$5} END{print s+0}' "$wd"/worker.*.out)
             thr=$(( total_bytes / (wall > 0 ? wall : 1) / 1024 ))
             p50=$(awk -F'\t' '{print $3}' "$wd"/worker.*.out | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-            echo "✅ N=$N 全部签名一致 聚合吞吐≈${thr}KB/s p50=${p50}s 墙钟=${wall}s"
+            echo "✅ N=$N 全部签名一致 聚合吞吐≈${thr}KB/s p50=${p50}s 实际耗时=${wall}s"
         else
             echo "❌ N=$N 正确性失败（rc=$wrc 签名数=$n_hash 失败数=$n_fail）"; return 1
         fi
@@ -535,7 +535,7 @@ vllm-model-pull() {
     done
     [ "$rc" -eq 0 ] || { echo "❌ 存在 worker 非零退出"; kill "$pid" 2>/dev/null; return 1; }
     [ "$n_bad" -eq 0 ] || { kill "$pid" 2>/dev/null; return 1; }
-    echo "✅ 冷拉取 4 worker 全部正确 墙钟=${wall_a}s"
+    echo "✅ 冷拉取 4 worker 全部正确 实际耗时=${wall_a}s"
 
     echo "--- 热复拉（同对象重下，验证 squid 缓存命中）---"
     local hdr wall_b

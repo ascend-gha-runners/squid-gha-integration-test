@@ -8,7 +8,7 @@
 #   - 第 2..N 次 = 热路径，取中位数与冷启动对比
 #   - baseline=1 时额外克隆一次上游 gitcode.com（用 GIT_CONFIG_GLOBAL=/dev/null
 #     跳过 insteadOf）作为对照
-#   - ladder 非空时按并发阶梯同时 clone N 份（测墙钟/延迟放大/聚合吞吐）
+#   - ladder 非空时按并发阶梯同时 clone N 份（测实际耗时/延迟放大/聚合吞吐）
 #   - github_clone=1 时额外克隆一个 github.com 仓库作对照：job pod 模板的
 #     postStart 会把 github.com 重写到 git-cdn 的 github 实例（与 gitcode 是
 #     两套独立后端），所以这项测的是 github 侧缓存，不是 gh-proxy 直连

@@ -13,7 +13,7 @@
 #   ITERATIONS       克隆次数，默认 5；第 1 次为冷启动，其余为热路径
 #   BASELINE         1=额外克隆一次上游 gitcode.com 作对照（GIT_CONFIG_GLOBAL=/dev/null 跳过 insteadOf）
 #   LADDER           并发阶梯（空格分隔，如 "1 4 8"）；空=只测串行。
-#                    每个并发度下同时启动 N 个 clone（各自独立目录），记录墙钟与逐次耗时
+#                    每个并发度下同时启动 N 个 clone（各自独立目录），记录实际耗时（wall-clock）与逐次耗时
 #   GITHUB_CLONE     1=额外测 github.com 的 clone：走 pod 模板 postStart 注入的
 #                    gitconfig 重写（github.com → git-cdn 的 github 实例），
 #                    与 gitcode 是两套独立缓存后端
@@ -257,7 +257,7 @@ if [ "$GH_ON" = 1 ]; then
     done
 fi
 
-# --- ③' 并发阶梯（可选）：同时 clone N 份，测墙钟与逐次耗时 -------------------
+# --- ③' 并发阶梯（可选）：同时 clone N 份，测实际耗时（wall-clock）与逐次耗时 ---------
 CONC_CSV="$OUT/concurrency.tsv"
 CONC_TBL="$OUT/conc-levels.tsv"
 if [ -n "$LADDER" ]; then
@@ -299,7 +299,7 @@ for lvl in $LADDER; do
     for p in $pids; do wait "$p" || true; done
     we=$(date +%s%3N); wall=$((we - ws))
 
-    # 汇总本并发度：ok/fail、墙钟、逐次耗时中位数/极值、整体吞吐
+    # 汇总本并发度：ok/fail、实际耗时、逐次耗时中位数/极值、整体吞吐
     agg=$(awk -F'\t' -v wall="$wall" '
     { n++; rc[n] = $2; ms[n] = $3; by[n] = $4; if ($2 == 0) ok++; else fail++; tot += $4 }
     END {
@@ -411,9 +411,9 @@ if [ -s "$CONC_TBL" ] && [ "$(wc -l < "$CONC_TBL")" -gt 1 ]; then
         printf '%s\n' ""
         printf '## gitcode clone 并发\n'
         printf '%s\n' ""
-        printf '%s\n' "同一仓库同时 clone N 份（各自独立目录），墙钟为整组起止时间。"
+        printf '%s\n' "同一仓库同时 clone N 份（各自独立目录），实际耗时为整组起止时间。"
         printf '%s\n' ""
-        printf '%s\n' "| 并发度 | 成功 | 失败 | 墙钟 | 单次中位数 | 最小 | 最大 | 聚合吞吐 |"
+        printf '%s\n' "| 并发度 | 成功 | 失败 | 实际耗时 | 单次中位数 | 最小 | 最大 | 聚合吞吐 |"
         printf '%s\n' "|---|---|---|---|---|---|---|---|"
         awk -F'\t' 'NR>1{printf "| %s | %s | %s | %s ms | %s ms | %s ms | %s ms | %s MB/s |\n", $1,$2,$3,$4,$5,$6,$7,$8}' "$CONC_TBL"
     } >> "$SUMMARY"

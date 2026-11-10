@@ -473,11 +473,11 @@ for item in "${plan[@]}"; do
         printf '%s\tconc\t-\t-\t-\tINFO\t%s\n' "$tag" "$conc" >>"$TSV"
     fi
     if [ "$TRACE_PERF" = 1 ]; then
-        # 各子命令的耗时之和 = 各 clone 内部阶段，可与 sub_ms（墙钟）对照：
+        # 各子命令的耗时之和 = 各 clone 内部阶段，可与 sub_ms（实际耗时）对照：
         #   index-pack 之和 ≈ 网络取数占比；checkout/other ≈ 本地落盘占比
         summarize_perf "$d/sub.err" | while IFS=$'\t' read -r k ms cnt; do
             printf '%s\tsub_%s\t%s\t-\t-\tINFO\tcalls=%s\n' "$tag" "$k" "$ms" "$cnt" >>"$TSV"
-            log "子模块阶段 $k：合计 ${ms}ms / ${cnt} 次（墙钟 ${sub_ms}ms）"
+            log "子模块阶段 $k：合计 ${ms}ms / ${cnt} 次（实际耗时 ${sub_ms}ms）"
         done
     fi
 
