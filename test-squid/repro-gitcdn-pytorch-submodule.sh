@@ -36,6 +36,7 @@ RUNS="${RUNS:-1}"                          # >1 时第 2 轮起为热缓存对�
 SUBMODULES="${SUBMODULES:-}"               # 空 = 全量；可给 "third_party/cutlass third_party/flash-attention"
 SUBMODULE_JOBS="${SUBMODULE_JOBS:-8}"      # 子模块并发数（36 个并发 8 既不压垮 git-cdn 也不至于太慢）
 JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此并发档位逐档跑（如 "1 8 32"），忽略 RUNS
+SPLIT_PHASE="${SPLIT_PHASE:-1}"            # 1 = 主仓拆成「取数(纯网络)/checkout(纯落盘)」两段计时
 CLONE_TIMEOUT="${CLONE_TIMEOUT:-0}"        # 主仓超时，0 = 按仓库体积估
 SUBMODULE_TIMEOUT="${SUBMODULE_TIMEOUT:-3600}"   # 并发 1 档串行 61 个 clone 可能 20min+，留足余量
 RESULTS="${RESULTS:-${RESULTS_DIR:-/tmp/test-squid-results}/gitcdn-pytorch}"
@@ -141,9 +142,10 @@ for item in "${plan[@]}"; do
     probe_refs "$RESULTS/refs-probe-run$run.txt"
     log "===== 第 $run 轮（$tag，子模块并发 $SUBMODULE_JOBS）====="
 
-    # ① 主仓浅取（显式 --no-recurse-submodules，先拿到分段耗时）
+    # ① 主仓浅取：--no-checkout 只拉对象（纯网络），checkout 单独计时（纯本地落盘）
+    #    两者分开才能回答「280s 是网络慢还是写盘慢」
     t0=$(now_ms)
-    timeout "$tmo" git -c "$insteadof" clone -q --depth 1 --no-recurse-submodules \
+    timeout "$tmo" git -c "$insteadof" clone -q --depth 1 --no-recurse-submodules --no-checkout \
         "$url" "$d/pytorch" 2>"$d/main.err"; rc=$?
     main_ms=$(( $(now_ms) - t0 ))
     if [ "$rc" = 124 ]; then
@@ -156,6 +158,22 @@ for item in "${plan[@]}"; do
         log "$REPO —— ❌ 主仓 clone 失败：$reason"
         printf '%s\tmain\t%s\t-\t-\tFAIL\t%s\n' "$tag" "$main_ms" "$reason" >>"$TSV"
         FAIL=$((FAIL+1)); continue
+    fi
+    fetch_ms=$main_ms
+    printf '%s\tmain_fetch\t%s\t-\t-\tPASS\tno-checkout(纯网络)\n' "$tag" "$fetch_ms" >>"$TSV"
+    if [ "$SPLIT_PHASE" = 1 ]; then
+        t_c=$(now_ms)
+        timeout "$tmo" git -C "$d/pytorch" checkout -q -f 2>"$d/main-co.err"; rcc=$?
+        co_ms=$(( $(now_ms) - t_c ))
+        main_ms=$(( fetch_ms + co_ms ))
+        if [ "$rcc" != 0 ]; then
+            log "$REPO —— ⚠️ 主仓 checkout 失败（rc=$rcc），耗时不可信"
+            printf '%s\tmain_checkout\t%s\t-\t-\tWARN\trc=%s\n' "$tag" "$co_ms" "$rcc" >>"$TSV"
+            WARN=$((WARN+1))
+        else
+            printf '%s\tmain_checkout\t%s\t-\t-\tPASS\tlocal(纯落盘)\n' "$tag" "$co_ms" >>"$TSV"
+        fi
+        log "$REPO —— 主仓拆分：取数 ${fetch_ms}ms / checkout ${co_ms}ms"
     fi
     main_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     head_sha=$(git -C "$d/pytorch" rev-parse HEAD 2>/dev/null)
