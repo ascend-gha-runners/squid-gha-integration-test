@@ -190,6 +190,15 @@ namespace 统一 `squid`，两个副本 `squid-cache-0/1`，squid 容器名 `squ
 4. **mtail 规则靠 checksum 滚动生效**：改完 CM 必须重启 statefulset，否则查到的还是旧口径。
 5. **`squid_up` 每集群 2 个副本**属正常；sh-001 只有 1 个也正常。
 6. **不要用 `client_http_errors_total` 判 5xx**：它没有 code 标签，混了 4xx/abort/5xx。
+7. **`TCP_REDIRECT/302` 落进 `OTHER`**：mtail 没有 REDIRECT 分支，github.com 的
+   `/info/refs` 被 squid 302 到 git-cdn 后记为 OTHER，而 OTHER 在错误率分子里。
+   流量一低（CI 间歇），github.com 错误率就会跳到 94%~100%，这是**分类伪影**不是故障。
+   看域名错误率前先 `sum by (result)` 看 OTHER 是否等于 302 条数。
+8. **`increase()` 会外推**：mtail 刚重启时序列年龄 < 窗口，`increase(...[1h])` 会把
+   十几分钟的增量放大成整小时（实测 15m=100、1h=8347）。用 `[15m]` 与 `[1h]` 比值自检，
+   或先看 `count_over_time` 的采样点数。
+9. **低流量域名的 100% 没有意义**：`rate` 守卫只有 0.05 req/s（3 次/分），apt/dnf 两次
+   运行之间的一个 ABORT 就能让 5m 窗口显示 100%。峰值列必须配合总量一起看。
 
 ## 6. 一键采集（只读 Prometheus）
 

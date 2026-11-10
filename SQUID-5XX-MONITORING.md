@@ -173,6 +173,56 @@ access.log 证据（aiframework，窗口 1794272059~1794295189，约 6.4h，cach
 
 ---
 
+## 2026-11-10 hk-001 面板错误率排查（全部为伪影，无 5xx）
+
+面板口径（`ABORT+TIMEDOUT+OTHER+5xx` / 全部）在 hk-001 上 8 个域名全部为 0 个 5xx：
+
+| 域名 | 面板 5m / 峰值 | 1h result 拆解 | 判定 |
+|---|---:|---|---|
+| github.com | 94.1% / 100% | MISS 8849\* / OTHER 262 / MISS_429 243 / ABORT 129 | **302 分类伪影** |
+| archive.ubuntu.com | 0.0% / 100% | HIT 2562 / REVAL 1032 / MISS 9 / ABORT 6 | 低流量瞬时 |
+| security.ubuntu.com | 0.0% / 63.6% | REVAL 410 / MISS 12 / ABORT 5 | 低流量瞬时 |
+| www.modelscope.cn | 11.8% / 82.6% | MISS 874 / ABORT 45 | 客户端取消刷新 |
+| gitcode.com | 0.0% / 60% | MISS 384 / ABORT 20 | 低流量瞬时 |
+| download.pytorch.org | 4.8% / 19% | MISS 36154 / HIT 7001 / ABORT 1733 | 403 探测 + 断开 |
+| repo.huaweicloud.com | 0.0% / 13.6% | MISS_404 6209 / ABORT 129 | 404 探测 |
+| mirrors.huaweicloud.com | 2.2% / 12.9% | MISS_404 80641 / ABORT 1397 | 404 探测 |
+
+\* `increase(...[1h])` 外推：同一序列 `[15m]`=100、`[30m]`=251、`[1h]`=8347，
+说明 mtail 刚重启、序列年龄 < 1h，8849 不是真实小时量。
+
+### github.com：302 → OTHER 分类伪影
+
+- 5m 错误率序列：14:40–14:55 为 2%~5.7%（MISS 上千），15:10 起流量掉到 20~60/5m，
+  而 `TCP_REDIRECT/302` 稳定产生 → 15:30 窗口 `total=22 / OTHER=21 / MISS=1 = 94.4%`。
+- access.log：
+
+  ```text
+  1794296033.348  0 172.16.1.59  TCP_REDIRECT/302 314 GET https://github.com/vllm-project/vllm/info/refs? - HIER_NONE/- -
+  1794296052.541  0 172.16.1.121 TCP_REDIRECT/302 322 GET https://github.com/triton-lang/triton-ascend/info/refs? - HIER_NONE/- -
+  ```
+
+- 根因：`mtail-configmap.yaml` 的 else 链没有 `TCP_REDIRECT` 分支，302 落进最后的
+  `OTHER`（原本只预期 TCP_DENIED/NONE）。squid 302 → git-cdn 的策略（本仓库 #2470）让
+  github.com 的 `info/refs` 全部走 302，CI 一停，OTHER 就成了分子主体。
+- 影响：看板与 `SquidDomainErrorRateHigh`（OTHER 占比 >40% 持续 15m）会误报 github.com。
+- 修复建议：mtail 增加 `REDIRECT` 桶并从错误分子移除（或按 TUNNEL 同款单列），
+  同时把 0.05 req/s 流量守卫提高到 ≥0.5 req/s，避免低流量瞬时值。
+
+### 其余域名
+
+- **modelscope**：`TCP_REFRESH_ABORTED/000` 200ms `GET /api/v1/repos/internalAccelerationInfo`，
+  `HIER_NONE/-`，是客户端（轮询 API）主动断开刷新，ABORT 计入错误率；1h 45 次属持续行为。
+- **download.pytorch.org**：与 aiframework 同因，`/whl/cpu/<pkg>/` 返回 `TCP_MISS/403`
+  （8070+8324/副本），客户端断开记 `TCP_MISS_ABORTED/403`（342+422/副本）；真实 wheel 是 MEM_HIT/200。
+- **archive/security.ubuntu.com**：HIT/REVAL 占绝对多数（2562+1032 / 410），
+  100% 只出现在两次 apt 之间的 5m 空窗（1 个 ABORT、0 个命中）。
+- **gitcode.com**：`insteadOf → git-cdn` 走集群内直连，squid 只剩残量（MISS 384/h），峰值 60% 是分母小。
+- **repo/mirrors.huaweicloud.com**：`MISS_404` 6.2k/h、80.6k/h（pip 探测 nightly/不存在的包），
+  404 不进分子，但 `_ABORTED/404` 进 ABORT，峰值随 5m 分母波动。
+
+---
+
 ## 与既有 issue 的对应
 
 | 域名 | issue | 处理 |
