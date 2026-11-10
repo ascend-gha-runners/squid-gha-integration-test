@@ -72,6 +72,11 @@ on:
         required: false
         default: ''
         type: string
+      pytorch_work_dir:
+        description: '克隆落盘目录（默认 /tmp/gitcdn-pytorch；填 /dev/shm/gitcdn-pytorch 可做 tmpfs 对照，排除落盘 IO）'
+        required: false
+        default: ''
+        type: string
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -188,6 +193,7 @@ jobs:
           RUNS: ${{ inputs.pytorch_runs || '1' }}
           SUBMODULES: ${{ inputs.pytorch_submodules }}
           JOBS_LADDER: ${{ inputs.pytorch_jobs_ladder }}
+          WORK: ${{ inputs.pytorch_work_dir }}
           CLONE_TIMEOUT: ${{ inputs.clone_timeout || '0' }}
         run: bash test-squid/repro-gitcdn-pytorch-submodule.sh
 
