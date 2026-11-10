@@ -40,10 +40,6 @@ on:
         default: ''
         type: string
 
-  schedule:
-    # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
-    - cron: '*/30 * * * *'
-
   pull_request:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
