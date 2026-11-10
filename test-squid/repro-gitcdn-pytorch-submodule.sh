@@ -24,7 +24,13 @@
 # 可覆盖：GIT_CDN_BASE / REPO / RUNS / SUBMODULES / SUBMODULE_JOBS
 #         / JOBS_LADDER（并发拨测，如 "1 8 32"，每档一轮全新克隆，替代 RUNS）
 #         / CLONE_TIMEOUT（主仓，0=按体积估）/ SUBMODULE_TIMEOUT
+#         / TRACE_PERF（1 = 打开 GIT_TRACE_PERFORMANCE，把每个 git 子命令的耗时留档）
 #         / RESULTS / WORK / GH_TOKEN
+#
+# TRACE_PERF=1 时：
+#   ① 完整 stderr 落盘到 perf-main-run<N>.txt / perf-sub-run<N>.txt（不再只留前 10 行）
+#   ② 按子命令归类汇总（index-pack = 网络取数 / checkout = 本地落盘 / fetch = 回源），
+#      以 sub_<phase> 行写进 TSV —— 用于判定「慢在取数还是落盘」。
 #
 # 退出码：0=PASS；1=FAIL；2=SKIP（git-cdn 不可达）
 # =============================================================================
@@ -37,11 +43,15 @@ SUBMODULES="${SUBMODULES:-}"               # 空 = 全量；可给 "third_party/
 SUBMODULE_JOBS="${SUBMODULE_JOBS:-8}"      # 子模块并发数（36 个并发 8 既不压垮 git-cdn 也不至于太慢）
 JOBS_LADDER="${JOBS_LADDER:-}"             # 非空则按此并发档位逐档跑（如 "1 8 32"），忽略 RUNS
 SPLIT_PHASE="${SPLIT_PHASE:-1}"            # 1 = 主仓拆成「取数(纯网络)/checkout(纯落盘)」两段计时
+TRACE_PERF="${TRACE_PERF:-0}"              # 1 = GIT_TRACE_PERFORMANCE 留档每个 git 子命令耗时
 CLONE_TIMEOUT="${CLONE_TIMEOUT:-0}"        # 主仓超时，0 = 按仓库体积估
 SUBMODULE_TIMEOUT="${SUBMODULE_TIMEOUT:-3600}"   # 并发 1 档串行 61 个 clone 可能 20min+，留足余量
 RESULTS="${RESULTS:-${RESULTS_DIR:-/tmp/test-squid-results}/gitcdn-pytorch}"
 WORK="${WORK:-/tmp/gitcdn-pytorch}"
 export GIT_TERMINAL_PROMPT=0
+# GIT_TRACE_PERFORMANCE 由 git 写到 stderr，经 `git -c` / submodule 子进程继承，
+# 所以 `2>file` 就能拿到主仓与每个子模块 clone 的分阶段耗时。
+[ "$TRACE_PERF" = 1 ] && export GIT_TRACE_PERFORMANCE=1
 
 mkdir -p "$RESULTS"
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -87,6 +97,24 @@ classify() {  # classify <errfile> <rc>
     echo "rc=$rc"
 }
 
+summarize_perf() {  # summarize_perf <tracefile> → 每行 "phase<TAB>sum_ms<TAB>calls"
+    local f="$1"
+    [ -s "$f" ] || return 0
+    sed -n 's/.*| \([0-9.]*\) s: git command: \(.*\)$/\1\t\2/p' "$f" \
+        | awk -F'\t' '
+            {
+                ms = $1 * 1000
+                cmd = $2
+                if (cmd ~ /index-pack/)       k = "index-pack"
+                else if (cmd ~ /checkout/)    k = "checkout"
+                else if (cmd ~ /fetch/)       k = "fetch"
+                else                          k = "other"
+                sum[k] += ms; cnt[k]++
+            }
+            END { for (k in sum) printf "%s\t%d\t%d\n", k, sum[k], cnt[k] }' \
+        | sort -k2,2nr
+}
+
 probe_refs() {  # 记录 git-cdn 对 info/refs 的缓存类响应头（每轮一次，作缓存证据）
     local out="$1"
     {
@@ -118,6 +146,7 @@ insteadof="url.${GIT_CDN_BASE}.insteadOf=https://github.com/"
 log "被测仓库：$REPO（体积 ${size_mb}MB，主仓超时 ${tmo}s，子模块超时 ${SUBMODULE_TIMEOUT}s，并发 ${SUBMODULE_JOBS}）"
 log "git-cdn 基址：$GIT_CDN_BASE；真值 HEAD：${truth:0:9}"
 [ -n "$SUBMODULES" ] && log "限定子模块：$SUBMODULES"
+[ "$TRACE_PERF" = 1 ] && log "GIT_TRACE_PERFORMANCE=1：逐子命令耗时留档（perf-*.txt）"
 
 FAIL=0; WARN=0
 # 轮次计划：JOBS_LADDER 非空 → 每档并发一轮（都从空目录起，排除工作树复用的干扰）；
@@ -161,6 +190,13 @@ for item in "${plan[@]}"; do
     fi
     fetch_ms=$main_ms
     printf '%s\tmain_fetch\t%s\t-\t-\tPASS\tno-checkout(纯网络)\n' "$tag" "$fetch_ms" >>"$TSV"
+    if [ "$TRACE_PERF" = 1 ]; then
+        [ -s "$d/main.err" ] && cp "$d/main.err" "$RESULTS/perf-main-run$run.txt"
+        summarize_perf "$d/main.err" | while IFS=$'\t' read -r k ms cnt; do
+            printf '%s\tmain_%s\t%s\t-\t-\tINFO\tcalls=%s\n' "$tag" "$k" "$ms" "$cnt" >>"$TSV"
+            log "主仓阶段 $k：合计 ${ms}ms / ${cnt} 次"
+        done
+    fi
     if [ "$SPLIT_PHASE" = 1 ]; then
         t_c=$(now_ms)
         timeout "$tmo" git -C "$d/pytorch" checkout -q -f 2>"$d/main-co.err"; rcc=$?
@@ -174,6 +210,12 @@ for item in "${plan[@]}"; do
             printf '%s\tmain_checkout\t%s\t-\t-\tPASS\tlocal(纯落盘)\n' "$tag" "$co_ms" >>"$TSV"
         fi
         log "$REPO —— 主仓拆分：取数 ${fetch_ms}ms / checkout ${co_ms}ms"
+        if [ "$TRACE_PERF" = 1 ] && [ -s "$d/main-co.err" ]; then
+            cp "$d/main-co.err" "$RESULTS/perf-mainco-run$run.txt"
+            summarize_perf "$d/main-co.err" | while IFS=$'\t' read -r k ms cnt; do
+                printf '%s\tmainco_%s\t%s\t-\t-\tINFO\tcalls=%s\n' "$tag" "$k" "$ms" "$cnt" >>"$TSV"
+            done
+        fi
     fi
     main_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     head_sha=$(git -C "$d/pytorch" rev-parse HEAD 2>/dev/null)
@@ -205,7 +247,11 @@ for item in "${plan[@]}"; do
     total_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     sub_mb=$(( ${total_mb:-0} - ${main_mb:-0} ))
     # stderr 留档 + 首行入备注（否则只剩 rc=1 无法定位）
-    [ -s "$d/sub.err" ] && sed -n '1,10p' "$d/sub.err" >"$RESULTS/submodule-err-run$run.txt"
+    if [ "$TRACE_PERF" = 1 ]; then
+        [ -s "$d/sub.err" ] && cp "$d/sub.err" "$RESULTS/perf-sub-run$run.txt"
+    else
+        [ -s "$d/sub.err" ] && sed -n '1,10p' "$d/sub.err" >"$RESULTS/submodule-err-run$run.txt"
+    fi
     err1=$(grep -om1 -E '(fatal|error): .*' "$d/sub.err" 2>/dev/null | cut -c1-90 | tr '\t' ' ')
 
     sub_verdict=PASS; sub_note="declared=$n_sub,jobs=$SUBMODULE_JOBS"
@@ -218,6 +264,14 @@ for item in "${plan[@]}"; do
     sub_note="$sub_note,inited=$done_sub"
     log "子模块 —— ${sub_verdict} ${sub_ms}ms（${sub_mb}MB，已初始化 $done_sub/$n_sub）"
     printf '%s\tsubmodules\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$sub_ms" "$sub_mb" "$done_sub" "$sub_verdict" "$sub_note" >>"$TSV"
+    if [ "$TRACE_PERF" = 1 ]; then
+        # 各子命令的耗时之和 = 各 clone 内部阶段，可与 sub_ms（墙钟）对照：
+        #   index-pack 之和 ≈ 网络取数占比；checkout/other ≈ 本地落盘占比
+        summarize_perf "$d/sub.err" | while IFS=$'\t' read -r k ms cnt; do
+            printf '%s\tsub_%s\t%s\t-\t-\tINFO\tcalls=%s\n' "$tag" "$k" "$ms" "$cnt" >>"$TSV"
+            log "子模块阶段 $k：合计 ${ms}ms / ${cnt} 次（墙钟 ${sub_ms}ms）"
+        done
+    fi
 
     # 子模块明细（path / 已 checkout 的 sha / 工作目录体积）
     git -C "$d/pytorch" submodule status --recursive 2>/dev/null | while read -r sha path _; do

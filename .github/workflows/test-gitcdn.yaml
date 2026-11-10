@@ -77,6 +77,11 @@ on:
         required: false
         default: ''
         type: string
+      pytorch_trace_perf:
+        description: '1 = 打开 GIT_TRACE_PERFORMANCE，按 index-pack/checkout/fetch 归类留档每个 git 子命令耗时（判定慢在取数还是落盘）'
+        required: false
+        default: '0'
+        type: string
 
   schedule:
     # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
@@ -195,6 +200,7 @@ jobs:
           JOBS_LADDER: ${{ inputs.pytorch_jobs_ladder }}
           WORK: ${{ inputs.pytorch_work_dir }}
           CLONE_TIMEOUT: ${{ inputs.clone_timeout || '0' }}
+          TRACE_PERF: ${{ inputs.pytorch_trace_perf || '0' }}
         run: bash test-squid/repro-gitcdn-pytorch-submodule.sh
 
       - name: 写入 Step Summary
