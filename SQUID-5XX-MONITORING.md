@@ -144,15 +144,15 @@ topk(10, sum by (cluster, host) (
 
 | 域名 | issue | 处理 |
 |---|---|---|
-| github.com | #11（hk-001 429）、#15（sh-002 10s 超时） | 已有，域名不重复建 |
-| gh-proxy.test.osinfra.cn | #12 | 已有，新集群证据追加评论 |
+| github.com | #11（hk-001 429）、#15（sh-002 10s 超时） | 已有；#15 已追加 cn12-001 证据评论 |
+| gh-proxy.test.osinfra.cn | #12 | 已有；已追加 7d 跨集群分布评论 |
 | registry.npmmirror.com | #13 | 已有 |
-| apig.openlibing.com | 2026-11-10 新建 | 源站 500，进行中 |
-| huggingface.co | 2026-11-10 新建 | 上游超时 |
-| datasets-server.hf-mirror.com | 2026-11-10 新建 | 转发失败 |
-| mirrors.qlu.edu.cn | 2026-11-10 新建 | epel repodata 超时 |
-| pypi.douban.com | 2026-11-10 新建 | 连接失败 |
-| ascend-ci-cache-hk.obs... | 2026-11-10 新建 | 证据待补 |
-| download.pytorch.org | 2026-11-10 新建 | 证据待补 |
+| apig.openlibing.com | #16 | 新建；源站 500，进行中 |
+| huggingface.co | #18 | 新建；上游超时 |
+| datasets-server.hf-mirror.com | #17 | 新建；转发失败 |
+| mirrors.qlu.edu.cn | #19 | 新建；epel repodata 超时 |
+| pypi.douban.com | #20 | 新建；连接失败 |
+| ascend-ci-cache-hk.obs... | #21 | 新建；证据待补 |
+| download.pytorch.org | #22 | 新建；证据待补 |
 
 桶口径改造见 ascend-ci-deployment #2556；本次巡检未发现需要改 mtail 规则的新问题。
