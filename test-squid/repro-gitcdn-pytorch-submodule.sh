@@ -28,7 +28,7 @@
 #           fetchjobs0 = PyTorch CI 的官方配置：submodule.fetchJobs=0 + fetch.parallel=0
 #           filter:X   = submodule update 加 --filter=X（如 blob:none，partial clone）
 #         / SUB_MODE（update = git 原生 --recursive --jobs；par = 脚本分层并行）
-#         / SAMPLE_CONC（1 = 每秒采样在跑的 git 进程数，写 conc-run*.tsv）
+#         / SAMPLE_CONC（1 = 每秒采样在跑的 git 进程数 + loadavg + CPU 核数，写 conc-run*.tsv）
 #         / CLONE_TIMEOUT（主仓，0=按体积估）/ SUBMODULE_TIMEOUT
 #         / RESULTS / WORK / GH_TOKEN
 #         / TRACE_PERF（1 = 打开 GIT_TRACE_PERFORMANCE，把每个 git 子命令的耗时留档）
@@ -71,6 +71,8 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 TSV="$RESULTS/pytorch-submodule.tsv"   # run phase ms size_mb submodules verdict note
 SUBTSV="$RESULTS/submodules.tsv"       # run path sha size_mb
 : >"$TSV"; : >"$SUBTSV"
+CPU_STATE="$RESULTS/.cpu-state"        # 采样器上一次的「时间戳 + cgroup CPU 累计」，用于算瞬时核数
+: >"$CPU_STATE"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 now_ms() { date +%s%3N; }
@@ -141,7 +143,17 @@ summarize_perf() {  # summarize_perf <tracefile> → 每行 "phase<TAB>sum_ms<TA
 # ---------------------------------------------------------------------------
 # 并发采样：证明「同一时刻到底有几个 git 在跑」（只扫 /proc，不依赖 pgrep）
 # ---------------------------------------------------------------------------
-sample_once() {  # 输出：net index_pack fetch_or_clone checkout total_git
+cpu_ns_once() {  # 容器 cgroup 累计 CPU 时间（ns）；v1 → v2 → 0
+    if [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then
+        cat /sys/fs/cgroup/cpuacct/cpuacct.usage 2>/dev/null
+    elif [ -r /sys/fs/cgroup/cpu.stat ]; then
+        awk '/^usage_usec/ { printf "%d", $2 * 1000; exit }' /sys/fs/cgroup/cpu.stat 2>/dev/null
+    else
+        echo 0
+    fi
+}
+
+sample_once() {  # 输出：net index_pack fetch_or_clone checkout total_git load1 cpu_cores
     local net=0 ipk=0 fet=0 co=0 tot=0 f cmd
     for f in /proc/[0-9]*/cmdline; do
         [ -r "$f" ] || continue
@@ -153,14 +165,31 @@ sample_once() {  # 输出：net index_pack fetch_or_clone checkout total_git
         case "$cmd" in *" fetch "*|*" clone "*) fet=$((fet + 1)) ;; esac
         case "$cmd" in *" checkout "*|*checkout-index*) co=$((co + 1)) ;; esac
     done
-    printf '%s\t%s\t%s\t%s\t%s' "$net" "$ipk" "$fet" "$co" "$tot"
+    # 机器负载（/proc/loadavg 在容器内读到的是**宿主机** loadavg）与容器 CPU 核数
+    # （cpuacct/cpu.stat 的视角取决于 cgroupns：private = 容器自身，host = 整机）。
+    # 两者都只作量级参考，用于回答「开更多进程到底是并行还是空转」。
+    local load1 cores=0 now_ns cpu_ns st
+    load1=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+    now_ns=$(date +%s%N 2>/dev/null)
+    cpu_ns=$(cpu_ns_once)
+    if [ -r "$CPU_STATE" ] && [ -n "$now_ns" ]; then
+        st=$(cat "$CPU_STATE" 2>/dev/null)
+        local p_ns="${st%% *}" p_cpu="${st##* }"
+        if [ "${now_ns:-0}" -gt "${p_ns:-0}" ] 2>/dev/null; then
+            cores=$(awk -v dc="$((cpu_ns - p_cpu))" -v dt="$((now_ns - p_ns))" \
+                'BEGIN { if (dt > 0) printf "%.2f", dc / dt; else print "0" }')
+        fi
+    fi
+    [ -n "$now_ns" ] && printf '%s %s\n' "$now_ns" "$cpu_ns" >"$CPU_STATE" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$net" "$ipk" "$fet" "$co" "$tot" "${load1:-0}" "$cores"
 }
 
 start_sampler() {  # $1 = 输出文件
     local out="$1"
+    rm -f "$CPU_STATE"   # 上一档的基线作废，否则首帧会把档间空档的 CPU 平摊进来
     (
         local t0=$SECONDS
-        printf 'elapsed\tnet\tindex_pack\tfetch_or_clone\tcheckout\ttotal_git\n' >"$out"
+        printf 'elapsed\tnet\tindex_pack\tfetch_or_clone\tcheckout\ttotal_git\tload1\tcpu_cores\n' >"$out"
         while :; do
             printf '%s\t%s\n' "$((SECONDS - t0))" "$(sample_once)" >>"$out"
             sleep "$SAMPLE_INTERVAL"
@@ -178,11 +207,12 @@ stop_sampler() {
 
 summarize_conc() {  # $1 = 采样文件；输出一行 max/mean（net=HTTP 会话，即真正的在飞请求数）
     awk -F'\t' 'NR > 1 { n++
-        for (i = 2; i <= 6; i++) { s[i] += $i; if ($i > m[i]) m[i] = $i } }
+        for (i = 2; i <= 8; i++) { s[i] += $i; if ($i > m[i]) m[i] = $i } }
         END {
             if (!n) { print "no-samples"; exit }
-            printf "samples=%d net:mean=%.2f,max=%d index_pack:max=%d fetch:max=%d total:mean=%.2f,max=%d",
-                n, s[2] / n, m[2], m[3], m[4], s[6] / n, m[6] }' "$1"
+            printf "samples=%d net:mean=%.2f,max=%d index_pack:max=%d fetch:max=%d total:mean=%.2f,max=%d load1:mean=%.2f,max=%.2f cpu:mean=%.2f,max=%.2f",
+                n, s[2] / n, m[2], m[3], m[4], s[6] / n, m[6],
+                s[7] / n, m[7], s[8] / n, m[8] }' "$1"
 }
 
 # ---------------------------------------------------------------------------
