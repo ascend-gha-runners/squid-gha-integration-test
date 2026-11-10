@@ -200,11 +200,11 @@ jobs:
         if: ${{ inputs.pytorch_git_upgrade == '1' }}
         run: |
           set -x
-          if git submodule update -h 2>&1 | grep -q -- '--filter'; then
-            echo "当前 git 已支持 submodule update --filter，无需升级"
-            git --version
-            exit 0
-          fi
+          # git submodule update -h 返回 129，直接接 grep 会被 pipefail 判成失败，先落成变量
+          help_txt=$(git submodule update -h 2>&1 || true)
+          case "$help_txt" in
+            *--filter*) echo "当前 git 已支持 submodule update --filter，无需升级"; git --version; exit 0 ;;
+          esac
           SUDO=""
           command -v sudo >/dev/null 2>&1 && SUDO=sudo
           $SUDO apt-get update -qq || true
@@ -213,9 +213,11 @@ jobs:
           $SUDO apt-get update -qq
           $SUDO apt-get install -y -qq git
           git --version
-          git submodule update -h 2>&1 | grep -q -- '--filter' \
-            && echo "升级成功：已支持 --filter" \
-            || { echo "升级后仍不支持 --filter"; exit 1; }
+          help_txt=$(git submodule update -h 2>&1 || true)
+          case "$help_txt" in
+            *--filter*) echo "升级成功：已支持 --filter" ;;
+            *) echo "升级后仍不支持 --filter"; exit 1 ;;
+          esac
 
       - name: 经 git-cdn 克隆 pytorch 主仓 + 子模块（分段计时）
         env:

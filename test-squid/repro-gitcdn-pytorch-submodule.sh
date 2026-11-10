@@ -297,10 +297,18 @@ for item in "${plan[@]}"; do
     esac
     d="$WORK/run$run"; mkdir -p "$d"
     # 老版本 git 的 `submodule update` 没有 --filter：这一档直接跳过，别白跑主仓
-    if [ -n "$SUB_FILTER" ] && ! git submodule update -h 2>&1 | grep -q -- '--filter'; then
-        log "⚠️ 当前 git 不支持 submodule update --filter，跳过该档（$tag）"
-        printf '%s\tsubmodules\t0\t0\t-\tSKIP\tgit-no-submodule-filter\n' "$tag" >>"$TSV"
-        rm -rf "$d"; continue
+    # 注意：`git submodule update -h` 返回 129，配合 set -o pipefail 会把管道判成失败，
+    #       所以必须先落地成变量再匹配，不能直接接 grep。
+    if [ -n "$SUB_FILTER" ]; then
+        sub_help=$(git submodule update -h 2>&1 || true)
+        case "$sub_help" in
+            *--filter*) : ;;
+            *)
+                log "⚠️ 当前 git 不支持 submodule update --filter，跳过该档（$tag）"
+                printf '%s\tsubmodules\t0\t0\t-\tSKIP\tgit-no-submodule-filter\n' "$tag" >>"$TSV"
+                rm -rf "$d"; continue
+                ;;
+        esac
     fi
     probe_refs "$RESULTS/refs-probe-run$run.txt"
     log "===== 第 $run 轮（$tag，模式 $SUB_MODE，子模块并发 $SUBMODULE_JOBS）====="
