@@ -256,7 +256,11 @@ FAIL=0; WARN=0
 # 轮次计划：JOBS_LADDER 非空 → 每档并发一轮（都从空目录起，排除工作树复用的干扰）；
 #           否则按 RUNS 跑冷/热对照
 if [ -n "$JOBS_LADDER" ]; then
-    plan=(); for j in $JOBS_LADDER; do plan+=("jobs:$j"); done
+    plan=()
+    for j in $JOBS_LADDER; do
+        # 裸数字 = 并发档（jobs:N）；带冒号的 "update:8" / "par:8" 原样保留
+        case "$j" in *:*) plan+=("$j") ;; *) plan+=("jobs:$j") ;; esac
+    done
     log "并发拨测档位：$JOBS_LADDER"
 else
     plan=(); for i in $(seq 1 "$RUNS"); do plan+=("run:$i"); done
