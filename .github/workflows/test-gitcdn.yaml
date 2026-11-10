@@ -30,7 +30,7 @@ on:
         default: '["linux-amd64-cpu-2", "gy-006"]'
         type: string
       latest:
-        description: '1 = 立刻跑一次「最新 commit 滚动校验」（定时任务每 30 分钟自动跑）'
+        description: '1 = 跑一次「最新 commit 滚动校验」（原 30 分钟定时任务已移除）'
         required: false
         default: '1'
         type: string
@@ -87,10 +87,6 @@ on:
         required: false
         default: '0'
         type: string
-
-  schedule:
-    # 每 30 分钟一轮：全部仓库重新取上游最新 commit，验证 git-cdn 可服务新提交
-    - cron: '*/30 * * * *'
 
   pull_request:
     paths:
