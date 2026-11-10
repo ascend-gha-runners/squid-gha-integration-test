@@ -202,21 +202,28 @@ par_update_recursive() {  # $1 = 仓库目录（含 .gitmodules）；$2 = 日志
     fi
     git -C "$dir" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/"
     git -C "$dir" submodule init -- "${paths[@]}" >>"$log" 2>&1
-    for p in "${paths[@]}"; do
+    # 分批扇出：每批最多 SUBMODULE_JOBS 个，只 wait 本批的 PID
+    # （不能用裸 wait —— 采样器也是个后台作业，会把整轮永久挂住）
+    local i=0 rc_all=0
+    local -a pids=()
+    while [ "$i" -lt "${#paths[@]}" ]; do
         if [ "$PAR_DEADLINE" -gt 0 ] && [ "$(date +%s)" -gt "$PAR_DEADLINE" ]; then
-            echo "[par] 超过 SUBMODULE_TIMEOUT，中止剩余子模块（$dir → $p）" >>"$log"
-            kill $(jobs -p) 2>/dev/null
+            echo "[par] 超过 SUBMODULE_TIMEOUT，中止（$dir）" >>"$log"
             return 124
         fi
-        while [ "$(jobs -rp | wc -l)" -ge "$SUBMODULE_JOBS" ]; do wait -n 2>/dev/null || break; done
-        ( git -C "$dir" submodule update --depth 1 -- "$p" >>"$log" 2>&1 ) &
+        pids=()
+        while [ "$i" -lt "${#paths[@]}" ] && [ "${#pids[@]}" -lt "$SUBMODULE_JOBS" ]; do
+            p="${paths[$i]}"; i=$((i + 1))
+            ( git -C "$dir" submodule update --depth 1 -- "$p" >>"$log" 2>&1 ) &
+            pids+=($!)
+        done
+        for pid in "${pids[@]}"; do wait "$pid" || rc_all=1; done
     done
-    wait
     # 本层全部落地后再下降一层（每层内部仍然是满并发）
     for p in "${paths[@]}"; do
-        [ -f "$dir/$p/.gitmodules" ] && par_update_recursive "$dir/$p" "$log" "" 
+        [ -f "$dir/$p/.gitmodules" ] && par_update_recursive "$dir/$p" "$log" ""
     done
-    return 0
+    return "$rc_all"
 }
 
 probe_refs() {  # 记录 git-cdn 对 info/refs 的缓存类响应头（每轮一次，作缓存证据）
