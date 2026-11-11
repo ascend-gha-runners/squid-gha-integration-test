@@ -93,7 +93,7 @@ on:
         default: '0'
         type: string
       pytorch_ghproxy_baseline:
-        description: '1 = 用 GitHub 托管 runner（ubuntu-latest）跑同一脚本、直连 gh-proxy（不经 git-cdn），作对照基线'
+        description: '1 = 自建 runner 直连 gh-proxy（git-cdn 的回源上游、不经 git-cdn）跑同一脚本，作上游路径基线'
         required: false
         default: '0'
         type: string
@@ -321,16 +321,19 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
-  # gh-proxy 对照基线（opt-in）：同一脚本、同一档位，跑在 GitHub 托管 runner 上，
-  # 但把克隆基址换成 git-cdn 的回源上游 gh-proxy（不经 git-cdn）。
+  # gh-proxy 对照基线（opt-in）：同一脚本、同一档位，但把克隆基址换成 git-cdn 的
+  # 回源上游 gh-proxy（不经 git-cdn），即「以前 CI 直接打 gh-proxy」的姿势。
   # 与上一条基线是三点对照：
-  #   集群 git-cdn  ←→  托管 runner 直连 gh-proxy  ←→  托管 runner 直连 github.com
-  # 用来区分「2.9x 差距」来自 git-cdn 本身，还是来自 gh-proxy 这一跳 / 集群网络。
+  #   集群 git-cdn  ←→  runner 直连 gh-proxy（经 squid）  ←→  托管 runner 直连 github.com
+  #
+  # 为什么不能跑在 GitHub 托管 runner：gh-proxy 对境外源 IP 固定回 418（实测
+  # 2026-11-11 run 42985682263：托管 runner 上 git ls-remote 直接 418，1.8s 失败），
+  # 只有境内/白名单网络可达，所以这条腿必须落在自建 runner 上。
   pytorch-baseline-ghproxy:
-    name: pytorch 克隆基线（GitHub 托管 runner 直连 gh-proxy）
+    name: pytorch 克隆基线（自建 runner 直连 gh-proxy，不经 git-cdn）
     if: ${{ inputs.pytorch_ghproxy_baseline == '1' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -354,7 +357,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## pytorch 克隆基线（GitHub 托管 runner，直连 gh-proxy）"
+            echo "## pytorch 克隆基线（自建 runner，直连 gh-proxy，不经 git-cdn）"
             echo "| 轮次 | 阶段 | 耗时(ms) | 体积(MB) | 子模块数 | 结论 | 备注 |"
             echo "|---|---|---|---|---|---|---|"
             awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7}' \
