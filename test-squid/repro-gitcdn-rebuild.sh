@@ -12,7 +12,7 @@
 #
 # 对应断言（全部通过 HTTP/git 协议从 runner 侧观测，不需要 kubeconfig）：
 #   live         GET / 返回 200 且含 "live"                     —— 服务起来且 readiness 口径正确
-#   metrics      GET /metrics 200 且含多进程指标                —— PACK_CACHE_MULTI 生效（WARN 不判红）
+#   metrics      GET /metrics 200 且指标带 pid 标签               —— PACK_CACHE_MULTI 生效（WARN 不判红）
 #   bigbody      POST 2MB 请求体不得 413                        —— 补丁 ②，aiohttp 默认上限 1MB
 #   filter       带 --filter=blob:none 的 clone 必须成功且真跳过 blob
 #                                                                —— 补丁 ③，服务端没配 allowfilter 会整包下发
@@ -85,15 +85,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. metrics：/metrics 可达 + 有多进程收集器（PACK_CACHE_MULTI=true 时才有）
+# 2. metrics：/metrics 可达 + 多进程模式真的在聚合（PACK_CACHE_MULTI=true 时才有）
+#    判据是 pid 标签，不是字面量 "multiprocess"：prometheus_client 多进程模式
+#    不输出任何叫 multiprocess 的指标，而是把各 worker 的 gauge 按 pid="N" 分别
+#    导出（见单进程 → 无 pid 标签；多进程 → pid="7"/"8"/"9"/"10"）。
 # ---------------------------------------------------------------------------
 t0=$(now_ms); mbody=$(curl -sS -A "$UA" --max-time 20 "$BASE/metrics" 2>/dev/null); rc=$?
 ms=$(( $(now_ms) - t0 ))
 if [ "$rc" = 0 ] && printf '%s' "$mbody" | grep -q '^# HELP'; then
-    if printf '%s' "$mbody" | grep -qi 'multiprocess'; then
-        rec metrics PASS "$ms" "multiprocess collector found"
+    npid=$(printf '%s\n' "$mbody" | grep -oE 'pid="[0-9]+"' | sort -u | wc -l)
+    if [ "${npid:-0}" -gt 0 ]; then
+        rec metrics PASS "$ms" "多进程聚合：pid 标签 ${npid} 个"
     else
-        rec metrics WARN "$ms" "metrics ok, but no multiprocess collector"
+        rec metrics WARN "$ms" "metrics 可用，但无 pid 标签（PACK_CACHE_MULTI 可能未生效）"
         WARN=$((WARN + 1))
     fi
     printf '%s\n' "$mbody" | grep -iE 'warm|pack_cache|pack_cache_hit' | head -10 \
