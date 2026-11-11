@@ -446,11 +446,15 @@ for item in "${plan[@]}"; do
         fi
         # 逐项子模块耗时：GIT_TRACE2_EVENT 记录每个 clone 子进程的起止时间，
         # 事后解析出 <path>\t<ms>，用于三条腿（git-cdn / gh-proxy / github.com）逐项对照。
+        # TRACE_PERF=1 时再叠加 curl 级 trace：每行带 HH:MM:SS.micro，可把每次
+        # GET info/refs / POST git-upload-pack 的往返单独算出来（含 301 次数）。
+        trace_env=()
+        [ "$TRACE_PERF" = 1 ] && trace_env=(env GIT_TRACE_PERFORMANCE=1 GIT_TRACE_CURL=1 GIT_TRACE_CURL_NO_DATA=1)
         if command -v python3 >/dev/null 2>&1; then
-            GIT_TRACE2_EVENT="$d/trace2.json" GIT_TRACE2_EVENT_NESTING=5 \
+            "${trace_env[@]}" GIT_TRACE2_EVENT="$d/trace2.json" GIT_TRACE2_EVENT_NESTING=5 \
                 timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
         else
-            timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+            "${trace_env[@]}" timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
         fi
     fi
     stop_sampler
@@ -486,12 +490,47 @@ for line in open(sys.argv[1], errors="replace"):
 PY
         log "子模块逐项耗时：$(wc -l <"$RESULTS/sub-times-run$run.tsv" 2>/dev/null || echo 0) 条（sub-times-run$run.tsv）"
     fi
+    # curl 级 trace 汇总：每条 HTTP 请求一行（method / path / 次数 / 总耗时 / 状态码分布），
+    # 用 Send header → Recv header 的时间戳差算往返，FIFO 配对（--jobs 并发下近似）。
+    if [ "$TRACE_PERF" = 1 ] && [ -s "$d/sub.err" ]; then
+        python3 - "$d/sub.err" >"$RESULTS/trace-http-run$run.tsv" 2>/dev/null <<'PY'
+import re, sys
+send = re.compile(r'^\d+:\d+:\d+(?:\.\d+)? .*=> Send header: (GET|POST) (\S+)')
+recv = re.compile(r'^\d+:\d+:\d+(?:\.\d+)? .*<= Recv header: HTTP/1\.1 (\d+)')
+stamp = re.compile(r'^(\d\d):(\d\d):(\d\d(?:\.\d+)?)')
+def sec(h, m, s): return int(h) * 3600 + int(m) * 60 + float(s)
+pend, agg = [], {}
+for line in open(sys.argv[1], errors="replace"):
+    t = stamp.match(line)
+    if not t:
+        continue
+    ts = sec(*t.groups())
+    if "=> Send header:" in line:
+        g = send.match(line)
+        if g:
+            pend.append((ts, g.group(1), g.group(2)))
+    elif "<= Recv header: HTTP/1.1" in line:
+        r = recv.match(line)
+        if r and pend:
+            t0, method, path = pend.pop(0)
+            k = (method, path.split("?")[0])
+            a = agg.setdefault(k, [0, 0.0, {}])
+            a[0] += 1
+            a[1] += max(0.0, (ts - t0) * 1000)
+            a[2][r.group(1)] = a[2].get(r.group(1), 0) + 1
+for (method, path), (n, tot, sts) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
+    print("%s\t%s\t%d\t%.0f\t%s" % (method, path, n, tot,
+          ",".join("%s x%d" % (k, v) for k, v in sorted(sts.items()))))
+PY
+        log "HTTP trace：$(wc -l <"$RESULTS/trace-http-run$run.tsv" 2>/dev/null || echo 0) 类（trace-http-run$run.tsv）"
+    fi
     sub_ms=$(( $(now_ms) - t1 ))
     total_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     sub_mb=$(( ${total_mb:-0} - ${main_mb:-0} ))
     # stderr 留档 + 首行入备注（否则只剩 rc=1 无法定位）
     if [ "$TRACE_PERF" = 1 ]; then
-        [ -s "$d/sub.err" ] && cp "$d/sub.err" "$RESULTS/perf-sub-run$run.txt"
+        # 原始 trace 很大（61 个子模块的 curl 行），只留头部样本，结论看 trace-http-run<N>.tsv
+        [ -s "$d/sub.err" ] && sed -n '1,5000p' "$d/sub.err" >"$RESULTS/perf-sub-run$run.txt"
     else
         [ -s "$d/sub.err" ] && sed -n '1,10p' "$d/sub.err" >"$RESULTS/submodule-err-run$run.txt"
     fi
