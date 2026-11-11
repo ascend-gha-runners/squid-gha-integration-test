@@ -444,9 +444,48 @@ for item in "${plan[@]}"; do
         if [ "$FETCH_JOBS_AUTO" = 1 ]; then
             git_cfg+=(-c submodule.fetchJobs=0 -c fetch.parallel=0)
         fi
-        timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+        # 逐项子模块耗时：GIT_TRACE2_EVENT 记录每个 clone 子进程的起止时间，
+        # 事后解析出 <path>\t<ms>，用于三条腿（git-cdn / gh-proxy / github.com）逐项对照。
+        if command -v python3 >/dev/null 2>&1; then
+            GIT_TRACE2_EVENT="$d/trace2.json" GIT_TRACE2_EVENT_NESTING=5 \
+                timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+        else
+            timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+        fi
     fi
     stop_sampler
+    if [ -s "$d/trace2.json" ]; then
+        python3 - "$d/trace2.json" >"$RESULTS/sub-times-run$run.tsv" 2>/dev/null <<'PY'
+import json, sys
+from datetime import datetime
+stack, rows = {}, []
+for line in open(sys.argv[1], errors="replace"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    sid, ev = e.get("sid"), e.get("event")
+    if ev == "child_start":
+        stack.setdefault(sid, []).append((e.get("child_id"), e.get("time"), e.get("argv") or []))
+    elif ev == "child_exit":
+        for i in range(len(stack.get(sid, [])) - 1, -1, -1):
+            cid, t0, argv = stack[sid][i]
+            if cid == e.get("child_id"):
+                stack[sid].pop(i)
+                try:
+                    ms = int((datetime.fromisoformat(e["time"].replace("Z", "+00:00"))
+                              - datetime.fromisoformat(t0.replace("Z", "+00:00"))).total_seconds() * 1000)
+                except Exception:
+                    break
+                if "--path" in argv:
+                    print("%s\t%d" % (argv[argv.index("--path") + 1], ms))
+                break
+PY
+        log "子模块逐项耗时：$(wc -l <"$RESULTS/sub-times-run$run.tsv" 2>/dev/null || echo 0) 条（sub-times-run$run.tsv）"
+    fi
     sub_ms=$(( $(now_ms) - t1 ))
     total_mb=$(du -sm "$d/pytorch" 2>/dev/null | awk '{print $1}')
     sub_mb=$(( ${total_mb:-0} - ${main_mb:-0} ))
