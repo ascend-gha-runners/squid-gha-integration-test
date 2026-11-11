@@ -236,7 +236,10 @@ par_update_recursive() {  # $1 = 仓库目录（含 .gitmodules）；$2 = 日志
         paths=("${keep[@]}")
         [ "${#paths[@]}" -eq 0 ] && return 0
     fi
-    git -C "$dir" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/"
+    case "$GIT_CDN_BASE" in
+        https://github.com/|http://github.com/) : ;;
+        *) git -C "$dir" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/" ;;
+    esac
     git -C "$dir" submodule init -- "${paths[@]}" >>"$log" 2>&1
     # 分批扇出：每批最多 SUBMODULE_JOBS 个，只 wait 本批的 PID
     # （不能用裸 wait —— 采样器也是个后台作业，会把整轮永久挂住）
@@ -288,7 +291,12 @@ truth=$(truth_sha)
 url="${GIT_CDN_BASE}${REPO}.git"
 # 子模块 URL 是绝对地址（https://github.com/<owner>/<repo>.git），必须经 insteadOf 重写才走 git-cdn。
 # `git -c` 会通过 GIT_CONFIG_PARAMETERS 传给子进程，因此 submodule 递归同样生效。
-insteadof="url.${GIT_CDN_BASE}.insteadOf=https://github.com/"
+# 直连基线（GIT_CDN_BASE=https://github.com/）不需要重写，否则会写成「自己 → 自己」。
+main_cfg=()
+case "$GIT_CDN_BASE" in
+    https://github.com/|http://github.com/) : ;;
+    *) main_cfg=(-c "url.${GIT_CDN_BASE}.insteadOf=https://github.com/") ;;
+esac
 
 log "被测仓库：$REPO（体积 ${size_mb}MB，主仓超时 ${tmo}s，子模块超时 ${SUBMODULE_TIMEOUT}s，并发 ${SUBMODULE_JOBS}）"
 log "git-cdn 基址：$GIT_CDN_BASE；真值 HEAD：${truth:0:9}"
@@ -346,7 +354,7 @@ for item in "${plan[@]}"; do
     # ① 主仓浅取：--no-checkout 只拉对象（纯网络），checkout 单独计时（纯本地落盘）
     #    两者分开才能回答「280s 是网络慢还是写盘慢」
     t0=$(now_ms)
-    timeout "$tmo" git -c "$insteadof" clone -q --depth 1 --no-recurse-submodules --no-checkout \
+    timeout "$tmo" git ${main_cfg[@]+"${main_cfg[@]}"} clone -q --depth 1 --no-recurse-submodules --no-checkout \
         "$url" "$d/pytorch" 2>"$d/main.err"; rc=$?
     main_ms=$(( $(now_ms) - t0 ))
     if [ "$rc" = 124 ]; then
@@ -410,8 +418,12 @@ for item in "${plan[@]}"; do
     fi
     # 注意：--shallow-submodules 是 git clone 的选项，submodule update 不认识（会直接 usage 退出）
     t1=$(now_ms)
-    # clone 下的 insteadOf 需落到仓库配置里，否则子模块（独立进程、独立 repo）看不到
-    git -C "$d/pytorch" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/"
+    # clone 下的 insteadOf 需落到仓库配置里，否则子模块（独立进程、独立 repo）看不到；
+    # 直连基线模式跳过（不写「自己 → 自己」的重写）。
+    case "$GIT_CDN_BASE" in
+        https://github.com/|http://github.com/) : ;;
+        *) git -C "$d/pytorch" config "url.${GIT_CDN_BASE}.insteadOf" "https://github.com/" ;;
+    esac
     : >"$d/sub.err"
     [ "$SAMPLE_CONC" = 1 ] && start_sampler "$RESULTS/conc-run$run.tsv"
     if [ "$SUB_MODE" = par ]; then

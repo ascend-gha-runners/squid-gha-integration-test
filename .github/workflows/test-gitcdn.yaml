@@ -87,6 +87,11 @@ on:
         required: false
         default: '0'
         type: string
+      pytorch_baseline:
+        description: '1 = 用 GitHub 托管 runner（ubuntu-latest）跑同一脚本、直连 github.com，作环境对照基线'
+        required: false
+        default: '0'
+        type: string
 
   pull_request:
     paths:
@@ -258,6 +263,60 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-gitcdn-pytorch-submodule
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  # 环境对照基线（opt-in）：同一脚本、同一档位，但跑在 GitHub 托管 runner 上、
+  # 直连 github.com（不经 git-cdn）。用于区分「命令/调度差异」与「链路差异」：
+  #   - 若本 job 的各档位耗时与集群内接近 → 差异来自调度方式，与环境无关；
+  #   - 若本 job 明显更快且各档位差别小 → 差异来自 git-cdn 链路本身（吞吐/首字节）。
+  pytorch-baseline-github:
+    name: pytorch 克隆基线（GitHub 托管 runner 直连 github.com）
+    if: ${{ inputs.pytorch_baseline == '1' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 打印 git 版本
+        run: git --version
+
+      - name: 直连 github.com 克隆 pytorch 主仓 + 子模块（同脚本、同采样）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CDN_BASE: https://github.com/
+          RUNS: ${{ inputs.pytorch_runs || '1' }}
+          SUBMODULES: ${{ inputs.pytorch_submodules }}
+          JOBS_LADDER: ${{ inputs.pytorch_jobs_ladder }}
+          CLONE_TIMEOUT: ${{ inputs.clone_timeout || '0' }}
+          TRACE_PERF: ${{ inputs.pytorch_trace_perf || '0' }}
+        run: bash test-squid/repro-gitcdn-pytorch-submodule.sh
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## pytorch 克隆基线（GitHub 托管 runner，直连 github.com）"
+            echo "| 轮次 | 阶段 | 耗时(ms) | 体积(MB) | 子模块数 | 结论 | 备注 |"
+            echo "|---|---|---|---|---|---|---|"
+            awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7}' \
+              /tmp/test-squid-results/gitcdn-pytorch/pytorch-submodule.tsv 2>/dev/null \
+              || echo "| - | - | - | - | - | 无结果 | - |"
+            echo
+            echo "### 子模块明细（体积 Top 15）"
+            echo '```'
+            sort -t$'\t' -k4,4nr /tmp/test-squid-results/gitcdn-pytorch/submodules.tsv 2>/dev/null | head -15 \
+              || echo '(无 submodules.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-pytorch-baseline
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
