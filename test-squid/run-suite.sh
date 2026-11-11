@@ -19,8 +19,6 @@
 #                      2026-11-04 gy-006 checkout 事故；独立脚本 repro-gitcdn-unsynced-sha.sh）
 #       gitcdn-rebuild —— git-cdn-rebuild chart 灰度验证（ADR-0015：client_max_size /
 #                      allowfilter / refs-pull 排除 / 浅包缓存；独立脚本 repro-gitcdn-rebuild.sh）
-#       gitcdn-ghproxy —— git-cdn vs gh-proxy 直连克隆对照（同 pod/同仓/同 depth，
-#                      ratio 与 HEAD 一致性；独立脚本 repro-ghproxy-clone-compare.sh）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -2059,17 +2057,8 @@ elif [ "$MODE" = "gitcdn-rebuild" ]; then
     # uploadpack.allowfilter / refs-pull 排除），全部从 HTTP + git 协议侧观测。
     run_timed env-snapshot        "$LAYER" env-snapshot
     run_timed gitcdn-rebuild      "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-rebuild" bash "$SCRIPT_DIR/repro-gitcdn-rebuild.sh"
-elif [ "$MODE" = "gitcdn-ghproxy" ]; then
-    # git-cdn vs gh-proxy 直连克隆对照：git-cdn 的回源上游就是 gh-proxy
-    # （GITSERVER_UPSTREAM=https://gh-proxy.test.osinfra.cn/https://github.com/），
-    # 所以「客户端自己拿 gh-proxy 克隆」是最直接的对照组：同 pod、同仓库、同 depth。
-    run_timed env-snapshot        "$LAYER" env-snapshot
-    run_timed ghproxy-compare     "$LAYER" env RESULTS="$RESULTS_DIR/ghproxy-compare" \
-        REPOS="${GHPROXY_REPOS:-}" ROUNDS="${GHPROXY_ROUNDS:-1}" \
-        SUBMODULES="${GHPROXY_SUBMODULES:-1}" SUB_JOBS="${GHPROXY_SUB_JOBS:-8}" \
-        bash "$SCRIPT_DIR/repro-ghproxy-clone-compare.sh"
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | gitcdn-rebuild | gitcdn-ghproxy）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | gitcdn-rebuild）" >&2
     exit 2
 fi
 
