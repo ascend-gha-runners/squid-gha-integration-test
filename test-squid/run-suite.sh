@@ -2066,6 +2066,7 @@ elif [ "$MODE" = "gitcdn-ghproxy" ]; then
     run_timed env-snapshot        "$LAYER" env-snapshot
     run_timed ghproxy-compare     "$LAYER" env RESULTS="$RESULTS_DIR/ghproxy-compare" \
         REPOS="${GHPROXY_REPOS:-}" ROUNDS="${GHPROXY_ROUNDS:-1}" \
+        SUBMODULES="${GHPROXY_SUBMODULES:-1}" SUB_JOBS="${GHPROXY_SUB_JOBS:-8}" \
         bash "$SCRIPT_DIR/repro-ghproxy-clone-compare.sh"
 else
     echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | gitcdn-rebuild | gitcdn-ghproxy）" >&2

@@ -98,14 +98,19 @@ on:
         default: '0'
         type: string
       ghproxy_compare:
-        description: '1 = 跑 git-cdn vs gh-proxy 直连克隆对照（同一 pod、同一仓库、同一 depth，比耗时与 HEAD）'
+        description: '1 = 跑 git-cdn vs gh-proxy 直连克隆对照（默认 pytorch 主仓 + 全量子模块，比耗时与 HEAD）'
         required: false
         default: '0'
         type: string
       ghproxy_repos:
-        description: '对照仓库（空格/逗号分隔 owner/repo；空 = vllm-project/vllm-ascend triton-lang/triton）'
+        description: '对照仓库（空格/逗号分隔 owner/repo；空 = pytorch/pytorch）'
         required: false
         default: ''
+        type: string
+      ghproxy_submodules:
+        description: '1 = 主仓后跑全量递归子模块（默认）；0 = 只测主仓'
+        required: false
+        default: '1'
         type: string
       ghproxy_rounds:
         description: '对照轮数：1 = 一轮（proxy 先跑）；2 = 再加一轮（cdn 先跑，抵消冷暖偏差）'
@@ -209,15 +214,15 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
-  # git-cdn vs gh-proxy 直连克隆对照（opt-in）：
+  # git-cdn vs gh-proxy 直连克隆对照（opt-in，默认 pytorch/pytorch）：
   # git-cdn 的回源上游就是 gh-proxy，所以「客户端自己拿 gh-proxy 克隆」是最直接的
-  # 对照组：同一 pod、同一仓库、同一 depth，一次跑两条路径，比耗时与 HEAD。
-  # 判定：HEAD 不一致 / cdn 克隆失败 → 红；cdn 慢于 gh-proxy 2 倍以上 → WARN。
+  # 对照组：同一 pod、同一仓库、同一 depth，主仓 + 全量子模块各跑一遍，比耗时与 HEAD。
+  # 判定：HEAD / 子模块个数不一致或 cdn 克隆失败 → 红；cdn 慢于 gh-proxy 2 倍以上 → WARN。
   ghproxy-compare:
     name: git-cdn vs gh-proxy 直连克隆对照
     if: ${{ inputs.ghproxy_compare == '1' }}
     runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
-    timeout-minutes: 40
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -226,6 +231,7 @@ jobs:
       - name: 运行 git-cdn vs gh-proxy 克隆对照
         env:
           GHPROXY_REPOS: ${{ inputs.ghproxy_repos }}
+          GHPROXY_SUBMODULES: ${{ inputs.ghproxy_submodules || '1' }}
           GHPROXY_ROUNDS: ${{ inputs.ghproxy_rounds || '1' }}
         run: bash test-squid/run-suite.sh --mode gitcdn-ghproxy
 
@@ -234,11 +240,11 @@ jobs:
         run: |
           {
             echo "## git-cdn vs gh-proxy 直连克隆对照"
-            echo "| 仓库 | 轮次 | 路径 | 耗时(ms) | 体积(MB) | HEAD | 结论 | 备注 |"
-            echo "|---|---|---|---|---|---|---|---|"
-            awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8}' \
+            echo "| 仓库 | 轮次 | 路径 | 总耗时(ms) | 体积(MB) | HEAD | 子模块数 | 结论 | 备注 |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9}' \
               /tmp/test-squid-results/ghproxy-compare/ghproxy-compare.tsv 2>/dev/null \
-              || echo "| - | - | - | - | - | - | 无结果 | - |"
+              || echo "| - | - | - | - | - | - | - | 无结果 | - |"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: 上传结果
