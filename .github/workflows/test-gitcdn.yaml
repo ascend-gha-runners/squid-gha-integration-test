@@ -92,12 +92,18 @@ on:
         required: false
         default: '0'
         type: string
+      gitcdn_rebuild:
+        description: '1 = 跑 git-cdn-rebuild chart 灰度验证（ADR-0015：client_max_size / allowfilter / refs-pull 排除 / 浅包缓存）'
+        required: false
+        default: '0'
+        type: string
 
   pull_request:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
       - 'test-squid/repro-gitcdn-latest.sh'
       - 'test-squid/repro-gitcdn-pytorch-submodule.sh'
+      - 'test-squid/repro-gitcdn-rebuild.sh'
       - '.github/workflows/test-gitcdn.yaml'
 
 permissions:
@@ -140,6 +146,50 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-gitcdn-unsynced
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  # git-cdn-rebuild chart 灰度验证（ascend-ci-deployment#2567 / ADR-0015）：
+  # 运行时补丁上移到镜像后，四项契约必须仍然成立：
+  #   ① client_max_size 由 env CLIENT_MAX_SIZE_MB 控制（不能回落到 aiohttp 默认 1MB）
+  #   ② 系统 gitconfig 内置 uploadpack.allowfilter（--filter=blob:none 要真裁剪）
+  #   ③ refs/pull/* 不进 mirror（Patch 5）
+  #   ④ 浅包缓存 + 流式转发仍然生效（同仓两次 clone 第二次不慢）
+  gitcdn-rebuild:
+    name: git-cdn-rebuild 灰度验证
+    if: ${{ inputs.gitcdn_rebuild == '1' }}
+    runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 git-cdn-rebuild 灰度验证
+        run: bash test-squid/run-suite.sh --mode gitcdn-rebuild
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## git-cdn-rebuild 灰度验证（ADR-0015）"
+            echo "| 用例 | 结论 | 耗时(ms) | 备注 |"
+            echo "|---|---|---|---|"
+            awk -F'\t' '{printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4}' \
+              /tmp/test-squid-results/gitcdn-rebuild/gitcdn-rebuild.tsv 2>/dev/null \
+              || echo "| - | - | - | 无结果 |"
+            echo
+            echo "### /metrics 中的预热 / 缓存指标（留档）"
+            echo '```'
+            cat /tmp/test-squid-results/gitcdn-rebuild/metrics-warm.txt 2>/dev/null || echo '(无)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-rebuild
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 

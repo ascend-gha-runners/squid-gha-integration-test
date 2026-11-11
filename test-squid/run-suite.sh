@@ -17,6 +17,8 @@
 #                      2026-10-31 pip hash 校验事故，META R22）
 #       gitcdn-unsynced —— git-cdn 无法为未同步 SHA 回源（insteadOf→git-cdn 集群，
 #                      2026-11-04 gy-006 checkout 事故；独立脚本 repro-gitcdn-unsynced-sha.sh）
+#       gitcdn-rebuild —— git-cdn-rebuild chart 灰度验证（ADR-0015：client_max_size /
+#                      allowfilter / refs-pull 排除 / 浅包缓存；独立脚本 repro-gitcdn-rebuild.sh）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -2049,8 +2051,14 @@ elif [ "$MODE" = "gitcdn-unsynced" ]; then
     # 显式传 RESULTS：脚本的证据文件（gitcfg.txt / control.log / target.log）要落在
     # 套件结果目录里才会被 artifact 上传（RESULTS_DIR 未 export 到子进程）
     run_timed gitcdn-unsynced-sha "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-unsynced" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
+elif [ "$MODE" = "gitcdn-rebuild" ]; then
+    # git-cdn-rebuild chart 灰度验证（ascend-ci-deployment#2567 / ADR-0015）：
+    # 校验「运行时补丁上移到镜像」后的四项契约（live / client_max_size /
+    # uploadpack.allowfilter / refs-pull 排除），全部从 HTTP + git 协议侧观测。
+    run_timed env-snapshot        "$LAYER" env-snapshot
+    run_timed gitcdn-rebuild      "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-rebuild" bash "$SCRIPT_DIR/repro-gitcdn-rebuild.sh"
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | gitcdn-rebuild）" >&2
     exit 2
 fi
 
