@@ -276,12 +276,13 @@ probe_refs() {  # 记录 git-cdn 对 info/refs 的缓存类响应头（每轮一
 }
 
 # ---------------------------------------------------------------------------
-# 前置：git-cdn 可达，否则本集群没有实例，记 SKIP（不判红）
+# 前置：克隆基址可达，否则记 SKIP（不判红）
+#   用 git 协议探测，base 无关：git-cdn / gh-proxy / github.com 都适用。
+#   不要用 GET <base>/：gh-proxy 根路径固定 418（反爬），会把基线误判成不可达。
 # ---------------------------------------------------------------------------
-code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$GIT_CDN_BASE" 2>/dev/null) || code="000"
-if [ "$code" != "200" ]; then
-    log "⚠️ git-cdn 不可达（$GIT_CDN_BASE GET=$code）——记 SKIP"
-    printf '0\t-\t0\t-\t-\tSKIP\tgit-cdn-unreachable\n' >>"$TSV"
+if ! timeout 60 git ls-remote --heads "${GIT_CDN_BASE}${REPO}.git" >/dev/null 2>&1; then
+    log "⚠️ 克隆基址不可达（${GIT_CDN_BASE}${REPO}.git，git ls-remote 失败）——记 SKIP"
+    printf '0\t-\t0\t-\t-\tSKIP\tbase-unreachable\n' >>"$TSV"
     exit 2
 fi
 
