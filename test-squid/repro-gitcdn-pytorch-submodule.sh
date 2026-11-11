@@ -280,8 +280,8 @@ probe_refs() {  # 记录 git-cdn 对 info/refs 的缓存类响应头（每轮一
 #   用 git 协议探测，base 无关：git-cdn / gh-proxy / github.com 都适用。
 #   不要用 GET <base>/：gh-proxy 根路径固定 418（反爬），会把基线误判成不可达。
 # ---------------------------------------------------------------------------
-if ! timeout 60 git ls-remote --heads "${GIT_CDN_BASE}${REPO}.git" >/dev/null 2>&1; then
-    log "⚠️ 克隆基址不可达（${GIT_CDN_BASE}${REPO}.git，git ls-remote 失败）——记 SKIP"
+if ! timeout 60 git ls-remote --heads "${GIT_CDN_BASE}${REPO}.git" >/dev/null 2>"$WORK/probe.err"; then
+    log "⚠️ 克隆基址不可达（${GIT_CDN_BASE}${REPO}.git）——记 SKIP；git 报错：$(head -c 200 "$WORK/probe.err" | tr '\n' ' ')"
     printf '0\t-\t0\t-\t-\tSKIP\tbase-unreachable\n' >>"$TSV"
     exit 2
 fi
