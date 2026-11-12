@@ -448,13 +448,15 @@ for item in "${plan[@]}"; do
         # 事后解析出 <path>\t<ms>，用于三条腿（git-cdn / gh-proxy / github.com）逐项对照。
         # TRACE_PERF=1 时再叠加 curl 级 trace：每行带 HH:MM:SS.micro，可把每次
         # GET info/refs / POST git-upload-pack 的往返单独算出来（含 301 次数）。
-        trace_env=()
-        [ "$TRACE_PERF" = 1 ] && trace_env=(env GIT_TRACE_PERFORMANCE=1 GIT_TRACE_CURL=1 GIT_TRACE_CURL_NO_DATA=1)
+        sub_cmd=(timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}")
+        if [ "$TRACE_PERF" = 1 ]; then
+            sub_cmd=(env GIT_TRACE_PERFORMANCE=1 GIT_TRACE_CURL=1 GIT_TRACE_CURL_NO_DATA=1 "${sub_cmd[@]}")
+        fi
         if command -v python3 >/dev/null 2>&1; then
-            "${trace_env[@]}" GIT_TRACE2_EVENT="$d/trace2.json" GIT_TRACE2_EVENT_NESTING=5 \
-                timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+            GIT_TRACE2_EVENT="$d/trace2.json" GIT_TRACE2_EVENT_NESTING=5 \
+                "${sub_cmd[@]}" 2>"$d/sub.err"; rc=$?
         else
-            "${trace_env[@]}" timeout "$SUBMODULE_TIMEOUT" git "${git_cfg[@]}" "${sub_args[@]}" 2>"$d/sub.err"; rc=$?
+            "${sub_cmd[@]}" 2>"$d/sub.err"; rc=$?
         fi
     fi
     stop_sampler
