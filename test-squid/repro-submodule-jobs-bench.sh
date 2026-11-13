@@ -186,7 +186,9 @@ depth_needed() {  # depth_needed <root> <out-tsv> → 打印 n/p50/p90/max/unrea
         { v[NR] = $1 }
         END {
             if (!NR) { print "n=0"; exit }
-            printf "n=%d p50=%d p90=%d max=%d", NR, v[int((NR + 1) / 2)], v[int(NR * 0.9) || 1], v[NR]
+            # 注意：不能写 v[int(NR*0.9) || 1]——awk 里 || 求的是布尔值，会恒取 v[1]
+            p90 = int(NR * 0.9); if (p90 < 1) p90 = 1
+            printf "n=%d p50=%d p90=%d max=%d", NR, v[int((NR + 1) / 2)], v[p90], v[NR]
         }'
     printf " unreachable=%s" "$(awk -F'\t' '$3 < 0' "$out" | wc -l)"
 }
