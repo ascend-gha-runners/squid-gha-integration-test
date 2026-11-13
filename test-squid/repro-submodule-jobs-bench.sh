@@ -93,6 +93,26 @@ trace_summary() {  # trace_summary <tracefile>
     ' "$f" 2>/dev/null
 }
 
+# 正确性校验：每个子模块的 HEAD 必须等于父仓 index 里记录的 gitlink SHA。
+# 只比体积/数量不够——并发写 .git/config 或 URL 重写出错时，
+# 可能 clone 到「另一个仓库的尖端」，体积相近但内容是错的。
+verify_leg() {  # verify_leg <superproject-dir> <out-tsv> → 打印 mismatch 条数
+    local d="$1" out="$2" p pin head url st
+    : >"$out"
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        pin=$(git -C "$d" rev-parse "HEAD:$p" 2>/dev/null || true)
+        head=$(git -C "$d/$p" rev-parse HEAD 2>/dev/null || true)
+        url=$(git -C "$d/$p" ls-remote --get-url origin 2>/dev/null || true)
+        st=OK
+        if [ -z "$pin" ] || [ "$pin" != "$head" ]; then
+            st=MISMATCH
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$p" "$pin" "$head" "$st" "$url" >>"$out"
+    done < <(git -C "$d" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+    awk -F'\t' '$5 != "OK"' "$out" | wc -l
+}
+
 # ---------------------------------------------------------------------------
 # 腿 A：git 原生 --jobs
 # ---------------------------------------------------------------------------
@@ -127,6 +147,7 @@ msA=$(( $(now_ms) - t0 ))
 okA=$(count_done "$WORK/a"); unA=$(count_uninit "$WORK/a")
 conc_stat=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
 trA=$(trace_summary "$WORK/a.log")
+badA=$(verify_leg "$WORK/a" "$WORK/verify-a.tsv")
 if [ "$rcA" -eq 0 ] && [ "$unA" -eq 0 ]; then
     rec git-native-jobs PASS "$msA" "jobs=$JOBS,submodules=$okA/$n_first,conc[$conc_stat],trace[$trA]"
 else
@@ -175,6 +196,7 @@ rcB=$?
 touch "$WORK/stop-b"; wait "$sampler" 2>/dev/null
 msB=$(( $(now_ms) - t0 ))
 okB=$(count_done "$WORK/b"); unB=$(count_uninit "$WORK/b")
+badB=$(verify_leg "$WORK/b" "$WORK/verify-b.tsv")
 concB=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
 if [ "$rcB" -eq 0 ] && [ "$unB" -eq 0 ]; then
     rec manual-parallel PASS "$msB" "jobs=$JOBS,init=${init_ms}ms,submodules=$okB/$n_first,conc[$concB]"
@@ -207,6 +229,11 @@ ratio=$(awk -v a="$msA" -v b="$msB" 'BEGIN{ if (b > 0) printf "%.2f", a / b; els
 rec compare INFO 0 "git-native/manual=${ratio}x（<1 表示 git 原生更快；ORDER=$ORDER，先跑者刷新缓存）"
 if [ "$okA" != "$okB" ]; then
     rec parity FAIL 0 "git-native=$okA manual=$okB 子模块数量不一致"
+fi
+if [ "${badA:-0}" -ne 0 ] || [ "${badB:-0}" -ne 0 ]; then
+    rec verify FAIL 0 "子模块 HEAD 与父仓 gitlink 不一致：git-native=$badA manual=$badB（详见 verify-a/b.tsv）"
+else
+    rec verify PASS 0 "两腿 $okA/$okB 个子模块 HEAD 均等于父仓 gitlink（内容与 pin 一致）"
 fi
 
 # ---------------------------------------------------------------------------
