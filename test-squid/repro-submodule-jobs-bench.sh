@@ -142,6 +142,55 @@ verify_tree() {  # verify_tree <root> <out-tsv> → 打印 mismatch 条数
     awk -F'\t' '$5 != "OK"' "$out" | wc -l
 }
 
+# depth 需求统计：回答「用 --depth N 能不能在本地命中 pin」。
+# 判据与 git 一致——`--depth N` 隐含 --single-branch，clone 只拿默认分支尖端往下 N 个
+# commit，所以 N 必须 >= pin 到默认分支尖端的距离，否则仍会退回串行补 fetch。
+# 只在腿 D 的全克隆上算（那里 refs/remotes 齐全），纯本地 rev-list，零网络。
+depth_needed() {  # depth_needed <root> <out-tsv> → 打印 n/p50/p90/max/unreachable
+    local root="$1" out="$2" r p pin def d dmin n br
+    : >"$out"
+    echo "$root" >"$WORK/.dcur"
+    while [ -s "$WORK/.dcur" ]; do
+        : >"$WORK/.dnext"
+        while IFS= read -r r; do
+            [ -e "$r/.git" ] || continue
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                pin=$(git -C "$r" rev-parse "HEAD:$p" 2>/dev/null || true)
+                def=$(git -C "$r/$p" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)
+                d=-1
+                # 主口径：pin 在 origin 默认分支上 → 距离 = 需要的 depth
+                if [ -n "$pin" ] && [ -n "$def" ] &&
+                   git -C "$r/$p" merge-base --is-ancestor "$pin" "$def" 2>/dev/null; then
+                    d=$(git -C "$r/$p" rev-list --count "$pin..$def" 2>/dev/null || echo -1)
+                fi
+                # 备用口径：pin 不在默认分支 → 取包含它的任意 origin 分支的最小距离
+                if [ "$d" = "-1" ] && [ -n "$pin" ]; then
+                    dmin=""
+                    while IFS= read -r br; do
+                        [ -n "$br" ] || continue
+                        n=$(git -C "$r/$p" rev-list --count "$pin..$br" 2>/dev/null || true)
+                        [ -n "$n" ] || continue
+                        if [ -z "$dmin" ] || [ "$n" -lt "$dmin" ]; then dmin="$n"; fi
+                    done < <(git -C "$r/$p" for-each-ref --contains "$pin" --format='%(refname)' refs/remotes 2>/dev/null)
+                    [ -n "$dmin" ] && d="$dmin"
+                fi
+                [ -n "$d" ] || d=-1
+                printf '%s\t%s\t%s\n' "$r" "$p" "$d" >>"$out"
+                echo "$r/$p" >>"$WORK/.dnext"
+            done < <(git -C "$r" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+        done <"$WORK/.dcur"
+        mv "$WORK/.dnext" "$WORK/.dcur"
+    done
+    awk -F'\t' '$3 >= 0 {print $3}' "$out" | sort -n | awk '
+        { v[NR] = $1 }
+        END {
+            if (!NR) { print "n=0"; exit }
+            printf "n=%d p50=%d p90=%d max=%d", NR, v[int((NR + 1) / 2)], v[int(NR * 0.9) || 1], v[NR]
+        }'
+    printf " unreachable=%s" "$(awk -F'\t' '$3 < 0' "$out" | wc -l)"
+}
+
 # ---------------------------------------------------------------------------
 # 腿 A：git 原生 --jobs
 # ---------------------------------------------------------------------------
@@ -289,6 +338,9 @@ nD=$(git -C "$WORK/d" submodule status --recursive 2>/dev/null | wc -l)
 unD=$(git -C "$WORK/d" submodule status --recursive 2>/dev/null | grep -c '^-' || true)
 badD=$(verify_tree "$WORK/d" "$RESULTS/verify-d.tsv")
 trD=$(trace_summary "$RESULTS/d.log")
+# 全克隆里算「--depth N 需要多大才能本地命中 pin」，逐项落 depth-needed.tsv
+dnD=$(depth_needed "$WORK/d" "$RESULTS/depth-needed.tsv")
+rec depth-needed INFO 0 "$dnD（单位=commit 数；unreachable=不在任何 origin 分支上，任何 depth 都要按 SHA 补 fetch；逐项见 depth-needed.tsv）"
 if [ "$rcD" -eq 0 ] && [ "${unD:-1}" -eq 0 ] && [ "${badD:-1}" -eq 0 ]; then
     rec git-native-recursive-full PASS "$msD" "jobs=$JOBS,instances=$nD,uninit=0,verify-mismatch=0,trace[$trD]"
 else
