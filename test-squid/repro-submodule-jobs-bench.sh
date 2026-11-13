@@ -92,6 +92,7 @@ if ! prep "$WORK/b"; then
     rec manual-parallel FAIL 0 "主仓克隆失败"
     echo "FAIL" >"$RESULTS/verdict"; exit 1
 fi
+n_first=$(first_layer "$WORK/b" | wc -l)
 
 init_ms=0
 if [ "$n_first" -gt 0 ]; then
