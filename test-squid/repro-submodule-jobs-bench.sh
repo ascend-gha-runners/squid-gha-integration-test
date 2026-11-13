@@ -278,17 +278,22 @@ done
 size_a=$(du -sm "$WORK/a" 2>/dev/null | awk '{print $1}')
 size_b=$(du -sm "$WORK/b" 2>/dev/null | awk '{print $1}')
 size_c=$(du -sm "$WORK/c" 2>/dev/null | awk '{print $1}')
-rec size INFO 0 "git-native=${size_a}MB manual=${size_b}MB recursive=${size_c}MB"
-
-ratio=$(awk -v a="$msA" -v b="$msB" 'BEGIN{ if (b > 0) printf "%.2f", a / b; else print "n/a" }')
-rec compare INFO 0 "git-native/manual=${ratio}x（<1 表示 git 原生更快；ORDER=$ORDER，先跑者刷新缓存）"
-if [ "$okA" != "$okB" ]; then
-    rec parity FAIL 0 "git-native=$okA manual=$okB 子模块数量不一致"
+# A/B 是诊断对照，只在两腿都跑过时输出，避免 ORDER=c 时打出误导性的空值
+if [ "$msA" -gt 0 ] && [ "$msB" -gt 0 ]; then
+    rec size INFO 0 "git-native=${size_a}MB manual=${size_b}MB"
+    ratio=$(awk -v a="$msA" -v b="$msB" 'BEGIN{ if (b > 0) printf "%.2f", a / b; else print "n/a" }')
+    rec compare INFO 0 "git-native/manual=${ratio}x（<1 表示 git 原生更快；ORDER=$ORDER，先跑者刷新缓存）"
+    if [ "$okA" != "$okB" ]; then
+        rec parity FAIL 0 "git-native=$okA manual=$okB 子模块数量不一致"
+    fi
+    if [ "${badA:-0}" -ne 0 ] || [ "${badB:-0}" -ne 0 ]; then
+        rec verify FAIL 0 "子模块 HEAD 与父仓 gitlink 不一致：git-native=$badA manual=$badB（详见 verify-a/b.tsv）"
+    else
+        rec verify PASS 0 "两腿 $okA/$okB 个子模块 HEAD 均等于父仓 gitlink（内容与 pin 一致）"
+    fi
 fi
-if [ "${badA:-0}" -ne 0 ] || [ "${badB:-0}" -ne 0 ]; then
-    rec verify FAIL 0 "子模块 HEAD 与父仓 gitlink 不一致：git-native=$badA manual=$badB（详见 verify-a/b.tsv）"
-else
-    rec verify PASS 0 "两腿 $okA/$okB 个子模块 HEAD 均等于父仓 gitlink（内容与 pin 一致）"
+if [ "$msC" -gt 0 ]; then
+    rec size-recursive INFO 0 "recursive=${size_c}MB"
 fi
 
 # ---------------------------------------------------------------------------
