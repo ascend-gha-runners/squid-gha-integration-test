@@ -46,6 +46,8 @@ if ! git -c protocol.version=2 ls-remote --heads "$BASE/$REPO.git" >/dev/null 2>
 fi
 
 rec env INFO 0 "git=$(git --version | awk '{print $3}'),submodule.fetchJobs=$(git config --get submodule.fetchJobs || echo unset),fetch.parallel=$(git config --get fetch.parallel || echo unset)"
+# 任何 ORDER 子集都要能用（set -u 下未跑过的腿不能是未绑定变量）
+msA=0; msB=0; msC=0; okA=0; okB=0; okC=0; badA=0; badB=0; badC=0
 
 prep() {  # prep <dir>
     rm -rf "$1"
@@ -110,6 +112,31 @@ verify_leg() {  # verify_leg <superproject-dir> <out-tsv> → 打印 mismatch �
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$p" "$pin" "$head" "$st" "$url" >>"$out"
     done < <(git -C "$d" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+    awk -F'\t' '$5 != "OK"' "$out" | wc -l
+}
+
+# 递归校验：按层遍历全部子模块，比对每个 HEAD 与其**父仓**记录的 gitlink。
+# 未初始化的目录 head 为空 → 判 MISMATCH，可用于证明递归确实拉全了。
+verify_tree() {  # verify_tree <root> <out-tsv> → 打印 mismatch 条数
+    local root="$1" out="$2" r p pin head st
+    : >"$out"
+    echo "$root" >"$WORK/.vcur"
+    while [ -s "$WORK/.vcur" ]; do
+        : >"$WORK/.vnext"
+        while IFS= read -r r; do
+            [ -e "$r/.git" ] || continue
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                pin=$(git -C "$r" rev-parse "HEAD:$p" 2>/dev/null || true)
+                head=$(git -C "$r/$p" rev-parse HEAD 2>/dev/null || true)
+                st=OK
+                if [ -z "$pin" ] || [ "$pin" != "$head" ]; then st=MISMATCH; fi
+                printf '%s\t%s\t%s\t%s\t%s\n' "$r" "$p" "$pin" "$head" "$st" >>"$out"
+                echo "$r/$p" >>"$WORK/.vnext"
+            done < <(git -C "$r" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+        done <"$WORK/.vcur"
+        mv "$WORK/.vnext" "$WORK/.vcur"
+    done
     awk -F'\t' '$5 != "OK"' "$out" | wc -l
 }
 
@@ -206,6 +233,32 @@ fi
 }
 
 # ---------------------------------------------------------------------------
+# 腿 C：git 原生 --recursive --jobs（验证「一条命令最简单」方案的代价）
+#   上游实现：每层并行 clone，但递归是深度优先、逐子模块串行。
+# ---------------------------------------------------------------------------
+leg_c() {
+log "腿 C：git submodule update --init --recursive --depth 1 --jobs $JOBS"
+if ! prep "$WORK/c"; then
+    log "❌ 主仓克隆失败：$(head -c 160 "$WORK/c.err" | tr '\n' ' ')"
+    rec git-native-recursive FAIL 0 "主仓克隆失败"
+    echo "FAIL" >"$RESULTS/verdict"; exit 1
+fi
+t0=$(now_ms)
+git -C "$WORK/c" -c protocol.version=2 submodule update --init --recursive --depth 1 --jobs "$JOBS" \
+    >"$WORK/c.log" 2>&1
+rcC=$?
+msC=$(( $(now_ms) - t0 ))
+nC=$(git -C "$WORK/c" submodule status --recursive 2>/dev/null | wc -l)
+unC=$(git -C "$WORK/c" submodule status --recursive 2>/dev/null | grep -c '^-' || true)
+badC=$(verify_tree "$WORK/c" "$RESULTS/verify-c.tsv")
+if [ "$rcC" -eq 0 ] && [ "${unC:-1}" -eq 0 ] && [ "${badC:-1}" -eq 0 ]; then
+    rec git-native-recursive PASS "$msC" "jobs=$JOBS,instances=$nC,uninit=0,verify-mismatch=0"
+else
+    rec git-native-recursive FAIL "$msC" "rc=$rcC,instances=$nC,uninit=${unC:-?},verify-mismatch=${badC:-?},log=$(tail -c 160 "$WORK/c.log" | tr '\n' ' ')"
+fi
+}
+
+# ---------------------------------------------------------------------------
 # 执行顺序：ORDER=a,b（默认）或 b,a —— 用来把「谁先跑谁把缓存焐热」的偏差对调
 # ---------------------------------------------------------------------------
 ORDER="${ORDER:-a,b}"
@@ -214,6 +267,7 @@ for leg in ${ORDER//,/ }; do
     case "$leg" in
         a) leg_a ;;
         b) leg_b ;;
+        c) leg_c ;;
         *) log "⚠️ 未知腿 $leg，忽略" ;;
     esac
 done
@@ -223,7 +277,8 @@ done
 # ---------------------------------------------------------------------------
 size_a=$(du -sm "$WORK/a" 2>/dev/null | awk '{print $1}')
 size_b=$(du -sm "$WORK/b" 2>/dev/null | awk '{print $1}')
-rec size INFO 0 "git-native=${size_a}MB manual=${size_b}MB"
+size_c=$(du -sm "$WORK/c" 2>/dev/null | awk '{print $1}')
+rec size INFO 0 "git-native=${size_a}MB manual=${size_b}MB recursive=${size_c}MB"
 
 ratio=$(awk -v a="$msA" -v b="$msB" 'BEGIN{ if (b > 0) printf "%.2f", a / b; else print "n/a" }')
 rec compare INFO 0 "git-native/manual=${ratio}x（<1 表示 git 原生更快；ORDER=$ORDER，先跑者刷新缓存）"
