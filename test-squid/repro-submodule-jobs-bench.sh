@@ -45,6 +45,8 @@ if ! git -c protocol.version=2 ls-remote --heads "$BASE/$REPO.git" >/dev/null 2>
     exit 2
 fi
 
+rec env INFO 0 "git=$(git --version | awk '{print $3}'),submodule.fetchJobs=$(git config --get submodule.fetchJobs || echo unset),fetch.parallel=$(git config --get fetch.parallel || echo unset)"
+
 prep() {  # prep <dir>
     rm -rf "$1"
     git -c protocol.version=2 clone --quiet --depth 1 "$BASE/$REPO.git" "$1" 2>"$1.err" || return 1
@@ -70,15 +72,26 @@ if ! prep "$WORK/a"; then
 fi
 n_first=$(first_layer "$WORK/a" | wc -l)
 t0=$(now_ms)
+# 并发采样：统计 git 子进程（clone/fetch/index-pack）的瞬时并发度，
+# 用来回答「--jobs 32 到底有没有真的起 32 路」
+conc="$WORK/conc-a.txt"; : >"$conc"; rm -f "$WORK/stop-a"
+( while [ ! -f "$WORK/stop-a" ]; do
+      n=$(ps -eo args 2>/dev/null | grep -cE '^git(-upload-pack)? (clone|fetch|index-pack)' || true)
+      printf '%s\n' "${n:-0}" >>"$conc"
+      sleep 0.2
+  done ) &
+sampler=$!
 git -C "$WORK/a" -c protocol.version=2 submodule update --init --depth 1 --jobs "$JOBS" \
     >"$WORK/a.log" 2>&1
 rcA=$?
+touch "$WORK/stop-a"; wait "$sampler" 2>/dev/null
 msA=$(( $(now_ms) - t0 ))
 okA=$(count_done "$WORK/a"); unA=$(count_uninit "$WORK/a")
+conc_stat=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
 if [ "$rcA" -eq 0 ] && [ "$unA" -eq 0 ]; then
-    rec git-native-jobs PASS "$msA" "jobs=$JOBS,submodules=$okA/$n_first"
+    rec git-native-jobs PASS "$msA" "jobs=$JOBS,submodules=$okA/$n_first,conc[$conc_stat]"
 else
-    rec git-native-jobs FAIL "$msA" "rc=$rcA,uninit=$unA/$n_first,log=$(tail -c 160 "$WORK/a.log" | tr '\n' ' ')"
+    rec git-native-jobs FAIL "$msA" "rc=$rcA,uninit=$unA/$n_first,conc[$conc_stat],log=$(tail -c 160 "$WORK/a.log" | tr '\n' ' ')"
 fi
 }
 
@@ -102,6 +115,13 @@ if [ "$n_first" -gt 0 ]; then
 fi
 
 t0=$(now_ms)
+conc="$WORK/conc-b.txt"; : >"$conc"; rm -f "$WORK/stop-b"
+( while [ ! -f "$WORK/stop-b" ]; do
+      n=$(ps -eo args 2>/dev/null | grep -cE '^git(-upload-pack)? (clone|fetch|index-pack)' || true)
+      printf '%s\n' "${n:-0}" >>"$conc"
+      sleep 0.2
+  done ) &
+sampler=$!
 first_layer "$WORK/b" | xargs -P "$JOBS" -I{} bash -c '
     d="$1"; p="$2"; out="$3"
     s=$(date +%s%3N)
@@ -113,12 +133,14 @@ first_layer "$WORK/b" | xargs -P "$JOBS" -I{} bash -c '
     exit "$rc"
 ' _ "$WORK/b" {} "$MANUAL_TSV"
 rcB=$?
+touch "$WORK/stop-b"; wait "$sampler" 2>/dev/null
 msB=$(( $(now_ms) - t0 ))
 okB=$(count_done "$WORK/b"); unB=$(count_uninit "$WORK/b")
+concB=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
 if [ "$rcB" -eq 0 ] && [ "$unB" -eq 0 ]; then
-    rec manual-parallel PASS "$msB" "jobs=$JOBS,init=${init_ms}ms,submodules=$okB/$n_first"
+    rec manual-parallel PASS "$msB" "jobs=$JOBS,init=${init_ms}ms,submodules=$okB/$n_first,conc[$concB]"
 else
-    rec manual-parallel FAIL "$msB" "rc=$rcB,uninit=$unB/$n_first"
+    rec manual-parallel FAIL "$msB" "rc=$rcB,uninit=$unB/$n_first,conc[$concB]"
 fi
 }
 
