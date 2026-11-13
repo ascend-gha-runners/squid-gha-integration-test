@@ -147,7 +147,7 @@ msA=$(( $(now_ms) - t0 ))
 okA=$(count_done "$WORK/a"); unA=$(count_uninit "$WORK/a")
 conc_stat=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
 trA=$(trace_summary "$WORK/a.log")
-badA=$(verify_leg "$WORK/a" "$WORK/verify-a.tsv")
+badA=$(verify_leg "$WORK/a" "$RESULTS/verify-a.tsv")
 if [ "$rcA" -eq 0 ] && [ "$unA" -eq 0 ]; then
     rec git-native-jobs PASS "$msA" "jobs=$JOBS,submodules=$okA/$n_first,conc[$conc_stat],trace[$trA]"
 else
@@ -196,7 +196,7 @@ rcB=$?
 touch "$WORK/stop-b"; wait "$sampler" 2>/dev/null
 msB=$(( $(now_ms) - t0 ))
 okB=$(count_done "$WORK/b"); unB=$(count_uninit "$WORK/b")
-badB=$(verify_leg "$WORK/b" "$WORK/verify-b.tsv")
+badB=$(verify_leg "$WORK/b" "$RESULTS/verify-b.tsv")
 concB=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
 if [ "$rcB" -eq 0 ] && [ "$unB" -eq 0 ]; then
     rec manual-parallel PASS "$msB" "jobs=$JOBS,init=${init_ms}ms,submodules=$okB/$n_first,conc[$concB]"
