@@ -244,9 +244,11 @@ if ! prep "$WORK/c"; then
     echo "FAIL" >"$RESULTS/verdict"; exit 1
 fi
 t0=$(now_ms)
-git -C "$WORK/c" -c protocol.version=2 submodule update --init --recursive --depth 1 --jobs "$JOBS" \
-    >"$WORK/c.log" 2>&1
-rcC=$?
+# --progress 强制输出克隆进度（非 tty 下 git 默认静默）；tee 让日志实时进 Actions
+# 并落到 $RESULTS，随 artifact 一起上传（之前只写 $WORK/c.log，既看不见也不上传）
+git -C "$WORK/c" -c protocol.version=2 submodule update --init --recursive --depth 1 \
+    --progress --jobs "$JOBS" 2>&1 | tee "$RESULTS/c.log"
+rcC=${PIPESTATUS[0]}
 msC=$(( $(now_ms) - t0 ))
 nC=$(git -C "$WORK/c" submodule status --recursive 2>/dev/null | wc -l)
 unC=$(git -C "$WORK/c" submodule status --recursive 2>/dev/null | grep -c '^-' || true)
@@ -254,7 +256,7 @@ badC=$(verify_tree "$WORK/c" "$RESULTS/verify-c.tsv")
 if [ "$rcC" -eq 0 ] && [ "${unC:-1}" -eq 0 ] && [ "${badC:-1}" -eq 0 ]; then
     rec git-native-recursive PASS "$msC" "jobs=$JOBS,instances=$nC,uninit=0,verify-mismatch=0"
 else
-    rec git-native-recursive FAIL "$msC" "rc=$rcC,instances=$nC,uninit=${unC:-?},verify-mismatch=${badC:-?},log=$(tail -c 160 "$WORK/c.log" | tr '\n' ' ')"
+    rec git-native-recursive FAIL "$msC" "rc=$rcC,instances=$nC,uninit=${unC:-?},verify-mismatch=${badC:-?},log=$(tail -c 160 "$RESULTS/c.log" | tr '\n' ' ')"
 fi
 }
 
