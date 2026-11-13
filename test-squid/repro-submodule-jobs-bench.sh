@@ -60,6 +60,39 @@ first_layer() {  # first_layer <dir> → 每行一个第一层子模块路径
 count_uninit() { git -C "$1" submodule status 2>/dev/null | grep -c '^-'; }
 count_done()   { git -C "$1" submodule status 2>/dev/null | grep -vc '^-'; }
 
+# 从 GIT_TRACE_PERFORMANCE 的 stderr 里按子命令归类，并给出首末时间戳的跨度。
+# 目的：验证「clone 集中在开头、fetch 铺满后半段」——即 --jobs 只并行 clone 段。
+# 行格式：03:19:49.864991 trace.c:420  performance: 6.315115 s: git command: 'git' 'clone' ...
+trace_summary() {  # trace_summary <tracefile>
+    local f="$1"
+    [ -s "$f" ] || { echo "no-trace"; return; }
+    awk '
+        /performance: [0-9.]+ s:/ {
+            ts = $1
+            dur = $0; sub(/.*performance: /, "", dur); sub(/ s:.*/, "", dur)
+            cmd = $0; sub(/.*git command: /, "", cmd)
+            name = "other"
+            if (cmd ~ /index-pack/)      name = "index-pack"
+            else if (cmd ~ /clone/)      name = "clone"   # clone 带 --no-checkout，含 checkout，必须先判 clone
+            else if (cmd ~ /checkout/)   name = "checkout"
+            else if (cmd ~ /fetch/)      name = "fetch"
+            else if (cmd ~ /rev-list/)   name = "rev-list"
+            n[name]++; t[name] += dur
+            split(ts, a, ":"); sec = a[1] * 3600 + a[2] * 60 + a[3]
+            if (!(name in lo) || sec < lo[name]) lo[name] = sec
+            if (!(name in hi) || sec > hi[name]) hi[name] = sec
+        }
+        END {
+            printf "clone=%d/%.1fs(span=%.1fs) fetch=%d/%.1fs(span=%.1fs) checkout=%d/%.1fs rev-list=%d/%.1fs index-pack=%d/%.1fs",
+                n["clone"], t["clone"], (("clone" in hi) ? hi["clone"] - lo["clone"] : 0),
+                n["fetch"], t["fetch"], (("fetch" in hi) ? hi["fetch"] - lo["fetch"] : 0),
+                n["checkout"], t["checkout"],
+                n["rev-list"], t["rev-list"],
+                n["index-pack"], t["index-pack"]
+        }
+    ' "$f" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # 腿 A：git 原生 --jobs
 # ---------------------------------------------------------------------------
@@ -72,26 +105,32 @@ if ! prep "$WORK/a"; then
 fi
 n_first=$(first_layer "$WORK/a" | wc -l)
 t0=$(now_ms)
-# 并发采样：统计 git 子进程（clone/fetch/index-pack）的瞬时并发度，
-# 用来回答「--jobs 32 到底有没有真的起 32 路」
+# 并发采样：统计 git 网络子进程的瞬时并发度，用来回答「--jobs 32 到底有没有起 32 路」
+# 进程名形如：/usr/lib/git-core/git clone ... / git-remote-https ... / git index-pack ...
+count_git_net() {
+    ps -eo args= 2>/dev/null |
+        grep -E '(^|/)(git|git-remote-https|git-remote-http|git-upload-pack|git-index-pack)[^ ]* .*(clone|fetch|index-pack|remote-https|remote-http|upload-pack)' |
+        grep -vc 'grep' || true
+}
 conc="$WORK/conc-a.txt"; : >"$conc"; rm -f "$WORK/stop-a"
 ( while [ ! -f "$WORK/stop-a" ]; do
-      n=$(ps -eo args 2>/dev/null | grep -cE '^git(-upload-pack)? (clone|fetch|index-pack)' || true)
+      n=$(count_git_net)
       printf '%s\n' "${n:-0}" >>"$conc"
       sleep 0.2
   done ) &
 sampler=$!
-git -C "$WORK/a" -c protocol.version=2 submodule update --init --depth 1 --jobs "$JOBS" \
+GIT_TRACE_PERFORMANCE=1 git -C "$WORK/a" -c protocol.version=2 submodule update --init --depth 1 --jobs "$JOBS" \
     >"$WORK/a.log" 2>&1
 rcA=$?
 touch "$WORK/stop-a"; wait "$sampler" 2>/dev/null
 msA=$(( $(now_ms) - t0 ))
 okA=$(count_done "$WORK/a"); unA=$(count_uninit "$WORK/a")
 conc_stat=$(awk '{s+=$1; if($1>m)m=$1; if($1>0)c++} END{printf "mean=%.2f max=%d busy=%d/%d", (NR?s/NR:0), m, c, NR}' "$conc" 2>/dev/null)
+trA=$(trace_summary "$WORK/a.log")
 if [ "$rcA" -eq 0 ] && [ "$unA" -eq 0 ]; then
-    rec git-native-jobs PASS "$msA" "jobs=$JOBS,submodules=$okA/$n_first,conc[$conc_stat]"
+    rec git-native-jobs PASS "$msA" "jobs=$JOBS,submodules=$okA/$n_first,conc[$conc_stat],trace[$trA]"
 else
-    rec git-native-jobs FAIL "$msA" "rc=$rcA,uninit=$unA/$n_first,conc[$conc_stat],log=$(tail -c 160 "$WORK/a.log" | tr '\n' ' ')"
+    rec git-native-jobs FAIL "$msA" "rc=$rcA,uninit=$unA/$n_first,conc[$conc_stat],trace[$trA],log=$(tail -c 160 "$WORK/a.log" | tr '\n' ' ')"
 fi
 }
 
@@ -117,7 +156,7 @@ fi
 t0=$(now_ms)
 conc="$WORK/conc-b.txt"; : >"$conc"; rm -f "$WORK/stop-b"
 ( while [ ! -f "$WORK/stop-b" ]; do
-      n=$(ps -eo args 2>/dev/null | grep -cE '^git(-upload-pack)? (clone|fetch|index-pack)' || true)
+      n=$(count_git_net)
       printf '%s\n' "${n:-0}" >>"$conc"
       sleep 0.2
   done ) &
