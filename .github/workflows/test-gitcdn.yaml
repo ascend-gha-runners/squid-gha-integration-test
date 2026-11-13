@@ -104,6 +104,12 @@ on:
         default: '0'
         type: string
 
+      subjobs_order:
+        description: '两条腿的执行顺序：a,b（原生先跑）或 b,a（手动先跑，用于对调缓存预热偏差）'
+        required: false
+        default: 'a,b'
+        type: string
+
   pull_request:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
@@ -341,6 +347,7 @@ jobs:
         env:
           JOBS: '32'
           WORK: /tmp/subjobs-bench
+          ORDER: ${{ inputs.subjobs_order || 'a,b' }}
         run: bash test-squid/repro-submodule-jobs-bench.sh
 
       - name: 写入 Step Summary

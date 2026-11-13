@@ -62,6 +62,7 @@ count_done()   { git -C "$1" submodule status 2>/dev/null | grep -vc '^-'; }
 # 腿 A：git 原生 --jobs
 # ---------------------------------------------------------------------------
 log "腿 A：git submodule update --init --depth 1 --jobs $JOBS（第一层，不带 --recursive）"
+leg_a() {
 if ! prep "$WORK/a"; then
     log "❌ 主仓克隆失败：$(head -c 160 "$WORK/a.err" | tr '\n' ' ')"
     rec git-natives-jobs FAIL 0 "主仓克隆失败"
@@ -79,10 +80,12 @@ if [ "$rcA" -eq 0 ] && [ "$unA" -eq 0 ]; then
 else
     rec git-native-jobs FAIL "$msA" "rc=$rcA,uninit=$unA/$n_first,log=$(tail -c 160 "$WORK/a.log" | tr '\n' ' ')"
 fi
+}
 
 # ---------------------------------------------------------------------------
 # 腿 B：手动 32 并发（跨路径 xargs -P）
 # ---------------------------------------------------------------------------
+leg_b() {
 log "腿 B：init 串行 + xargs -P $JOBS 逐路径 submodule update"
 if ! prep "$WORK/b"; then
     log "❌ 主仓克隆失败：$(head -c 160 "$WORK/b.err" | tr '\n' ' ')"
@@ -116,6 +119,20 @@ if [ "$rcB" -eq 0 ] && [ "$unB" -eq 0 ]; then
 else
     rec manual-parallel FAIL "$msB" "rc=$rcB,uninit=$unB/$n_first"
 fi
+}
+
+# ---------------------------------------------------------------------------
+# 执行顺序：ORDER=a,b（默认）或 b,a —— 用来把「谁先跑谁把缓存焐热」的偏差对调
+# ---------------------------------------------------------------------------
+ORDER="${ORDER:-a,b}"
+log "执行顺序：$ORDER（先跑的腿会预热 git-cdn 的 pack cache，务必对调再跑一轮对照）"
+for leg in ${ORDER//,/ }; do
+    case "$leg" in
+        a) leg_a ;;
+        b) leg_b ;;
+        *) log "⚠️ 未知腿 $leg，忽略" ;;
+    esac
+done
 
 # ---------------------------------------------------------------------------
 # 对照：体积应基本一致（证明两腿拉的是同样内容）
@@ -125,8 +142,7 @@ size_b=$(du -sm "$WORK/b" 2>/dev/null | awk '{print $1}')
 rec size INFO 0 "git-native=${size_a}MB manual=${size_b}MB"
 
 ratio=$(awk -v a="$msA" -v b="$msB" 'BEGIN{ if (b > 0) printf "%.2f", a / b; else print "n/a" }')
-rec compare INFO 0 "git-native/manual=${ratio}x（<1 表示 git 原生更快）"
-
+rec compare INFO 0 "git-native/manual=${ratio}x（<1 表示 git 原生更快；ORDER=$ORDER，先跑者刷新缓存）"
 if [ "$okA" != "$okB" ]; then
     rec parity FAIL 0 "git-native=$okA manual=$okB 子模块数量不一致"
 fi
