@@ -105,7 +105,7 @@ on:
         type: string
 
       subjobs_order:
-        description: '两条腿的执行顺序：a,b（原生先跑）或 b,a（手动先跑，用于对调缓存预热偏差）'
+        description: '执行哪些腿及顺序：a,b（原生 vs 手动）/ b,a / c（--recursive --depth 1）/ d（--recursive 不浅克隆）/ c,d'
         required: false
         default: 'a,b'
         type: string
@@ -330,9 +330,11 @@ jobs:
           if-no-files-found: warn
 
   # 第一层子模块扇出对照（opt-in）：验证 git 原生 --jobs 是否真的把第一层跑满。
-  # 同主仓、同基址、同 --depth 1，只改「谁负责扇出」：
-  #   A = git submodule update --jobs 32（不带 --recursive）
-  #   B = init 串行 + xargs -P 32 逐路径 update
+  # 同主仓、同基址，只改被测变量：
+  #   A = git submodule update --jobs 32（第一层，不带 --recursive）
+  #   B = init 串行 + xargs -P 32 逐路径 update（第一层）
+  #   C = update --recursive --depth 1 --jobs 32（一条命令）
+  #   D = 同 C 但子模块不浅克隆（验证串行补 fetch 段是否消失、体积代价多少）
   subjobs-bench:
     name: 子模块扇出对照（--jobs 32 vs 手动 32 并发）
     if: ${{ inputs.subjobs_bench == '1' }}

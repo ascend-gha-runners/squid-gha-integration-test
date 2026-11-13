@@ -6,9 +6,11 @@
 #   腿 A：git submodule update --init --depth 1 --jobs 32（不带 --recursive）
 #   腿 B：git submodule init（串行写 .git/config）+ xargs -P 32 每个路径单独
 #         git submodule update --init --depth 1 -- <path>
+#   腿 C：git submodule update --init --recursive --depth 1 --jobs 32（一条命令）
+#   腿 D：同 C 但**去掉 --depth 1** —— 子模块取全历史，pin 从默认分支可达，
+#         串行补 fetch 段应整段消失，验证「不加外部脚本也能快」这条路
 #
-# 两条腿都：同一主仓、同一 git-cdn 基址、同一 insteadOf 重写、同一 --depth 1，
-# 只改「谁负责扇出」。
+# 各腿都：同一主仓、同一 git-cdn 基址、同一 insteadOf 重写，只改被测变量。
 #
 # 判定：任一条腿残留未初始化子模块（'-' 前缀）、或两腿子模块数量不一致 → FAIL；
 #       基址不可达 → SKIP（退出码 2）。
@@ -47,7 +49,7 @@ fi
 
 rec env INFO 0 "git=$(git --version | awk '{print $3}'),submodule.fetchJobs=$(git config --get submodule.fetchJobs || echo unset),fetch.parallel=$(git config --get fetch.parallel || echo unset)"
 # 任何 ORDER 子集都要能用（set -u 下未跑过的腿不能是未绑定变量）
-msA=0; msB=0; msC=0; okA=0; okB=0; okC=0; badA=0; badB=0; badC=0
+msA=0; msB=0; msC=0; msD=0; okA=0; okB=0; okC=0; okD=0; badA=0; badB=0; badC=0; badD=0
 
 prep() {  # prep <dir>
     rm -rf "$1"
@@ -261,6 +263,40 @@ fi
 }
 
 # ---------------------------------------------------------------------------
+# 腿 D：同 C，但子模块不浅克隆（去掉 --depth 1）
+#   动机：C 的串行段来自 is_tip_reachable 在 depth-1 里查不到 pin，于是逐个
+#   串行补 fetch。全历史 clone 后 pin 通常落在默认分支上 → rev-list 直接可达
+#   → 串行 fetch 段消失，git 自己的 --jobs 就能把扇出跑满，不需要外部扇出。
+#   代价是体积，所以 D 同时记 size 与 trace 里的 fetch 次数作证据。
+# ---------------------------------------------------------------------------
+leg_d() {
+log "腿 D：git submodule update --init --recursive --jobs $JOBS（子模块不浅克隆）"
+if ! prep "$WORK/d"; then
+    log "❌ 主仓克隆失败：$(head -c 160 "$WORK/d.err" | tr '\n' ' ')"
+    rec git-native-recursive-full FAIL 0 "主仓克隆失败"
+    echo "FAIL" >"$RESULTS/verdict"; exit 1
+fi
+t0=$(now_ms)
+# GIT_TRACE_PERFORMANCE 的 trace 行照常落 d.log（artifact 可查），但不刷 Actions：
+# grep 只过滤 stdout 展示，文件里保留完整证据供 trace_summary 统计 fetch 次数。
+GIT_TRACE_PERFORMANCE=1 git -C "$WORK/d" -c protocol.version=2 submodule update --init --recursive \
+    --progress --jobs "$JOBS" 2>&1 \
+  | tee "$RESULTS/d.log" \
+  | grep --line-buffered -v 'trace\.c:'
+rcD=${PIPESTATUS[0]}
+msD=$(( $(now_ms) - t0 ))
+nD=$(git -C "$WORK/d" submodule status --recursive 2>/dev/null | wc -l)
+unD=$(git -C "$WORK/d" submodule status --recursive 2>/dev/null | grep -c '^-' || true)
+badD=$(verify_tree "$WORK/d" "$RESULTS/verify-d.tsv")
+trD=$(trace_summary "$RESULTS/d.log")
+if [ "$rcD" -eq 0 ] && [ "${unD:-1}" -eq 0 ] && [ "${badD:-1}" -eq 0 ]; then
+    rec git-native-recursive-full PASS "$msD" "jobs=$JOBS,instances=$nD,uninit=0,verify-mismatch=0,trace[$trD]"
+else
+    rec git-native-recursive-full FAIL "$msD" "rc=$rcD,instances=$nD,uninit=${unD:-?},verify-mismatch=${badD:-?},trace[$trD],log=$(tail -c 160 "$RESULTS/d.log" | tr '\n' ' ')"
+fi
+}
+
+# ---------------------------------------------------------------------------
 # 执行顺序：ORDER=a,b（默认）或 b,a —— 用来把「谁先跑谁把缓存焐热」的偏差对调
 # ---------------------------------------------------------------------------
 ORDER="${ORDER:-a,b}"
@@ -270,6 +306,7 @@ for leg in ${ORDER//,/ }; do
         a) leg_a ;;
         b) leg_b ;;
         c) leg_c ;;
+        d) leg_d ;;
         *) log "⚠️ 未知腿 $leg，忽略" ;;
     esac
 done
@@ -280,6 +317,7 @@ done
 size_a=$(du -sm "$WORK/a" 2>/dev/null | awk '{print $1}')
 size_b=$(du -sm "$WORK/b" 2>/dev/null | awk '{print $1}')
 size_c=$(du -sm "$WORK/c" 2>/dev/null | awk '{print $1}')
+size_d=$(du -sm "$WORK/d" 2>/dev/null | awk '{print $1}')
 # A/B 是诊断对照，只在两腿都跑过时输出，避免 ORDER=c 时打出误导性的空值
 if [ "$msA" -gt 0 ] && [ "$msB" -gt 0 ]; then
     rec size INFO 0 "git-native=${size_a}MB manual=${size_b}MB"
@@ -296,6 +334,13 @@ if [ "$msA" -gt 0 ] && [ "$msB" -gt 0 ]; then
 fi
 if [ "$msC" -gt 0 ]; then
     rec size-recursive INFO 0 "recursive=${size_c}MB"
+fi
+# C vs D：唯一变量是「子模块是否浅克隆」，用来量「去掉 --depth 1」换来的时间 / 体积
+if [ "$msC" -gt 0 ] && [ "$msD" -gt 0 ]; then
+    rec size-recursive-full INFO 0 "recursive-full=${size_d}MB"
+    r_dc=$(awk -v c="$msC" -v d="$msD" 'BEGIN{ if (c > 0) printf "%.2f", d / c; else print "n/a" }')
+    s_dc=$(awk -v c="${size_c:-0}" -v d="${size_d:-0}" 'BEGIN{ if (c > 0) printf "%.2f", d / c; else print "n/a" }')
+    rec compare-depth INFO 0 "full/depth1: time=${r_dc}x size=${s_dc}x（<1 表示去 depth 更快/更小）"
 fi
 
 # ---------------------------------------------------------------------------
