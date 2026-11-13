@@ -98,12 +98,19 @@ on:
         default: '0'
         type: string
 
+      subjobs_bench:
+        description: '1 = 第一层子模块对照：git 原生 update --jobs 32 vs 手动 xargs -P 32 逐路径并发'
+        required: false
+        default: '0'
+        type: string
+
   pull_request:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
       - 'test-squid/repro-gitcdn-latest.sh'
       - 'test-squid/repro-gitcdn-pytorch-submodule.sh'
       - 'test-squid/repro-gitcdn-rebuild.sh'
+      - 'test-squid/repro-submodule-jobs-bench.sh'
       - '.github/workflows/test-gitcdn.yaml'
 
 permissions:
@@ -314,6 +321,52 @@ jobs:
         with:
           name: test-gitcdn-pytorch-submodule
           path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  # 第一层子模块扇出对照（opt-in）：验证 git 原生 --jobs 是否真的把第一层跑满。
+  # 同主仓、同基址、同 --depth 1，只改「谁负责扇出」：
+  #   A = git submodule update --jobs 32（不带 --recursive）
+  #   B = init 串行 + xargs -P 32 逐路径 update
+  subjobs-bench:
+    name: 子模块扇出对照（--jobs 32 vs 手动 32 并发）
+    if: ${{ inputs.subjobs_bench == '1' }}
+    runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行第一层子模块扇出对照
+        env:
+          JOBS: '32'
+          WORK: /tmp/subjobs-bench
+        run: bash test-squid/repro-submodule-jobs-bench.sh
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## 子模块扇出对照：git --jobs 32 vs 手动 32 并发"
+            echo "| 用例 | 结论 | 耗时(ms) | 明细 |"
+            echo "|---|---|---|---|"
+            awk -F'\t' '{printf "| %s | %s | %s | %s |\n", $1,$2,$3,$4}' \
+              /tmp/test-squid-results/subjobs/subjobs.tsv 2>/dev/null \
+              || echo "| - | - | - | 无结果 |"
+            echo
+            echo "### 手动并发逐项耗时（Top 15，ms）"
+            echo '```'
+            sort -t$'\t' -k3,3nr /tmp/test-squid-results/subjobs/sub-times-manual.tsv 2>/dev/null | head -15 \
+              || echo '(无 sub-times-manual.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-subjobs-bench
+          path: /tmp/test-squid-results/subjobs/
           if-no-files-found: warn
 
   # 环境对照基线（opt-in）：同一脚本、同一档位，但跑在 GitHub 托管 runner 上、
