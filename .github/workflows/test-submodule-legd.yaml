@@ -1,0 +1,252 @@
+name: test-submodule-legd
+
+# =============================================================================
+# 单腿 D：子模块「不浅克隆」的全历史扇出（来自 gitcdn-pose-clone 的
+# repro-submodule-jobs-bench.sh，只保留腿 D，逻辑内联在 step 里，不依赖 test-squid/）
+#
+# 回答一个问题：主仓 --depth 1，子模块**去掉 --depth 1** 全历史克隆时，
+#   ① 串行补 fetch 段是否消失（trace 里 fetch 次数/跨度）
+#   ② 体积代价多少
+#   ③ 每个子模块 HEAD 是否仍等于父仓记录的 gitlink（内容正确性）
+#   ④ 若改用 --depth N，N 至少多大才能本地命中 pin（depth-needed 统计）
+#
+# 姿势：显式打集群内 git-cdn 基址（<base>/<repo>.git），并给主仓写
+#   url.<base>/.insteadOf https://github.com/ ，子模块也有 git-cdn。
+#
+# 判定：主仓克隆/子模块更新失败、残留未初始化子模块、HEAD≠gitlink → 红；
+#       基址不可达（该集群无 git-cdn）→ SKIP（不判红，写进 Summary）。
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签 JSON 数组（数组内多标签为 AND 关系）'
+        required: false
+        default: '["linux-amd64-cpu-2", "gy-006"]'
+        type: string
+      repo:
+        description: '主仓（owner/repo）'
+        required: false
+        default: 'pytorch/pytorch'
+        type: string
+      jobs:
+        description: '子模块并发数'
+        required: false
+        default: '32'
+        type: string
+      git_cdn_base:
+        description: 'git-cdn 基址（末尾不要带仓库路径）'
+        required: false
+        default: 'http://git-cdn-service.git-cdn.svc.cluster.local:8000/'
+        type: string
+      timeout_minutes:
+        description: 'job 超时（pytorch 全历史子模块建议 >=90）'
+        required: false
+        default: '90'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  submodule-legd:
+    name: 腿 D·子模块不浅克隆
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '90') }}
+    steps:
+      - name: 腿 D 执行（内联）
+        env:
+          RUNNER_LABEL: ${{ inputs.runner }}
+          REPO: ${{ inputs.repo }}
+          JOBS: ${{ inputs.jobs }}
+          GIT_CDN_BASE: ${{ inputs.git_cdn_base }}
+        run: |
+          set -uo pipefail
+          BASE="${GIT_CDN_BASE%/}"
+          WORK=/tmp/legd
+          RESULTS=/tmp/legd-results
+          rm -rf "$WORK"; mkdir -p "$WORK" "$RESULTS"
+          TSV="$RESULTS/legd.tsv"; : >"$TSV"
+          log() { echo "[$(date '+%H:%M:%S')] $*"; }
+          now_ms() { date +%s%3N; }
+          rec() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$TSV"; }
+
+          log "runner=$RUNNER_LABEL repo=$REPO jobs=$JOBS base=$BASE"
+          log "proxy: HTTP_PROXY=${HTTP_PROXY:-<空>} HTTPS_PROXY=${HTTPS_PROXY:-<空>}"
+
+          # 0. 基址可达性：该集群没有 git-cdn 时记 SKIP（不判红）
+          if ! git -c protocol.version=2 ls-remote --heads "$BASE/$REPO.git" >/dev/null 2>"$RESULTS/reach.err"; then
+            log "⚠️ 基址不可达（$BASE/$REPO.git）——记 SKIP：$(head -c 200 "$RESULTS/reach.err" | tr '\n' ' ')"
+            rec reachable SKIP 0 "unreachable $BASE"
+            echo SKIP >"$RESULTS/verdict"
+            exit 0
+          fi
+          rec reachable PASS 0 "$BASE/$REPO.git"
+          rec env INFO 0 "git=$(git --version | awk '{print $3}'),submodule.fetchJobs=$(git config --get submodule.fetchJobs || echo unset),fetch.parallel=$(git config --get fetch.parallel || echo unset)"
+
+          # 1. 主仓浅取 + 把子模块 github URL 重写到 git-cdn
+          rm -rf "$WORK/d"
+          if ! git -c protocol.version=2 clone --quiet --depth 1 "$BASE/$REPO.git" "$WORK/d" 2>"$WORK/d.err"; then
+            log "❌ 主仓克隆失败：$(head -c 200 "$WORK/d.err" | tr '\n' ' ')"
+            rec clone FAIL 0 "主仓克隆失败：$(head -c 160 "$WORK/d.err" | tr '\n' ' ')"
+            echo FAIL >"$RESULTS/verdict"
+            exit 1
+          fi
+          git -C "$WORK/d" config url."$BASE/".insteadOf https://github.com/
+
+          # 2. 腿 D：子模块不浅克隆（去掉 --depth 1），保留 trace 证据
+          t0=$(now_ms)
+          GIT_TRACE_PERFORMANCE=1 git -C "$WORK/d" -c protocol.version=2 \
+            submodule update --init --recursive --progress --jobs "$JOBS" 2>&1 \
+            | tee "$RESULTS/d.log" \
+            | grep --line-buffered -v 'trace\.c:'
+          rcD=${PIPESTATUS[0]}
+          msD=$(( $(now_ms) - t0 ))
+          nD=$(git -C "$WORK/d" submodule status --recursive 2>/dev/null | wc -l)
+          unD=$(git -C "$WORK/d" submodule status --recursive 2>/dev/null | grep -c '^-' || true)
+
+          # 3. 正确性：每层子模块 HEAD 必须等于父仓 index 里的 gitlink
+          verify_tree() {
+            local root="$1" out="$2" r p pin head st
+            : >"$out"
+            echo "$root" >"$WORK/.vcur"
+            while [ -s "$WORK/.vcur" ]; do
+              : >"$WORK/.vnext"
+              while IFS= read -r r; do
+                [ -e "$r/.git" ] || continue
+                while IFS= read -r p; do
+                  [ -n "$p" ] || continue
+                  pin=$(git -C "$r" rev-parse "HEAD:$p" 2>/dev/null || true)
+                  head=$(git -C "$r/$p" rev-parse HEAD 2>/dev/null || true)
+                  st=OK
+                  if [ -z "$pin" ] || [ "$pin" != "$head" ]; then st=MISMATCH; fi
+                  printf '%s\t%s\t%s\t%s\t%s\n' "$r" "$p" "$pin" "$head" "$st" >>"$out"
+                  echo "$r/$p" >>"$WORK/.vnext"
+                done < <(git -C "$r" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+              done <"$WORK/.vcur"
+              mv "$WORK/.vnext" "$WORK/.vcur"
+            done
+            awk -F'\t' '$5 != "OK"' "$out" | wc -l
+          }
+          badD=$(verify_tree "$WORK/d" "$RESULTS/verify-d.tsv")
+
+          # 4. depth 需求统计：--depth N 要在本地命中 pin，N 至少多大
+          depth_needed() {
+            local root="$1" out="$2" r p pin def d dmin n br
+            : >"$out"
+            echo "$root" >"$WORK/.dcur"
+            while [ -s "$WORK/.dcur" ]; do
+              : >"$WORK/.dnext"
+              while IFS= read -r r; do
+                [ -e "$r/.git" ] || continue
+                while IFS= read -r p; do
+                  [ -n "$p" ] || continue
+                  pin=$(git -C "$r" rev-parse "HEAD:$p" 2>/dev/null || true)
+                  def=$(git -C "$r/$p" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)
+                  d=-1
+                  if [ -n "$pin" ] && [ -n "$def" ] &&
+                     git -C "$r/$p" merge-base --is-ancestor "$pin" "$def" 2>/dev/null; then
+                    d=$(git -C "$r/$p" rev-list --count "$pin..$def" 2>/dev/null || echo -1)
+                  fi
+                  if [ "$d" = "-1" ] && [ -n "$pin" ]; then
+                    dmin=""
+                    while IFS= read -r br; do
+                      [ -n "$br" ] || continue
+                      n=$(git -C "$r/$p" rev-list --count "$pin..$br" 2>/dev/null || true)
+                      [ -n "$n" ] || continue
+                      if [ -z "$dmin" ] || [ "$n" -lt "$dmin" ]; then dmin="$n"; fi
+                    done < <(git -C "$r/$p" for-each-ref --contains "$pin" --format='%(refname)' refs/remotes 2>/dev/null)
+                    [ -n "$dmin" ] && d="$dmin"
+                  fi
+                  [ -n "$d" ] || d=-1
+                  printf '%s\t%s\t%s\n' "$r" "$p" "$d" >>"$out"
+                  echo "$r/$p" >>"$WORK/.dnext"
+                done < <(git -C "$r" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+              done <"$WORK/.dcur"
+              mv "$WORK/.dnext" "$WORK/.dcur"
+            done
+            awk -F'\t' '$3 >= 0 {print $3}' "$out" | sort -n | awk '
+              { v[NR] = $1 }
+              END {
+                if (!NR) { print "n=0"; exit }
+                p90 = int(NR * 0.9); if (p90 < 1) p90 = 1
+                printf "n=%d p50=%d p90=%d max=%d", NR, v[int((NR + 1) / 2)], v[p90], v[NR]
+              }'
+            printf " unreachable=%s" "$(awk -F'\t' '$3 < 0' "$out" | wc -l)"
+          }
+          dnD=$(depth_needed "$WORK/d" "$RESULTS/depth-needed.tsv")
+
+          # 5. trace 归类：clone/fetch/checkout/index-pack 的次数、总耗时与时间跨度
+          trD=$(awk '
+            /performance: [0-9.]+ s:/ {
+              ts = $1
+              dur = $0; sub(/.*performance: /, "", dur); sub(/ s:.*/, "", dur)
+              cmd = $0; sub(/.*git command: /, "", cmd)
+              name = "other"
+              if (cmd ~ /index-pack/)      name = "index-pack"
+              else if (cmd ~ /clone/)      name = "clone"
+              else if (cmd ~ /checkout/)   name = "checkout"
+              else if (cmd ~ /fetch/)      name = "fetch"
+              else if (cmd ~ /rev-list/)   name = "rev-list"
+              n[name]++; t[name] += dur
+              split(ts, a, ":"); sec = a[1] * 3600 + a[2] * 60 + a[3]
+              if (!(name in lo) || sec < lo[name]) lo[name] = sec
+              if (!(name in hi) || sec > hi[name]) hi[name] = sec
+            }
+            END {
+              printf "clone=%d/%.1fs(span=%.1fs) fetch=%d/%.1fs(span=%.1fs) checkout=%d/%.1fs rev-list=%d/%.1fs index-pack=%d/%.1fs",
+                n["clone"], t["clone"], (("clone" in hi) ? hi["clone"] - lo["clone"] : 0),
+                n["fetch"], t["fetch"], (("fetch" in hi) ? hi["fetch"] - lo["fetch"] : 0),
+                n["checkout"], t["checkout"],
+                n["rev-list"], t["rev-list"],
+                n["index-pack"], t["index-pack"]
+            }
+          ' "$RESULTS/d.log" 2>/dev/null || echo "no-trace")
+          sizeD=$(du -sm "$WORK/d" 2>/dev/null | awk '{print $1}')
+
+          rec depth-needed INFO 0 "$dnD（单位=commit 数；unreachable=不在任何 origin 分支上）"
+          if [ "$rcD" -eq 0 ] && [ "${unD:-1}" -eq 0 ] && [ "${badD:-1}" -eq 0 ]; then
+            rec git-native-recursive-full PASS "$msD" "jobs=$JOBS,instances=$nD,uninit=0,verify-mismatch=0,size=${sizeD}MB,trace[$trD]"
+            echo PASS >"$RESULTS/verdict"
+          else
+            rec git-native-recursive-full FAIL "$msD" "rc=$rcD,instances=$nD,uninit=${unD:-?},verify-mismatch=${badD:-?},size=${sizeD}MB,trace[$trD],log=$(tail -c 200 "$RESULTS/d.log" | tr '\n' ' ')"
+            echo FAIL >"$RESULTS/verdict"
+            exit 1
+          fi
+
+      - name: 写入 Summary
+        if: always()
+        run: |
+          {
+            echo "## 腿 D：子模块不浅克隆（$(date '+%F %T')）"
+            echo "runner: \`${{ inputs.runner }}\` / repo: \`${{ inputs.repo }}\` / jobs: \`${{ inputs.jobs }}\`"
+            echo
+            if [ -f /tmp/legd-results/verdict ]; then
+              echo "**结论：$(cat /tmp/legd-results/verdict)**"
+            else
+              echo "**结论：无 verdict（step 未产出结果）**"
+            fi
+            echo
+            echo '```'
+            cat /tmp/legd-results/legd.tsv 2>/dev/null || echo '(无 legd.tsv)'
+            echo '```'
+            echo
+            echo "### 子模块 HEAD 校验（非 OK 行）"
+            echo '```'
+            awk -F'\t' '$5 != "OK"' /tmp/legd-results/verify-d.tsv 2>/dev/null | head -20 || true
+            echo '```'
+            echo
+            echo "### depth 需求逐项（前 20 行）"
+            echo '```'
+            head -20 /tmp/legd-results/depth-needed.tsv 2>/dev/null || echo '(无 depth-needed.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-submodule-legd
+          path: /tmp/legd-results/
+          if-no-files-found: warn
