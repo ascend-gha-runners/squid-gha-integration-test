@@ -83,6 +83,10 @@ cached_served() {  # 该响应是否由缓存对象作答（HIT / fwd=stale / Va
     grep -qiE '^cache-status:.*(hit|fwd=stale|detail=mismatch)|^x-cache-lookup:.*hit' "$1" 2>/dev/null
 }
 
+cache_hit_strict() {  # 严格的缓存命中：Cache-Status 里出现独立 hit 段（detail=mismatch 不算）
+    grep -qiE '^cache-status:[^;]*;hit(;|$)|^x-cache-lookup:.*hit' "$1" 2>/dev/null
+}
+
 # 源站直连取 Release 真值（cache-buster 双保险：no-cache 头 + 沿途绕开）
 fetch_release() {
     local code
@@ -129,7 +133,7 @@ byhash_case() {
         return 2
     fi
 
-    local sha url i hcode st age bytes body_sha ok200=0 hit=0 miss=0 other=0 trace=0 mismatch=0
+    local sha url i hcode st age bytes body_sha ok200=0 hit=0 miss=0 other=0 trace=0 mismatch=0 vmismatch=0
     local hits_lines=""
 
     resolve_byhash || return $?
@@ -163,9 +167,13 @@ byhash_case() {
         squid_trace "$results/byhash-$i.hdr" && trace=$((trace + 1))
         if [ "$hcode" != "200" ]; then
             other=$((other + 1))
-        elif cached_served "$results/byhash-$i.hdr"; then
+        elif cache_hit_strict "$results/byhash-$i.hdr"; then
             hit=$((hit + 1))
             hits_lines="${hits_lines}    第 $i 发 HIT：Cache-Status=$st Age=${age:-N/A}"$'\n'
+        elif echo "$st" | grep -qiE 'detail=mismatch'; then
+            # 缓存里有条目但 Vary/编码变体不一致 → 本次仍回源，不算命中
+            vmismatch=$((vmismatch + 1))
+            echo "  ⚠️ 第 $i 发：Cache-Status=$st（变体不一致 → 仍回源，不计 HIT）"
         elif echo "$st" | grep -qiE 'miss|no-cache'; then
             # miss=none;no-cache 是 squid 判「不可缓存」的标记：cache deny 命中即此形态
             miss=$((miss + 1))
@@ -189,10 +197,16 @@ byhash_case() {
     fi
 
     if [ "$hit" -gt 0 ]; then
-        echo "✅ by-hash 索引可缓存：${SHOTS} 发中 ${hit} 发 HIT（MISS ${miss} / 其它 ${other}），且响应体 sha256 与文件名一致"
+        echo "✅ by-hash 索引可缓存：${SHOTS} 发中 ${hit} 发 HIT（MISS ${miss} / 变体不一致 ${vmismatch} / 其它 ${other}），且响应体 sha256 与文件名一致"
         echo "   HIT 明细（Age 为源站年龄 + 缓存年龄，>3600s 属预期，靠 immutable_file 豁免不进陈旧指标）："
         printf '%s' "$hits_lines"
         return 0
+    fi
+
+    if [ "$vmismatch" -gt 0 ]; then
+        echo "❌ by-hash 在缓存里有条目，但 ${vmismatch} 发都因 Vary/编码变体不一致而回源（0 发命中）"
+        echo "   含义：缓存键被 Accept-Encoding 等变体拆散，长缓存收益不成立；核对 squid.conf 的 Vary 处理"
+        return 1
     fi
 
     if [ "$STRICT" = "1" ]; then
