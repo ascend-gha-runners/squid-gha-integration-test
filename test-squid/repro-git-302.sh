@@ -53,6 +53,9 @@
 #                          空=跳过 D 段
 #   GIT302_GITCODE_PROBE_REPO  D 段 curl 契约的 gitcode 仓库
 #                          （默认 https://gitcode.com/cann/catlass.git）
+#   GIT302_SUBMODULE_REPOS E 段：空格分隔的仓库列表，每个都做
+#                          shallow clone + submodule update（如
+#                          "https://gitcode.com/ascend/pytorch.git ..."）；空=跳过
 #   GIT302_PUSH_URL        push 目标（空=SKIP，需凭据）
 #   GIT302_TIMEOUT         单条 git 命令超时秒数（默认 300）
 #
@@ -76,6 +79,7 @@ GIT302_SUBMODULE_REPO="${GIT302_SUBMODULE_REPO:-https://github.com/jqlang/jq.git
 GIT302_LFS_REPO="${GIT302_LFS_REPO:-https://github.com/honeynet/forensic_challenges.git}"
 GIT302_GITCODE_REPO="${GIT302_GITCODE_REPO:-}"
 GIT302_GITCODE_PROBE_REPO="${GIT302_GITCODE_PROBE_REPO:-https://gitcode.com/cann/catlass.git}"
+GIT302_SUBMODULE_REPOS="${GIT302_SUBMODULE_REPOS:-}"
 GIT302_PUSH_URL="${GIT302_PUSH_URL:-}"
 GIT302_TIMEOUT="${GIT302_TIMEOUT:-300}"
 
@@ -494,6 +498,55 @@ else
     skip_case "gitcode-probe-upload-pack" "未设置 GIT302_GITCODE_REPO"
     skip_case "vllm-ascend-clone" "未设置 GIT302_GITCODE_REPO"
     skip_case "vllm-ascend-submodule-catlass" "未设置 GIT302_GITCODE_REPO"
+fi
+
+# ===========================================================================
+# E. 任意仓库 × 子模块矩阵（opt-in：GIT302_SUBMODULE_REPOS 空格分隔）
+#    每个仓库：① shallow + blob:none 只取顶层并断言其 302；② read-tree 后
+#    submodule update --init --depth 1，子模块各自 URL 再走一次 302。
+#    gitcode.com 仓库断言跳 git-cdn-gitcode，其余断言跳 git-cdn。
+# ===========================================================================
+if [ -n "$GIT302_SUBMODULE_REPOS" ]; then
+    echo "===== E. 仓库 × 子模块矩阵 ====="
+    idx=0
+    for repo in $GIT302_SUBMODULE_REPOS; do
+        idx=$((idx+1))
+        slug=$(printf '%s' "$repo" | sed -E 's#https?://##; s#[^A-Za-z0-9]+#-#g; s#^-##; s#-$##')
+        case "$repo" in
+            *gitcode.com*) re='redirecting to .*git-cdn-gitcode' ;;
+            *)             re='redirecting to .*git-cdn' ;;
+        esac
+        dir="$WORK/matrix-$idx"
+        rm -rf "$dir"
+        if ! run_git_case_re "m$idx-$slug-clone" "$WORK" "$re" bash -c '
+            git clone --depth 1 --filter=blob:none --no-checkout "$1" "$2" &&
+            git -C "$2" read-tree HEAD
+        ' _ "$repo" "$dir"; then
+            continue
+        fi
+        if ! git -C "$dir" cat-file -e HEAD:.gitmodules 2>/dev/null; then
+            skip_case "m$idx-$slug-submodules" "$repo 无 .gitmodules"
+            continue
+        fi
+        if run_git_case_re "m$idx-$slug-submodules" "$dir" "$re" \
+            git submodule update --init --depth 1; then
+            subs=$(git -C "$dir" submodule status 2>/dev/null)
+            total=0; pop=0
+            if [ -n "$subs" ]; then
+                total=$(printf '%s\n' "$subs" | grep -c . || true)
+                pop=$(printf '%s\n' "$subs" | grep -vc '^-' || true)
+            fi
+            if [ "$pop" -gt 0 ]; then
+                phase_row "m$idx-$slug-populated" 0 0
+                mark "m$idx-$slug-populated" PASS "$repo: $pop/$total 个子模块已落盘"
+            else
+                phase_row "m$idx-$slug-populated" 0 1
+                mark "m$idx-$slug-populated" FAIL "$repo: 无子模块落盘（$total 个注册）"
+            fi
+        fi
+    done
+else
+    skip_case "repo-matrix" "未设置 GIT302_SUBMODULE_REPOS"
 fi
 
 # ===========================================================================

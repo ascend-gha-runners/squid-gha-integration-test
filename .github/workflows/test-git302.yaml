@@ -21,6 +21,9 @@ name: test-git302
 #      真实形态：vllm-ascend 的子模块 catlass 指向 gitcode.com；顶层走 github
 #      302 → git-cdn，子模块必须 302 → git-cdn-gitcode（curl 契约 + 真实
 #      submodule update 双断言）
+#   E. 仓库 × 子模块矩阵（opt-in：submodule_repos 非空）
+#      对每个仓库做 shallow clone + submodule update，逐跳断言 302 目标
+#      （gitcode.com → git-cdn-gitcode，其余 → git-cdn）
 #
 # 前置：runner 已注入 squid（HTTP(S)_PROXY + CA）。脚本用
 #       GIT_CONFIG_GLOBAL/SYSTEM=/dev/null 剥掉宿主机 insteadOf，
@@ -59,6 +62,11 @@ on:
         required: false
         default: ''
         type: string
+      submodule_repos:
+        description: 'GIT302_SUBMODULE_REPOS 空格分隔的仓库矩阵，每个都 shallow clone + submodule update（空=跳过）'
+        required: false
+        default: ''
+        type: string
       timeout:
         description: '单条 git 命令超时秒数'
         required: false
@@ -88,6 +96,7 @@ jobs:
           GIT302_SUBMODULE_REPO: ${{ github.event_name == 'pull_request' && 'https://github.com/jqlang/jq.git' || inputs.submodule_repo }}
           GIT302_LFS_REPO: ${{ github.event_name == 'pull_request' && 'https://github.com/honeynet/forensic_challenges.git' || inputs.lfs_repo }}
           GIT302_GITCODE_REPO: ${{ github.event_name == 'pull_request' && '' || inputs.gitcode_repo }}
+          GIT302_SUBMODULE_REPOS: ${{ github.event_name == 'pull_request' && '' || inputs.submodule_repos }}
           GIT302_TIMEOUT: ${{ github.event_name == 'pull_request' && '300' || inputs.timeout }}
         run: bash test-squid/repro-git-302.sh
 
