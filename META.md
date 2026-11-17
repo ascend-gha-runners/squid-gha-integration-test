@@ -236,6 +236,34 @@ squid 不是黑盒。每个 case 必须声明自己打哪个功能面：
   证据链改为「客户端 rc + git-cdn pod 日志（fetch_sha / still missing after
   SHA fetch 行）」。只在容器层之外单列 job（opt-in `gitcdn_unsynced=1`）。
 
+- **R24 apt by-hash 索引可长缓存**（2026-11-17，源自 #2443 / PR #2746，chart
+  0.1.31）：`repo.huaweicloud.com` 的 `/ubuntu(-ports)/dists/<suite>/<component>/
+  by-hash/<alg>/<hash>` 位于 `cache deny hc_repo mutable_meta_with_by_hash` 的
+  覆盖范围内，被当作可变索引拒绝缓存——而它其实是**内容寻址的不可变对象**
+  （文件名就是内容 sha256，源站 `Cache-Control: max-age=1296000`/15 天 + ETag，
+  实测 `Expires` 为过去时间）。代价是每次 `apt-get update` 全量回源：cn12-001
+  单副本 81 分钟 592 次请求 / 28 个对象 / 560 次 `TCP_MISS` / 1.8 GiB。修复为
+  三件套：① `acl by_hash urlpath_regex -i /by-hash/` + 同一条 deny 内
+  `!by_hash` 排除例外（不依赖 cache 行序，也不放开其它可变索引）；②
+  `refresh_pattern .../dists/.*/by-hash/ 10080 100% 525600 ignore-reload
+  override-expire ignore-no-store` 排在 apt 前缀短 TTL 规则**之前**
+  （refresh_pattern 首匹配生效）；③ `immutable_file` 追加 `/by-hash/`
+  （长缓存后 Age 必然 >3600s，避免正常命中点亮 `squid_stale_index_hit_total`）。
+  判定两面（真实域，域级 ACL 不能用 mock 主机复现）：① **by-hash 必须可缓存**——
+  从 Release 的 SHA256 段解析哈希拼 URL，经 squid 连打 6 发须出现 `hit`，
+  且每发 200 的响应体 sha256 必须等于文件名哈希（内容寻址完整性；全 MISS 说明
+  deny 例外未落地，判红）；② **负样本**——同一 dists 下非 by-hash 的 `InRelease`
+  与原 `Packages.gz` 带 run 唯一 query 连打 3 发，不得由缓存作答（证明 `!by_hash`
+  例外没有把可变索引一起放开）。**长缓存前提另有独立取证**：不可变性由内容寻址
+  保证，脚本用四路互证镜像确实遵守该契约——源站真值两遍（不同 cache-buster）+
+  条件请求 `If-None-Match`（用首遍 ETag，应 304）+ 对端镜像
+  `mirrors.huaweicloud.com` 同路径 + 非 by-hash 索引本体当前内容，全部必须哈希
+  成文件名里的 sha256；任何一路不等即判红（内容一旦漂移，哈希必然不等，所以
+  每轮都能抓到，不必等时间流逝）。③ 的 `immutable_file` 豁免只影响 squid 内部
+  index.log / Prometheus，runner 侧只留档 HIT 时的 Age（源站 Age 实测已 >3600s）。
+  opt-in `apt_byhash=1`，runner 层单列 job；chart 未 rollout 时 by-hash 全 MISS
+  会红，属预期。
+
 ## 六、与两份前作的关系
 
 | 前作 | 复用什么 | 本套件差异 |
