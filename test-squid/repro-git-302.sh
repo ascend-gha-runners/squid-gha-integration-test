@@ -22,6 +22,12 @@
 #      - 按 SHA fetch（actions/checkout 形态）
 #      - http.followRedirects=false 反证（必须失败，证明 302 真实存在）
 #   - 默认 SKIP：push（需写权限，用环境变量打开）
+#   C. submodule / LFS（默认开启）
+#   D. gitcode 302 → gitcode-cdn（opt-in：GIT302_GITCODE_REPO 非空）
+#      真实形态：vllm-ascend 的 .gitmodules 把 csrc/third_party/catlass 指向
+#      https://gitcode.com/cann/catlass.git。顶层（github）走既有 302 → git-cdn，
+#      子模块（gitcode）必须走新规则 302 → git-cdn-gitcode；并用 curl 契约单独
+#      断言 gitcode 端点的 302 与 Location。
 #
 # 判定：
 #   - 真实命令 must rc=0 且 stderr 出现 `redirecting to ...git-cdn`
@@ -42,6 +48,14 @@
 #   GIT302_SUBMODULE_REPO  带子模块的仓库（默认 jqlang/jq，子模块 kkos/oniguruma 也在 GitHub）
 #   GIT302_LFS_REPO        带 LFS 对象的仓库（默认 honeynet/forensic_challenges，
 #                          单个对象 ~1MB，bounded）
+#   GIT302_GITCODE_REPO    opt-in：带 gitcode 子模块的仓库（如
+#                          https://github.com/vllm-project/vllm-ascend.git）；
+#                          空=跳过 D 段
+#   GIT302_GITCODE_PROBE_REPO  D 段 curl 契约的 gitcode 仓库
+#                          （默认 https://gitcode.com/cann/catlass.git）
+#   GIT302_SUBMODULE_REPOS E 段：空格分隔的仓库列表，每个都做
+#                          shallow clone + submodule update（如
+#                          "https://gitcode.com/ascend/pytorch.git ..."）；空=跳过
 #   GIT302_PUSH_URL        push 目标（空=SKIP，需凭据）
 #   GIT302_TIMEOUT         单条 git 命令超时秒数（默认 300）
 #
@@ -63,6 +77,9 @@ GIT302_REPO="${GIT302_REPO:-https://github.com/octocat/Hello-World.git}"
 GIT302_REPO2="${GIT302_REPO2:-https://github.com/minghuaslab/flash-attention-npu.git}"
 GIT302_SUBMODULE_REPO="${GIT302_SUBMODULE_REPO:-https://github.com/jqlang/jq.git}"
 GIT302_LFS_REPO="${GIT302_LFS_REPO:-https://github.com/honeynet/forensic_challenges.git}"
+GIT302_GITCODE_REPO="${GIT302_GITCODE_REPO:-}"
+GIT302_GITCODE_PROBE_REPO="${GIT302_GITCODE_PROBE_REPO:-https://gitcode.com/cann/catlass.git}"
+GIT302_SUBMODULE_REPOS="${GIT302_SUBMODULE_REPOS:-}"
 GIT302_PUSH_URL="${GIT302_PUSH_URL:-}"
 GIT302_TIMEOUT="${GIT302_TIMEOUT:-300}"
 
@@ -91,6 +108,12 @@ now() { date +%s; }
 # ---------------------------------------------------------------------------
 run_git_case() {  # run_git_case <case> <workdir> <git args...>
     local c="$1" dir="$2"; shift 2
+    run_git_case_re "$c" "$dir" 'redirecting to .*git-cdn' "$@"
+}
+
+# 同上，但 redirect 断言用自定义正则（区分 git-cdn 与 git-cdn-gitcode 两种后端）
+run_git_case_re() {  # run_git_case_re <case> <workdir> <stderr-regex> <command...>
+    local c="$1" dir="$2" re="$3"; shift 3
     local log="$WORK/$c.log" rc t0 sec redirect
     rm -rf "$WORK/$c.out"
     t0=$(now)
@@ -104,12 +127,12 @@ run_git_case() {  # run_git_case <case> <workdir> <git args...>
         mark "$c" FAIL "rc=$rc: $(tail -3 "$log" | tr '\n' ' ' | cut -c1-240)"
         return 1
     fi
-    if ! grep -qi 'redirecting to .*git-cdn' "$log"; then
+    if ! grep -qiE "$re" "$log"; then
         phase_row "$c" "$sec" 1
-        mark "$c" FAIL "rc=0 但无 redirecting to git-cdn（302 未承载该命令）: $(tail -2 "$log" | tr '\n' ' ' | cut -c1-160)"
+        mark "$c" FAIL "rc=0 但 stderr 未命中 /$re/（302 未承载该命令）: $(tail -2 "$log" | tr '\n' ' ' | cut -c1-160)"
         return 1
     fi
-    redirect=$(grep -i 'redirecting to' "$log" | head -1 | sed 's/.*redirecting to //' | cut -c1-140)
+    redirect=$(grep -iE "$re" "$log" | head -1 | sed -E 's/.*redirecting to //' | cut -c1-160)
     phase_row "$c" "$sec" 0
     mark "$c" PASS "302 → $redirect"
 }
@@ -423,6 +446,108 @@ else
 fi
 
 skip_case "archive-remote" "GitHub 不支持 git archive --remote（HTTP 无 upload-archive）"
+
+# ===========================================================================
+# D. gitcode 302 → gitcode-cdn（opt-in）
+#    vllm-ascend 的子模块 csrc/third_party/catlass 指向 gitcode.com；顶层仓库
+#    走 github 302 → git-cdn，子模块必须被新规则 302 到 git-cdn-gitcode。
+# ===========================================================================
+if [ -n "$GIT302_GITCODE_REPO" ]; then
+    echo "===== D. gitcode 302 → gitcode-cdn（insteadOf 已剥离）====="
+
+    # D1 curl 契约：gitcode 端点的 upload-pack 初始 GET 必须 302 到 gitcode-cdn
+    GC_BASE="${GIT302_GITCODE_PROBE_REPO%/}"
+    GC_PATH="${GC_BASE#https://gitcode.com}"
+    out=$(probe_location "gitcode-probe-upload-pack" \
+        "$GC_BASE/info/refs?service=git-upload-pack")
+    code=${out%%$'\t'*}; loc=${out#*$'\t'}
+    phase_row "gitcode-probe-upload-pack" 0 "$([ "$code" = 302 ] && echo 0 || echo 1)"
+    if [ "$code" != "302" ]; then
+        mark "gitcode-probe-upload-pack" FAIL "GET=$code 期望 302（gitcode 302 规则未生效）"
+    elif [[ "$loc" != *git-cdn-gitcode* ]]; then
+        mark "gitcode-probe-upload-pack" FAIL "302 但 Location 未命中 git-cdn-gitcode：$loc"
+    elif [[ "$loc" != *"$GC_PATH/info/refs?service=git-upload-pack"* ]]; then
+        mark "gitcode-probe-upload-pack" FAIL "302 Location 未保留路径/查询串：$loc"
+    else
+        mark "gitcode-probe-upload-pack" PASS "302 → $loc"
+    fi
+
+    # D2 顶层 vllm-ascend：140MB 仓库用 blob:none + no-checkout 只取 commit/tree
+    VALM_DIR="$WORK/vllm-ascend"
+    rm -rf "$VALM_DIR"
+    if run_git_case "vllm-ascend-clone" "$WORK" bash -c '
+        git clone --depth 1 --filter=blob:none --no-checkout "$1" "$2" &&
+        git -C "$2" read-tree HEAD
+    ' _ "$GIT302_GITCODE_REPO" "$VALM_DIR"; then
+        # D3 子模块 catlass：第二跳必须命中 git-cdn-gitcode 主机
+        if run_git_case_re "vllm-ascend-submodule-catlass" "$VALM_DIR" \
+            'redirecting to .*git-cdn-gitcode' git submodule update --init --depth 1; then
+            subs=$(git -C "$VALM_DIR" submodule status 2>/dev/null)
+            n=$(printf '%s\n' "$subs" | grep -c . || true)
+            if [ "$n" -gt 0 ]; then
+                phase_row "vllm-ascend-submodule-populated" 0 0
+                mark "vllm-ascend-submodule-populated" PASS \
+                    "$n 个子模块已拉取: $(printf '%s\n' "$subs" | awk '{print $2}' | tr '\n' ' ')"
+            else
+                phase_row "vllm-ascend-submodule-populated" 0 1
+                mark "vllm-ascend-submodule-populated" FAIL "submodule status 为空（子模块未拉取）"
+            fi
+        fi
+    fi
+else
+    skip_case "gitcode-probe-upload-pack" "未设置 GIT302_GITCODE_REPO"
+    skip_case "vllm-ascend-clone" "未设置 GIT302_GITCODE_REPO"
+    skip_case "vllm-ascend-submodule-catlass" "未设置 GIT302_GITCODE_REPO"
+fi
+
+# ===========================================================================
+# E. 任意仓库 × 子模块矩阵（opt-in：GIT302_SUBMODULE_REPOS 空格分隔）
+#    每个仓库：① shallow + blob:none 只取顶层并断言其 302；② read-tree 后
+#    submodule update --init --depth 1，子模块各自 URL 再走一次 302。
+#    gitcode.com 仓库断言跳 git-cdn-gitcode，其余断言跳 git-cdn。
+# ===========================================================================
+if [ -n "$GIT302_SUBMODULE_REPOS" ]; then
+    echo "===== E. 仓库 × 子模块矩阵 ====="
+    idx=0
+    for repo in $GIT302_SUBMODULE_REPOS; do
+        idx=$((idx+1))
+        slug=$(printf '%s' "$repo" | sed -E 's#https?://##; s#[^A-Za-z0-9]+#-#g; s#^-##; s#-$##')
+        case "$repo" in
+            *gitcode.com*) re='redirecting to .*git-cdn-gitcode' ;;
+            *)             re='redirecting to .*git-cdn' ;;
+        esac
+        dir="$WORK/matrix-$idx"
+        rm -rf "$dir"
+        if ! run_git_case_re "m$idx-$slug-clone" "$WORK" "$re" bash -c '
+            git clone --depth 1 --filter=blob:none --no-checkout "$1" "$2" &&
+            git -C "$2" read-tree HEAD
+        ' _ "$repo" "$dir"; then
+            continue
+        fi
+        if ! git -C "$dir" cat-file -e HEAD:.gitmodules 2>/dev/null; then
+            skip_case "m$idx-$slug-submodules" "$repo 无 .gitmodules"
+            continue
+        fi
+        if run_git_case_re "m$idx-$slug-submodules" "$dir" "$re" \
+            git submodule update --init --depth 1; then
+            subs=$(git -C "$dir" submodule status 2>/dev/null)
+            total=0; pop=0
+            if [ -n "$subs" ]; then
+                total=$(printf '%s\n' "$subs" | grep -c . || true)
+                pop=$(printf '%s\n' "$subs" | grep -vc '^-' || true)
+            fi
+            if [ "$pop" -gt 0 ]; then
+                phase_row "m$idx-$slug-populated" 0 0
+                mark "m$idx-$slug-populated" PASS "$repo: $pop/$total 个子模块已落盘"
+            else
+                phase_row "m$idx-$slug-populated" 0 1
+                mark "m$idx-$slug-populated" FAIL "$repo: 无子模块落盘（$total 个注册）"
+            fi
+        fi
+    done
+else
+    skip_case "repo-matrix" "未设置 GIT302_SUBMODULE_REPOS"
+fi
 
 # ===========================================================================
 # 汇总
