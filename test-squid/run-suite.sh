@@ -1166,6 +1166,15 @@ tool-conda-verl() {
     "$d/root/envs/verl-vllm-npu/bin/python" -c "import sys; print('python', sys.version.split()[0])" \
         || { echo "❌ 文档环境 python 不可用"; return 1; }
     echo "✅ verl 文档命令 conda create 经 squid 通过（${e}s）"
+    # 事故对象是 linux-aarch64 的 repodata.json.zst；amd64 runner 上用 --platform 再取一次
+    # （dry-run 只做 solve，仍会下载该平台的 repodata），复现同一条 URL 的拉取行为
+    s=$(date +%s)
+    timeout 900 "$d/root/bin/conda" create --dry-run --platform linux-aarch64 -y -n probe-aarch64 python=3.12 \
+        >> "$RESULTS_DIR/tool-conda-verl.log" 2>&1
+    rc=$?
+    e=$(( $(date +%s) - s ))
+    [ "$rc" -eq 0 ] || { echo "❌ aarch64 repodata 拉取失败 rc=$rc 耗时=${e}s（tail: $(tail -2 "$RESULTS_DIR/tool-conda-verl.log" | tr '\n' ' ')）"; return 1; }
+    echo "✅ linux-aarch64 repodata 经 squid 通过（${e}s）"
 }
 
 # tool-07 cmake FetchContent：git clone 官方 googletest（不经重写直连）+ cmake 构建
