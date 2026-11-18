@@ -166,6 +166,7 @@ gy-006 的 squid 启用 `url_rewrite_program`：客户端零镜像配置，官�
 | npm-doc / npm-tgz | 规则7：registry.npmmirror host 交换 | `"versions"` / gzip |
 | crates-index / crates-config / crates-static | 规则8：rsproxy sparse index | `"vers"` / `api/v1/crates` 模板漂移守卫（R15，**策略自适应**：rewrite 正向 / direct 反向）/ gzip |
 | conda-cloud / conda-pkgs / miniconda | 规则9：nju `/cloud/` 前缀重映射 | HEAD 200（repodata 百 MB 级只探头） |
+| conda-zst（`<subdir>/repodata.json.zst`，按本机 arch 取 linux-64 / linux-aarch64） | 规则9 落地断言（2026-11-13 verl PR #8007 / job 131758907076 事故：conda 26.x `repodata_use_zst=True` 真拉 60MB zstd 索引，经 squid 卡 8 分 19 秒后读超时 → create 失败） | Range 64KB 真下载：120s 内必须完成（否则判红，复现事故）+ zstd 魔数 `28b52ffd` + 落点 rewrite 策略必须 `server: nginx`（nju）、direct 策略不得是 nginx |
 | openeuler-repomd | 规则10：yum host 交换 | `<repomd` |
 | rustup-manifest / rustup-init | 规则10a：huaweicloud 固定映射 | `manifest-version` / HEAD 200 |
 | NEG conda-nocloud（故意错映射，直连镜像） | R14 负样本 | 期望 404/403：证明判定方法有效 |
