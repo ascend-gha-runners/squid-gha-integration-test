@@ -793,7 +793,9 @@ ck_git_rewrite() {
     # 新策略（PR #2470，gy-006）：client-first bump 下 rewrite 到 http 会被 Squid 强制
     # TLS 打挂，改为 helper 对初始 GET 返回 302，把 clone 就近甩到集群内 git-cdn。
     # 判定：302 + Location 命中 git-cdn base = 重写生效。
-    if [ "$REWRITE_POLICY" != "direct" ] && [ "$code" = "302" ]; then
+    # 注意：302 规则与镜像重写是两套独立配置（HK 等 direct 集群没有镜像 rewrite，
+    # 但同样启用了 302），故不受 REWRITE_POLICY 约束。
+    if [ "$code" = "302" ]; then
         local loc
         loc=$(grep -i '^location:' "$hdr" 2>/dev/null | tr -d '\r' | sed 's/^[Ll]ocation: *//')
         case "$loc" in
@@ -1197,10 +1199,13 @@ int main(){testing::InitGoogleTest(nullptr,nullptr);return 0;}' > "$d/main.cc"
 
 # tool-08 bazel：bazelisk（官方 github release，规则3）+ http_archive 构建
 tool-bazel() {
-    local d="$RESULTS_DIR/bazel-proj"; rm -rf "$d"; mkdir -p "$d"
+    local d="$RESULTS_DIR/bazel-proj" bazel_arch=amd64; rm -rf "$d"; mkdir -p "$d"
+    case "$(uname -m)" in
+        aarch64|arm64) bazel_arch=arm64 ;;
+    esac
     curl -fsSL --max-time 120 -o "$d/bazelisk" \
-        https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64 \
-        || { echo "❌ bazelisk 下载失败"; return 1; }
+        "https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-${bazel_arch}" \
+        || { echo "❌ bazelisk 下载失败（$bazel_arch）"; return 1; }
     chmod +x "$d/bazelisk"
     cat > "$d/MODULE.bazel" <<'EOF'
 module(name = "t")
