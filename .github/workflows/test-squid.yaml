@@ -314,6 +314,66 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  # verl#8007（run 43362363531 job 131758907076）同款步骤复刻：
+  # 原 workflow 用 conda-incubator/setup-miniconda@v3 + miniforge-version 26.9.4-1
+  # 提供 conda，再由文档命令 conda create -n verl-vllm-npu python=3.12 建环境；
+  # 事故就是这一步 Collecting package metadata 拉 linux-aarch64/repodata.json.zst
+  # 卡死 499s 后 ReadTimeout。NPU 侧（npu-smi、run_doctests.sh）不在覆盖范围。
+  verl-conda:
+    name: verl 文档 conda 步骤复刻（setup-miniconda@v3）
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.heavy == '1'
+    timeout-minutes: 40
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: '26.9.4-1'
+          activate-environment: ''
+          auto-activate: false
+
+      - name: 文档命令 conda create（verl-vllm-npu）
+        shell: bash -el {0}
+        run: |
+          mkdir -p /tmp/test-squid-results
+          conda --version | tee /tmp/test-squid-results/verl-conda.log
+          conda info | grep -aiE 'repodata_use_zst|platform|channel' | tee -a /tmp/test-squid-results/verl-conda.log
+          s=$(date +%s)
+          timeout 900 conda create -y -n verl-vllm-npu python=3.12 \
+            > /tmp/test-squid-results/verl-create.log 2>&1
+          rc=$?
+          e=$(( $(date +%s) - s ))
+          tail -15 /tmp/test-squid-results/verl-create.log
+          printf 'verl-conda\t%s\t%s\trunner\n' "$e" "$rc" >> /tmp/test-squid-results/timings.tsv
+          if [ "$rc" -eq 124 ]; then
+            echo "❌ conda create 900s 未完成（复现 repodata 停顿，耗时=${e}s）"
+            exit 1
+          elif [ "$rc" -ne 0 ]; then
+            echo "❌ conda create 失败 rc=$rc 耗时=${e}s"
+            exit 1
+          fi
+          echo "✅ verl 文档命令经 squid 通过（${e}s）"
+
+      - name: aarch64 repodata（事故对象）
+        shell: bash -el {0}
+        run: |
+          s=$(date +%s)
+          timeout 900 conda create --dry-run --platform linux-aarch64 -y -n probe-aarch64 python=3.12 \
+            > /tmp/test-squid-results/verl-aarch64.log 2>&1
+          rc=$?
+          e=$(( $(date +%s) - s ))
+          tail -10 /tmp/test-squid-results/verl-aarch64.log
+          printf 'verl-conda-aarch64\t%s\t%s\trunner\n' "$e" "$rc" >> /tmp/test-squid-results/timings.tsv
+          [ "$rc" -eq 0 ] || { echo "❌ linux-aarch64 repodata 拉取失败 rc=$rc 耗时=${e}s"; exit 1; }
+          echo "✅ linux-aarch64 repodata 经 squid 通过（${e}s）"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-verl-conda
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   container-tools:
     name: 容器层·真实工具 e2e（CANN 镜像）
     timeout-minutes: 60
@@ -728,7 +788,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, verl-conda, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -742,7 +802,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-gitcdn-unsynced \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-verl-conda test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-gitcdn-unsynced \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
