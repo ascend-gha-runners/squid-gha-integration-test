@@ -678,6 +678,41 @@ ck_head() {  # 大文件只 HEAD（conda repodata 等百 MB 级）
     fi
 }
 
+ck_conda_zst() {  # name url —— repodata.json.zst 真实下载 64KB + zstd 魔数 + 落点断言
+    # 2026-11-13 verl PR #8007 事故（job 131758907076）：conda 26.x 在
+    # repodata_use_zst=True 下实际请求 .../repodata.json.zst（60MB 级），经 squid
+    # 卡 8 分 19 秒后 urllib3 ReadTimeoutError → conda create 失败。
+    # 只 HEAD 普通 repodata.json 拦不住这类「连上了但传不动」，故这里按真实客户端
+    # 形态下 Range 64KB：① 120s 内必须完成（000 = 客户端读超时，直接复现事故）；
+    # ② zstd 魔数 28b52ffd；③ 落点：rewrite 策略必须是 nju（server: nginx），
+    # direct 策略不得是 nginx（origin 走 cloudflare）。
+    local name=$1 url=$2
+    local hdr="$RESULTS_DIR/parity-$name.hdr" body="$RESULTS_DIR/parity-$name.bin" code t0 t1 sig
+    t0=$(date +%s)
+    code=$(curl -sS -L --max-time 120 -D"$hdr" -r 0-65535 -o "$body" -w '%{http_code}' \
+        "$url" 2>>"$RESULTS_DIR/parity.log")
+    t1=$(date +%s)
+    case "$code" in
+        200|206) : ;;
+        000) echo "✗ $name 120s 内未完成（客户端读超时，verl 2026-11-13 事故形态）"; P_FAIL=$((P_FAIL+1)); return 1 ;;
+        *) echo "✗ $name GET=$code 期望=206 ← repodata.json.zst 通道异常"; P_FAIL=$((P_FAIL+1)); return 1 ;;
+    esac
+    local got; got=$(od -An -tx1 -N4 "$body" | tr -d ' \n')
+    [ "$got" = "28b52ffd" ] || { echo "✗ $name 魔数=$got 期望=28b52ffd（不是 zstd，落点被改写成目录页？）"; P_FAIL=$((P_FAIL+1)); return 1; }
+    sig=$(grep -iE '^(server|content-type):' "$hdr" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+    if [ "$REWRITE_POLICY" = direct ]; then
+        if grep -qiE '^server: *nginx' "$hdr" 2>/dev/null; then
+            echo "✗ $name 落到 nju（$sig）← direct 策略下被误重写"; P_FAIL=$((P_FAIL+1)); return 1
+        fi
+        echo "✓ $name GET=$code zstdOK 源站直连（$sig）$((t1-t0))s"; P_PASS=$((P_PASS+1))
+    else
+        if ! grep -qiE '^server: *nginx' "$hdr" 2>/dev/null; then
+            echo "✗ $name 未落到 nju（$sig）← 规则9 未生效或 .json.zst 未覆盖"; P_FAIL=$((P_FAIL+1)); return 1
+        fi
+        echo "✓ $name GET=$code zstdOK → nju（$sig）$((t1-t0))s"; P_PASS=$((P_PASS+1))
+    fi
+}
+
 ck_json() {  # name url [must_key] —— 200/206 + 真 JSON 可解析
     # 事故形态（2026-09-20 gy-002）：?mode=json 被重写到镜像目录页 → 拿到 HTML
     # → pre-commit _infer_go_version 抛 JSONDecodeError。只 grep 引号关键字会漏，
@@ -872,6 +907,11 @@ rewrite-parity() {
     ck_head conda-cloud https://conda.anaconda.org/conda-forge/linux-64/repodata.json 200
     ck_head conda-pkgs https://repo.anaconda.com/pkgs/main/linux-64/repodata.json 200
     ck_head miniconda https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh 200
+    # 规则9 落地断言（2026-11-13 verl #8007 事故）：conda 26.x 实际拉 zstd 版索引，
+    # HEAD 普通 repodata.json 拦不住中途 stall；按本机 arch 取真实子目录真下 64KB。
+    local conda_subdir=linux-64
+    [ "$PKG_ARCH" = arm64 ] && conda_subdir=linux-aarch64
+    ck_conda_zst conda-zst "https://conda.anaconda.org/conda-forge/$conda_subdir/repodata.json.zst"
 
     echo "--- 规则10 openEuler yum host 交换 ---"
     ck_get openeuler-repomd https://repo.openeuler.org/openEuler-24.03-LTS/OS/x86_64/repodata/repomd.xml 200 '' '<repomd'
