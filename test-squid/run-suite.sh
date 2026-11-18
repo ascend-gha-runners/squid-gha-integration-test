@@ -1121,11 +1121,9 @@ tool-rustup() {
 
 # tool-11 conda：官方 miniconda installer + conda-forge create（规则9）
 tool-conda() {
-    # busybox wget 无法经代理下 https → 环境不可用，记 SKIP（非 squid 层问题）
-    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
-    local d="$RESULTS_DIR/conda"; rm -rf "$d"; mkdir -p "$d"
-    wget -q --timeout=300 -O "$d/miniconda.sh" \
-        https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+    local d="$RESULTS_DIR/conda" arch; arch=$(uname -m); rm -rf "$d"; mkdir -p "$d"
+    curl -fsSL --max-time 300 -o "$d/miniconda.sh" \
+        "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-${arch}.sh" \
         || { echo "❌ miniconda 下载失败"; return 1; }
     bash "$d/miniconda.sh" -b -p "$d/root" >> "$RESULTS_DIR/tool-conda.log" 2>&1 \
         || { echo "❌ miniconda 安装失败"; return 1; }
@@ -1143,11 +1141,10 @@ tool-conda() {
 #   Collecting package metadata 阶段拉 linux-aarch64/repodata.json.zst 卡死 499s
 #   后客户端 ReadTimeout，access.log 侧只留 CLIENT_ABORT（owner=client）。
 tool-conda-verl() {
-    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
     local d="$RESULTS_DIR/conda-verl" s e rc
     rm -rf "$d"; mkdir -p "$d"
     local url="https://github.com/conda-forge/miniforge/releases/download/26.9.4-1/Miniforge3-$(uname)-$(uname -m).sh"
-    wget -q --timeout=600 -O "$d/miniforge.sh" "$url" \
+    curl -fsSL --max-time 600 -o "$d/miniforge.sh" "$url" \
         || { echo "❌ miniforge 26.9.4-1 下载失败"; return 1; }
     bash "$d/miniforge.sh" -b -p "$d/root" >> "$RESULTS_DIR/tool-conda-verl.log" 2>&1 \
         || { echo "❌ miniforge 安装失败"; return 1; }
@@ -1200,10 +1197,8 @@ int main(){testing::InitGoogleTest(nullptr,nullptr);return 0;}' > "$d/main.cc"
 
 # tool-08 bazel：bazelisk（官方 github release，规则3）+ http_archive 构建
 tool-bazel() {
-    # busybox wget 无法经代理下 https → 环境不可用，记 SKIP（非 squid 层问题）
-    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
     local d="$RESULTS_DIR/bazel-proj"; rm -rf "$d"; mkdir -p "$d"
-    wget -q --timeout=120 -O "$d/bazelisk" \
+    curl -fsSL --max-time 120 -o "$d/bazelisk" \
         https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64 \
         || { echo "❌ bazelisk 下载失败"; return 1; }
     chmod +x "$d/bazelisk"
