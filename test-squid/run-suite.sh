@@ -1136,6 +1136,38 @@ tool-conda() {
     echo "✅ conda 官方链经 squid 通过"
 }
 
+# tool-11b verl 文档安装步骤原样复刻（verl#8007 / run 43362363531 job 131758907076）：
+#   文档块 installation-vllm 的第一条可执行命令即
+#     conda create -n verl-vllm-npu python=3.12 -y
+#   CI 用 setup-miniconda 装 miniforge 26.9.4-1 提供 conda。事故形态：
+#   Collecting package metadata 阶段拉 linux-aarch64/repodata.json.zst 卡死 499s
+#   后客户端 ReadTimeout，access.log 侧只留 CLIENT_ABORT（owner=client）。
+tool-conda-verl() {
+    wget_is_busybox && { echo "⚠️ busybox wget 经代理访 https 必失败（上游未修），SKIP"; return 2; }
+    local d="$RESULTS_DIR/conda-verl" s e rc
+    rm -rf "$d"; mkdir -p "$d"
+    local url="https://github.com/conda-forge/miniforge/releases/download/26.9.4-1/Miniforge3-$(uname)-$(uname -m).sh"
+    wget -q --timeout=600 -O "$d/miniforge.sh" "$url" \
+        || { echo "❌ miniforge 26.9.4-1 下载失败"; return 1; }
+    bash "$d/miniforge.sh" -b -p "$d/root" >> "$RESULTS_DIR/tool-conda-verl.log" 2>&1 \
+        || { echo "❌ miniforge 安装失败"; return 1; }
+    s=$(date +%s)
+    timeout 900 "$d/root/bin/conda" create -y -n verl-vllm-npu python=3.12 \
+        >> "$RESULTS_DIR/tool-conda-verl.log" 2>&1
+    rc=$?
+    e=$(( $(date +%s) - s ))
+    if [ "$rc" -eq 124 ]; then
+        echo "❌ conda create 900s 未完成（复现 repodata 停顿/超时，耗时=${e}s）"
+        return 1
+    elif [ "$rc" -ne 0 ]; then
+        echo "❌ conda create 失败 rc=$rc 耗时=${e}s（tail: $(tail -2 "$RESULTS_DIR/tool-conda-verl.log" | tr '\n' ' ')）"
+        return 1
+    fi
+    "$d/root/envs/verl-vllm-npu/bin/python" -c "import sys; print('python', sys.version.split()[0])" \
+        || { echo "❌ 文档环境 python 不可用"; return 1; }
+    echo "✅ verl 文档命令 conda create 经 squid 通过（${e}s）"
+}
+
 # tool-07 cmake FetchContent：git clone 官方 googletest（不经重写直连）+ cmake 构建
 tool-cmake() {
     need cmake || return 2
@@ -2036,6 +2068,7 @@ elif [ "$MODE" = "tools" ]; then
     if [ "${HEAVY:-0}" = "1" ]; then
         run_timed tool-rustup    "$LAYER" tool-rustup
         run_timed tool-conda     "$LAYER" tool-conda
+        run_timed tool-conda-verl "$LAYER" tool-conda-verl
         run_timed tool-cmake     "$LAYER" tool-cmake
         run_timed tool-bazel     "$LAYER" tool-bazel
         run_timed tool-precommit "$LAYER" tool-precommit
