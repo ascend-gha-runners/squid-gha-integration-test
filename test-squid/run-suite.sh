@@ -1217,9 +1217,18 @@ EOF
     # 用 keytool 把 squid CA + 系统根证书导入临时 PKCS12 信任库，再经
     # JAVA_TOOL_OPTIONS 注入给 bazel 的 server JVM，否则经 MITM 访问
     # bcr.bazel.build 报 PKIX path building failed。
-    local ca="${SQUID_CA_FILE:-/etc/squid-ca/squid-ca.pem}" ts="$d/truststore.p12" c f i=0 kt
+    local ca="${SQUID_CA_FILE:-/etc/squid-ca/squid-ca.pem}" ts="$d/truststore.p12"
+    local c f i=0 kt jh bz="USE_BAZEL_VERSION=${USE_BAZEL_VERSION:-7.4.1}"
     kt=$(command -v keytool 2>/dev/null || true)
     [ -n "$kt" ] || { [ -x "${JAVA_HOME:-/nonexistent}/bin/keytool" ] && kt="$JAVA_HOME/bin/keytool"; }
+    if [ -z "$kt" ]; then
+        # runner 容器通常无 JDK：bazel 本体自带 JDK，先用 bazelisk 下载 bazel
+        # （Go 客户端认系统 CA，可经 squid），再从 install base 里取 keytool
+        (cd "$d" && env $bz "$d/bazelisk" --nosystem_rc --nohome_rc version) \
+            > "$RESULTS_DIR/tool-bazel-boot.log" 2>&1
+        jh=$(cd "$d" && env $bz "$d/bazelisk" --nosystem_rc --nohome_rc info java-home --enable_bzlmod=false 2>/dev/null | tail -1)
+        [ -n "$jh" ] && [ -x "$jh/bin/keytool" ] && kt="$jh/bin/keytool"
+    fi
     if [ -n "$kt" ] && [ -f "$ca" ]; then
         for f in "$ca" /etc/ssl/certs/ca-certificates.crt; do
             [ -f "$f" ] || continue
@@ -1233,13 +1242,14 @@ EOF
         done
         if [ -f "$ts" ]; then
             export JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$ts -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=changeit"
-            echo "ℹ️ 已导入 squid CA（$ca）到 JVM 临时信任库"
+            echo "ℹ️ 已导入 squid CA（$ca）到 JVM 临时信任库（keytool=$kt）"
         fi
     fi
     # 固定版本：bazelisk 不指定 USE_BAZEL_VERSION 时会先查 GCS 的 "latest"
     # （www.googleapis.com/storage/v1/b/bazel/o），该接口抖动/503 会让本用例
     # 与 squid 无关地卡 30s×重试（2026-11-18 gy-006 实测 400s 后失败）
-    (cd "$d" && USE_BAZEL_VERSION="${USE_BAZEL_VERSION:-7.4.1}" "$d/bazelisk" build //:t --nosystem_rc --nohome_rc) \
+    # 注意 --nosystem_rc/--nohome_rc 是 startup option，必须放在子命令之前
+    (cd "$d" && env $bz "$d/bazelisk" --nosystem_rc --nohome_rc build //:t) \
         > "$RESULTS_DIR/tool-bazel.log" 2>&1
     local rc=$?
     if [ "$rc" -ne 0 ]; then
