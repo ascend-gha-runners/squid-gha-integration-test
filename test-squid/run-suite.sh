@@ -1191,8 +1191,10 @@ target_link_libraries(t gtest)
 EOF
     echo '#include <gtest/gtest.h>
 int main(){testing::InitGoogleTest(nullptr,nullptr);return 0;}' > "$d/main.cc"
+    # 不要给 cmake --build 加 --quiet：CANN 镜像自带 cmake 3.22 不认该选项，
+    # 会直接打印 usage 并 exit 1（2026-11-19 gy-006 容器层实测 2s FAIL）
     (cd "$d" && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null \
-        && cmake --build build -j2 --quiet) >> "$RESULTS_DIR/tool-cmake.log" 2>&1 \
+        && cmake --build build -j2) >> "$RESULTS_DIR/tool-cmake.log" 2>&1 \
         || { echo "❌ cmake 构建失败（tail: $(tail -2 "$RESULTS_DIR/tool-cmake.log" | tr '\n' ' ')）"; return 1; }
     echo "✅ cmake+googletest 官方 git 直连经 squid 通过"
 }
@@ -1241,8 +1243,15 @@ EOF
             i=$((i+1))
         done
         if [ -f "$ts" ]; then
+            local n_ts
+            n_ts=$("$kt" -list -keystore "$ts" -storepass changeit 2>/dev/null | grep -c trustedCertEntry || true)
             export JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$ts -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=changeit"
-            echo "ℹ️ 已导入 squid CA（$ca）到 JVM 临时信任库（keytool=$kt）"
+            echo "ℹ️ 已导入 squid CA（$ca）到 JVM 临时信任库（keytool=$kt，条目=$n_ts）"
+            # bazel server JVM 是常驻进程：上面 info java-home 已在导入前把它拉起，
+            # JAVA_TOOL_OPTIONS 变化不会触发重启，必须显式 shutdown 才能让后续
+            # build 的 server 读到信任库（否则仍报 PKIX）
+            (cd "$d" && env $bz "$d/bazelisk" --nosystem_rc --nohome_rc shutdown) \
+                >/dev/null 2>&1 || true
         fi
     fi
     # 固定版本：bazelisk 不指定 USE_BAZEL_VERSION 时会先查 GCS 的 "latest"
