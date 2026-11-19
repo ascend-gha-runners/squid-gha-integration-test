@@ -1213,14 +1213,38 @@ bazel_dep(name = "rules_cc", version = "0.0.17")
 EOF
     printf 'cc_binary(name = "t", srcs = ["t.cc"])\n' > "$d/BUILD"
     echo 'int main(){return 0;}' > "$d/t.cc"
-    # 固定版本：bazelisk 默认先查 GCS "latest"（googleapis.com），该接口抖动/503
-    # 会让本用例与 squid 无关地卡 400s（2026-11-18 cn12-001 实测）
+    # JVM 只读自己的 cacerts，不认 CURL_CA_BUNDLE/REQUESTS_CA_BUNDLE。
+    # 用 keytool 把 squid CA + 系统根证书导入临时 PKCS12 信任库，再经
+    # JAVA_TOOL_OPTIONS 注入给 bazel 的 server JVM，否则经 MITM 访问
+    # bcr.bazel.build 报 PKIX path building failed。
+    local ca="${SQUID_CA_FILE:-/etc/squid-ca/squid-ca.pem}" ts="$d/truststore.p12" c f i=0 kt
+    kt=$(command -v keytool 2>/dev/null || true)
+    [ -n "$kt" ] || { [ -x "${JAVA_HOME:-/nonexistent}/bin/keytool" ] && kt="$JAVA_HOME/bin/keytool"; }
+    if [ -n "$kt" ] && [ -f "$ca" ]; then
+        for f in "$ca" /etc/ssl/certs/ca-certificates.crt; do
+            [ -f "$f" ] || continue
+            awk -v out="$d/ca${i}-" '/BEGIN CERTIFICATE/{n++} n{print > (out n ".pem")}' "$f" 2>/dev/null
+            for c in "$d/ca${i}-"*.pem; do
+                [ -f "$c" ] || continue
+                "$kt" -importcert -noprompt -alias "ca${i}x$RANDOM" -file "$c" \
+                    -keystore "$ts" -storetype PKCS12 -storepass changeit >/dev/null 2>&1
+            done
+            i=$((i+1))
+        done
+        if [ -f "$ts" ]; then
+            export JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$ts -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=changeit"
+            echo "ℹ️ 已导入 squid CA（$ca）到 JVM 临时信任库"
+        fi
+    fi
+    # 固定版本：bazelisk 不指定 USE_BAZEL_VERSION 时会先查 GCS 的 "latest"
+    # （www.googleapis.com/storage/v1/b/bazel/o），该接口抖动/503 会让本用例
+    # 与 squid 无关地卡 30s×重试（2026-11-18 gy-006 实测 400s 后失败）
     (cd "$d" && USE_BAZEL_VERSION="${USE_BAZEL_VERSION:-7.4.1}" "$d/bazelisk" build //:t --nosystem_rc --nohome_rc) \
         > "$RESULTS_DIR/tool-bazel.log" 2>&1
     local rc=$?
     if [ "$rc" -ne 0 ]; then
-        # JVM 自带 cacerts 不含 squid CA → 经 MITM 访问 bcr.bazel.build 报 PKIX。
-        # 属宿主 JVM 信任库能力缺口，与 squid 重写/缓存无关 → SKIP 记数据（R16 口径）
+        # 兜底：仍出现 PKIX（keytool 缺失或 CA 未挂载）时记 SKIP，不判红——
+        # 属宿主 JVM 信任库能力缺口，与 squid 重写/缓存无关（R16 数据记录口径）
         if grep -qE 'PKIX|certificate_unknown|SunCertPathBuilderException' "$RESULTS_DIR/tool-bazel.log"; then
             echo "⚠️ JVM 不信任 squid CA（PKIX），bazel registry 拉取失败；SKIP（R16：数据记录）"
             return 2
