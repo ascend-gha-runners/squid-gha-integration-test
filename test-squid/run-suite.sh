@@ -1213,9 +1213,20 @@ bazel_dep(name = "rules_cc", version = "0.0.17")
 EOF
     printf 'cc_binary(name = "t", srcs = ["t.cc"])\n' > "$d/BUILD"
     echo 'int main(){return 0;}' > "$d/t.cc"
-    (cd "$d" && "$d/bazelisk" build //:t --nosystem_rc --nohome_rc) \
-        > "$RESULTS_DIR/tool-bazel.log" 2>&1 \
-        || { echo "❌ bazel build 失败（tail: $(tail -2 "$RESULTS_DIR/tool-bazel.log" | tr '\n' ' ')）"; return 1; }
+    # 固定版本：bazelisk 默认先查 GCS "latest"（googleapis.com），该接口抖动/503
+    # 会让本用例与 squid 无关地卡 400s（2026-11-18 cn12-001 实测）
+    (cd "$d" && USE_BAZEL_VERSION="${USE_BAZEL_VERSION:-7.4.1}" "$d/bazelisk" build //:t --nosystem_rc --nohome_rc) \
+        > "$RESULTS_DIR/tool-bazel.log" 2>&1
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # JVM 自带 cacerts 不含 squid CA → 经 MITM 访问 bcr.bazel.build 报 PKIX。
+        # 属宿主 JVM 信任库能力缺口，与 squid 重写/缓存无关 → SKIP 记数据（R16 口径）
+        if grep -qE 'PKIX|certificate_unknown|SunCertPathBuilderException' "$RESULTS_DIR/tool-bazel.log"; then
+            echo "⚠️ JVM 不信任 squid CA（PKIX），bazel registry 拉取失败；SKIP（R16：数据记录）"
+            return 2
+        fi
+        echo "❌ bazel build 失败（tail: $(tail -2 "$RESULTS_DIR/tool-bazel.log" | tr '\n' ' ')）"; return 1
+    fi
     echo "✅ bazelisk+bazel_dep 官方链经 squid 通过"
 }
 
