@@ -407,6 +407,36 @@ RESULTS=/tmp/pip-metadata bash test-squid/repro-pip-metadata.sh pip
 ```
 
 
+### apt-byhash 组（apt by-hash 长缓存，R24 回归守卫，runner 层 only，opt-in）
+
+背景（#2443 / PR #2746，chart 0.1.31）：`repo.huaweicloud.com` 的
+`/ubuntu(-ports)/dists/<suite>/<component>/by-hash/<alg>/<hash>` 落在
+`cache deny hc_repo mutable_meta_with_by_hash` 的覆盖范围内，被当作可变索引拒绝
+缓存。但 by-hash 是内容寻址的不可变对象：文件名就是内容 sha256，源站回
+`Cache-Control: max-age=1296000`（15 天）+ ETag（实测 `Expires` 是过去时间），
+可安全长缓存。不放行的代价是每次 `apt-get update` 全量回源（cn12-001 单副本
+81 分钟 592 次请求 / 28 个对象 / 560 次 `TCP_MISS` / 1.8 GiB）。
+
+触发：`gh workflow run test-squid.yaml -f apt_byhash=1`（仅 workflow_dispatch；
+可用 `-f apt_byhash_release=<Release URL> -f apt_byhash_index=<索引路径>` 换套件/镜像）。
+
+| 阶段 | 场景 | 判定 |
+|---|---|---|
+| `apt-byhash-immut` | 证明「可长缓存」的前提成立：① 源站真值两遍（不同 cache-buster，绕开边缘缓存）② 条件请求（`If-None-Match` 用首遍 ETag）③ 对端镜像 `mirrors.huaweicloud.com` 同路径 ④ 非 by-hash 的索引本体当前内容。每路取回的字节都算 sha256 与文件名里的哈希比对 | 任一路 sha256 ≠ 文件名哈希 = **FAIL**（内容漂移/变体混入，长缓存不安全）；条件请求回 304 = 实体未变的直接证据；各路都不可达 = SKIP。该阶段不需要 squid，可本地直跑 |
+| `apt-byhash-hit` | 源站直连取 `Release`（默认 `ubuntu/dists/jammy/Release`），在 SHA256 段按 `BYHASH_INDEX`（默认 `main/binary-amd64/Packages.gz`）取哈希，拼出 `/by-hash/SHA256/<hash>` URL；经 squid 连打 6 发（固定 `Accept-Encoding: identity`，与 apt 取索引形态一致） | 出现任一严格 `hit`（`Cache-Status: ...;hit;...`）= PASS；`detail=mismatch`（缓存里有条目但 Vary/编码变体不一致）不计 HIT，若 6 发全是 mismatch 判 **FAIL**（缓存键被变体拆散，长缓存收益不成立）；每发 200 的响应体 sha256 必须等于文件名哈希，否则 **FAIL**（内容寻址对象被换掉/变体混入）；6 发全 MISS/no-cache = **FAIL**（chart 未到 0.1.31 或 squid.conf 未生效，deny 例外未落地）；无代理/无 squid 痕迹/上游不可达/Release 无该索引 = SKIP。HIT 时留档 Age（源站 Age 实测已 >3600s，靠 `immutable_file` 豁免不进 `squid_stale_index_hit_total`——该豁免只在 squid 内部日志/Prometheus 可见，runner 侧只作旁证） |
+| `apt-byhash-mutable` | 同一 dists 下非 by-hash 的可变索引（`dists/<suite>/InRelease` 与 `dists/<suite>/<BYHASH_INDEX>`）各带 run 唯一 query 连打 3 发（唯一 query 保证缓存键本 run 首现，排除历史条目干扰） | 任一发由缓存作答 = **FAIL**（`!by_hash` 例外放太宽，deny 失效 → 回到 2026-10-29 索引陈旧形态）；全部 MISS/no-cache（≥3 发）= PASS；无 squid 痕迹/全部非 200 = SKIP |
+
+说明：域级 ACL（`hc_repo dstdomain`）决定了**不能用 mock origin 复现**——pod IP
+永远不匹配 `mutable_meta_with_by_hash` 的 deny，因此本组只走真实域。`byhash` 用
+裸 URL（真实 apt 形态），`mutable` 用唯一 query（确定性判定 deny 覆盖面）。
+
+本地冒烟（无 squid，两阶段均记 SKIP，只验脚本逻辑）：
+
+```bash
+RESULTS=/tmp/apt-byhash bash test-squid/repro-apt-byhash.sh byhash
+RESULTS=/tmp/apt-byhash bash test-squid/repro-apt-byhash.sh mutable
+```
+
 ## 结论口径
 
 - **PASS**：判定项全部达标（缓存 MISS→HIT 无缓存头等"数据记录"场景不阻断结论，但计入数据）。

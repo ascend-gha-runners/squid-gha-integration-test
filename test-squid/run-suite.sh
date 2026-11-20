@@ -17,6 +17,8 @@
 #                      2026-10-31 pip hash 校验事故，META R22）
 #       gitcdn-unsynced —— git-cdn 无法为未同步 SHA 回源（insteadOf→git-cdn 集群，
 #                      2026-11-04 gy-006 checkout 事故；独立脚本 repro-gitcdn-unsynced-sha.sh）
+#       apt-byhash  —— apt by-hash 索引长缓存（内容寻址不可变对象，deny 内用
+#                      !by_hash 排除例外；chart 0.1.31 / PR #2746，META R24）
 #
 # 用法：
 #   bash test-squid/run-suite.sh --mode function
@@ -2121,6 +2123,18 @@ elif [ "$MODE" = "pip-metadata" ]; then
     run_timed pip-metadata-mock   "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" mock
     run_timed pip-metadata-real   "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" real
     run_timed pip-metadata-client "$LAYER" env RESULTS="$RESULTS_DIR/pip-metadata" bash "$SCRIPT_DIR/repro-pip-metadata.sh" pip
+elif [ "$MODE" = "apt-byhash" ]; then
+    # R24 回归守卫（PR #2746，chart 0.1.31）：by-hash 是内容寻址的不可变索引，
+    # 却被 mutable_meta_with_by_hash 的 cache deny 一并拒缓存 → apt-get update
+    # 每次全量回源（cn12-001 单副本 81min / 592 请求 / 560 MISS / 1.8 GiB）。
+    # 阶段：① by-hash 不可变性（内容寻址契约：源站两遍 + 304 条件请求 +
+    # 跨镜像一致 + 索引本体绑定，任一 sha256 不符即红）② by-hash 对象必须可缓存
+    # （HIT）③ 同 dists 下非 by-hash 可变索引仍不得缓存（负样本，repro-apt-byhash.sh）
+    run_timed env-snapshot        "$LAYER" env-snapshot
+    run_timed meta-trace          "$LAYER" meta-trace
+    run_timed apt-byhash-immut    "$LAYER" env RESULTS="$RESULTS_DIR/apt-byhash" bash "$SCRIPT_DIR/repro-apt-byhash.sh" immutable
+    run_timed apt-byhash-hit      "$LAYER" env RESULTS="$RESULTS_DIR/apt-byhash" bash "$SCRIPT_DIR/repro-apt-byhash.sh" byhash
+    run_timed apt-byhash-mutable  "$LAYER" env RESULTS="$RESULTS_DIR/apt-byhash" bash "$SCRIPT_DIR/repro-apt-byhash.sh" mutable
 elif [ "$MODE" = "gitcdn-unsynced" ]; then
     # gy-006 专属：runner gitconfig 的 insteadOf 把 github.com 改写到集群内 git-cdn
     # （.svc.cluster.local 在 NO_PROXY 内，流量不经 squid）。缺陷：客户端带 Basic
@@ -2132,7 +2146,7 @@ elif [ "$MODE" = "gitcdn-unsynced" ]; then
     # 套件结果目录里才会被 artifact 上传（RESULTS_DIR 未 export 到子进程）
     run_timed gitcdn-unsynced-sha "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-unsynced" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | apt-byhash）" >&2
     exit 2
 fi
 

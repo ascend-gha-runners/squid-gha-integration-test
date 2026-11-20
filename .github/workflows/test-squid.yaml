@@ -28,6 +28,8 @@
 #                  2026-10-29 triton-ascend 3.6.0.post2 构建失败回归守卫）
 #   pip-metadata —— PEP 658 metadata 不缓存（CDN 压缩但不发 Vary → 编码变体
 #                  毒化，2026-10-31 pip hash 校验事故回归守卫）
+#   apt-byhash  —— apt by-hash 长缓存（内容寻址不可变索引被 deny 误伤 → 每次
+#                  apt-get update 全量回源；chart 0.1.31 / PR #2746 回归守卫）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
 # =============================================================================
 name: test-squid
@@ -97,6 +99,18 @@ on:
         default: '0'
       pip_metadata_url:
         description: 'pip-metadata 组的真实 metadata URL（空=默认 torch wheel 的 PEP 658 metadata）'
+        required: false
+        default: ''
+      apt_byhash:
+        description: '1=启用 apt by-hash 长缓存验证（内容寻址不可变索引须 HIT，chart 0.1.31 / PR #2746）'
+        required: false
+        default: '0'
+      apt_byhash_release:
+        description: 'apt-byhash 组的 Release URL（空=repo.huaweicloud.com/ubuntu/dists/jammy/Release）'
+        required: false
+        default: ''
+      apt_byhash_index:
+        description: 'apt-byhash 组跟的索引路径（空=main/binary-amd64/Packages.gz）'
         required: false
         default: ''
       gitcdn_unsynced:
@@ -540,6 +554,37 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  apt-byhash:
+    name: apt by-hash 长缓存（chart 0.1.31）
+    # #2443：repo.huaweicloud.com 的 /ubuntu(-ports)/dists/.../by-hash/<alg>/<hash>
+    # 落在 mutable_meta_with_by_hash 的 cache deny 下，被当可变索引拒缓存 →
+    # 每次 apt-get update 全量回源（cn12-001 单副本 81min / 592 请求 / 560 MISS /
+    # 1.8 GiB）。by-hash 文件名就是内容 sha256、源站给 15 天 max-age，属不可变
+    # 对象，chart 0.1.31 用 `cache deny ... !by_hash` 在同一条 deny 内排除例外
+    # （+ 前置长 TTL refresh_pattern + immutable_file 豁免）。
+    # 阶段：by-hash 对象必须 HIT 且响应体 sha256 == 文件名哈希；同 dists 下
+    # 非 by-hash 可变索引（InRelease / Packages.gz）仍不得缓存（负样本守卫，
+    # test-squid/repro-apt-byhash.sh，META R24）。
+    # opt-in：apt_byhash=1 才跑（chart 未 rollout 时 by-hash 全 MISS 会红，属预期）。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.apt_byhash == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 apt by-hash 长缓存验证
+        env:
+          BYHASH_RELEASE_URL: ${{ inputs.apt_byhash_release }}
+          BYHASH_INDEX: ${{ inputs.apt_byhash_index }}
+        run: bash test-squid/run-suite.sh --mode apt-byhash
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-apt-byhash
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   gitcdn-unsynced:
     name: git-cdn 未同步 SHA 回源复现
     # 2026-11-04 gy-006（run 41762789640 attempt 1，9/11 job 红在 actions/checkout）：
@@ -728,7 +773,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, apt-byhash, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -742,7 +787,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-gitcdn-unsynced \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-apt-byhash test-squid-gitcdn-unsynced \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
