@@ -804,6 +804,10 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 布局诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find . -maxdepth 3 -name '*.tsv' >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
           # 每个产物目录对应一个用例编号；未出现的目录说明该 job 未被 only 选中
           # （或 opt-in 开关关闭），记 NOT-SELECTED 而不是静默省略。
           for pair in \
