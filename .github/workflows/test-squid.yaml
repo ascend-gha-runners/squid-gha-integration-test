@@ -670,7 +670,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-squid-K5
-          path: /tmp/test-squid-results/
+          # 只传证据文本：LFS 对象 .bin 可达数百 MB，没必要进 artifact
+          path: |
+            /tmp/test-squid-results/*.tsv
+            /tmp/test-squid-results/*.log
+            /tmp/test-squid-results/*.err
+            /tmp/test-squid-results/*.hdr
           if-no-files-found: warn
 
   container-miss-p95:
@@ -812,25 +817,26 @@ jobs:
             'test-squid-container-miss-p95:K6-c' 'test-squid-container-imagebuild:B1-c' \
             'test-squid-container-cabundle:W3-c' 'test-squid-container-pkg:T3-e'; do
             d="${pair%%:*}"; ids="${pair#*:}"
-            if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
+            # artifact 解包后可能多一层同名目录（path 是目录时），统一用 find 兜住
+            tf=$(find "$d" -maxdepth 3 -name timings.tsv -print -quit 2>/dev/null)
+            pf=$(find "$d" -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null)
+            if [ -n "$tf" ] || [ -n "$pf" ]; then
               echo "### $d（$ids）" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
               # 逐文件判断后 cat：miss-p95 artifact 只有 probes.tsv 没有
               # timings.tsv，cat 对缺失文件 exit 1 会让 bash -e 直接退出
-              for f in timings.tsv probes.tsv; do
-                if [ -f "$d/$f" ]; then
-                  cat "$d/$f" >> "$GITHUB_STEP_SUMMARY"
-                fi
-              done
+              [ -n "$tf" ] && cat "$tf" >> "$GITHUB_STEP_SUMMARY"
+              [ -n "$pf" ] && cat "$pf" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
             else
               echo "- $ids（$d）：NOT-SELECTED" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          if [ -f test-squid-function/probes.tsv ]; then
+          fp=$(find test-squid-function -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null)
+          if [ -n "$fp" ]; then
             echo "### 域名探测" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat test-squid-function/probes.tsv >> "$GITHUB_STEP_SUMMARY"
+            cat "$fp" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
           cat "$GITHUB_STEP_SUMMARY"
