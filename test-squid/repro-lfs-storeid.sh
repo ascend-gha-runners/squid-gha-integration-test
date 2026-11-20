@@ -60,7 +60,8 @@
 #   LFS_STOREID_NEG_URL    负样本 URL（空=用 pypi.org/simple/six/）
 #   LFS_STOREID_GITCODE_TOKEN  gitcode token（有写权限才跑同名替换实验；空=跳过）
 #   LFS_STOREID_CONSISTENCY_REPO  替换实验用仓库（空=token 用户名下 squid-storeid-consistency，自动创建）
-#   LFS_STOREID_API_BASE   GitCode API 基址（默认 https://api.gitcode.com/api/v5）
+#   LFS_STOREID_API_BASE   GitCode API 基址（默认 https://gitcode.com/api/v5；
+#                          api.gitcode.com 已迁 AtomGit，GitCode token 不被识别）
 #   LFS_STOREID_GET_TIMEOUT 单次下载超时秒数（默认 900）
 #   RESULTS_DIR            结果目录（默认 /tmp/test-squid-results）
 #
@@ -77,7 +78,7 @@ ASSET_URL="${LFS_STOREID_ASSET_URL:-https://gitcode.com/zhoucungen/gitcode-oauth
 ASSET_ALT="${LFS_STOREID_ASSET_URL_ALT:-https://gitcode.com/zhoucungen/gitcode-oauth/releases/download/v0.0.2/install.sh}"
 NEG_URL="${LFS_STOREID_NEG_URL:-https://pypi.org/simple/six/}"
 GC_TOKEN="${LFS_STOREID_GITCODE_TOKEN:-}"
-GC_API="${LFS_STOREID_API_BASE:-https://api.gitcode.com/api/v5}"
+GC_API="${LFS_STOREID_API_BASE:-https://gitcode.com/api/v5}"
 CONS_REPO="${LFS_STOREID_CONSISTENCY_REPO:-}"
 GET_TIMEOUT="${LFS_STOREID_GET_TIMEOUT:-900}"
 results="${RESULTS_DIR:-/tmp/test-squid-results}"
