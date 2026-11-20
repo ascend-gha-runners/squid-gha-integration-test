@@ -131,22 +131,34 @@ resolve_location() {
         | awk 'tolower($1)=="location:"{sub(/^[^:]*:[ \t]*/,""); sub(/\r$/,""); print; exit}'
 }
 
-# ---- GitCode API v5（Gitee 兼容）：凭据只走 Authorization 头，绝不进 URL/日志 ----
+# ---- GitCode API v5（Gitee 兼容）：凭据形态先探测（token 头 / Bearer 头 / access_token 参数）
+# GC_MODE 由 phase_replace 探测后写入；query 形态会把 token 拼进 URL，故 curl 的
+# stderr 一律重定向到文件、不回显（日志里只有 HTTP 码与错误码，不含凭据）。
 gc_call() {  # <method> <api-path> [json-body] —— 响应体写 $results/gc.json，回显 HTTP 码
-    local m=$1 p=$2 body=${3:-}
+    local m=$1 p=$2 body=${3:-} url="$GC_API$p" auth=()
+    case "$GC_MODE" in
+        token)  auth=(-H "Authorization: token $GC_TOKEN") ;;
+        bearer) auth=(-H "Authorization: Bearer $GC_TOKEN") ;;
+        query)  case "$url" in *\?*) url="$url&access_token=$GC_TOKEN" ;; *) url="$url?access_token=$GC_TOKEN" ;; esac ;;
+    esac
     if [ -n "$body" ]; then
-        curl -sS -m 60 -X "$m" -H "Authorization: token $GC_TOKEN" \
-            -H 'Content-Type: application/json' -d "$body" \
-            -o "$results/gc.json" -w '%{http_code}' "$GC_API$p" 2>"$results/gc.err"
+        curl -sS -m 60 -X "$m" "${auth[@]}" -H 'Content-Type: application/json' -d "$body" \
+            -o "$results/gc.json" -w '%{http_code}' "$url" 2>"$results/gc.err"
     else
-        curl -sS -m 60 -X "$m" -H "Authorization: token $GC_TOKEN" \
-            -o "$results/gc.json" -w '%{http_code}' "$GC_API$p" 2>"$results/gc.err"
+        curl -sS -m 60 -X "$m" "${auth[@]}" \
+            -o "$results/gc.json" -w '%{http_code}' "$url" 2>"$results/gc.err"
     fi
 }
 
 gc_upload() {  # <api-path> <file> —— multipart 上传，回显 HTTP 码
-    curl -sS -m 180 -X POST -H "Authorization: token $GC_TOKEN" \
-        -F "file=@$2" -o "$results/gc.json" -w '%{http_code}' "$GC_API$1" 2>"$results/gc.err"
+    local p=$1 url="$GC_API$1" auth=()
+    case "$GC_MODE" in
+        token)  auth=(-H "Authorization: token $GC_TOKEN") ;;
+        bearer) auth=(-H "Authorization: Bearer $GC_TOKEN") ;;
+        query)  case "$url" in *\?*) url="$url&access_token=$GC_TOKEN" ;; *) url="$url?access_token=$GC_TOKEN" ;; esac ;;
+    esac
+    curl -sS -m 180 -X POST "${auth[@]}" -F "file=@$2" \
+        -o "$results/gc.json" -w '%{http_code}' "$url" 2>"$results/gc.err"
 }
 
 gc_field() {  # <json keys...> —— 从 $results/gc.json 取嵌套字段
@@ -169,17 +181,25 @@ print("" if d is None else d)
 # 返回 0=PASS（换内容必换键，或缓存未供旧副本）/ 1=FAIL（实证供旧副本）/ 2=SKIP
 # -----------------------------------------------------------------------------
 phase_replace() {
-    local code login slug rname created_repo=0 tag rid page shaA shaB aidA aidB
+    local code login slug rname created_repo=0 tag rid page shaA shaB aidA aidB mode
     local locA locA2 locB warm_rc cb bb tb sb pc sp delc dc sd
+    GC_TOKEN=$(printf '%s' "$GC_TOKEN" | tr -d ' \t\r\n')
     if [ -z "$GC_TOKEN" ]; then
         echo "⚠️ 无 LFS_STOREID_GITCODE_TOKEN（repository secret CQ_GITCODE_TOKEN）——跳过同名替换实验"
         return 2
     fi
-    code=$(gc_call GET /user); login=$(gc_field login)
-    if [ "$code" != "200" ] || [ -z "$login" ]; then
-        echo "⚠️ token 不可用（GET /user -> HTTP $code）：$(head -c 160 "$results/gc.json" | tr -d '\n')"
+    # GitCode 的凭据形态与 Gitee 不完全一致：三种都试，取第一个能拿到用户信息的
+    for mode in token bearer query; do
+        GC_MODE=$mode
+        code=$(gc_call GET /user); login=$(gc_field login)
+        [ "$code" = "200" ] && [ -n "$login" ] && break
+        login=""
+    done
+    if [ -z "$login" ]; then
+        echo "⚠️ token 不被 GitCode 接受（token/Bearer/access_token 三形态均失败，最后 HTTP $code）：$(head -c 160 "$results/gc.json" | tr -d '\n')"
         return 2
     fi
+    echo "ℹ️ 凭据形态 $GC_MODE 可用（用户 $login）"
     if [ -n "$CONS_REPO" ]; then
         slug="${CONS_REPO#*gitcode.com/}"; slug="${slug%.git}"; slug="${slug#/}"
     else
