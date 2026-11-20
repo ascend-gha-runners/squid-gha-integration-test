@@ -793,21 +793,35 @@ jobs:
     needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, apt-byhash, lfs-storeid, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
+      - name: 记录产物清单
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # download-artifact 在 pattern 只匹配到 1 个产物时不建同名子目录，直接
+          # 平铺到目标目录；汇总需要产物名清单才能把平铺文件归到对应编号
+          names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[].name | select(startswith("test-squid-"))] | join(" ")')
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+          echo "本次产物：${names:-（无）}"
+
       - name: 拉取结果
         uses: actions/download-artifact@v8
         with:
           pattern: test-squid-*
           merge-multiple: false
+          path: artifacts
 
       - name: 汇总表
         if: always()
+        env:
+          ARTIFACTS: ${{ steps.list.outputs.names }}
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          echo "### 布局诊断" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          find . -maxdepth 3 -name '*.tsv' >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
           # 每个产物目录对应一个用例编号；未出现的目录说明该 job 未被 only 选中
           # （或 opt-in 开关关闭），记 NOT-SELECTED 而不是静默省略。
           for pair in \
@@ -820,23 +834,28 @@ jobs:
             'test-squid-container-vllm:P7-c' 'test-squid-container-tools:T1-T2-c' \
             'test-squid-container-miss-p95:K6-c' 'test-squid-container-imagebuild:B1-c' \
             'test-squid-container-cabundle:W3-c' 'test-squid-container-pkg:T3-e'; do
-            d="${pair%%:*}"; ids="${pair#*:}"
+            name="${pair%%:*}"; ids="${pair#*:}"; d="artifacts/$name"
             # artifact 解包后可能多一层同名目录（path 是目录时），统一用 find 兜住
             tf=$(find "$d" -maxdepth 3 -name timings.tsv -print -quit 2>/dev/null || true)
             pf=$(find "$d" -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null || true)
+            # 只匹配到 1 个产物时 download-artifact 不建子目录、直接平铺，用产物
+            # 清单确认平铺文件确实属于这一条用例（清单=单个名字且等于本产物名）
+            if [ -z "$tf" ] && [ -z "$pf" ] && [ "$ARTIFACTS" = "$name" ]; then
+              if [ -f artifacts/timings.tsv ]; then tf=artifacts/timings.tsv; fi
+              if [ -f artifacts/probes.tsv ]; then pf=artifacts/probes.tsv; fi
+            fi
             if [ -n "$tf" ] || [ -n "$pf" ]; then
-              echo "### $d（$ids）" >> "$GITHUB_STEP_SUMMARY"
+              echo "### $name（$ids）" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
-              # 逐文件判断后 cat：miss-p95 artifact 只有 probes.tsv 没有
-              # timings.tsv，cat 对缺失文件 exit 1 会让 bash -e 直接退出
-              [ -n "$tf" ] && cat "$tf" >> "$GITHUB_STEP_SUMMARY"
-              [ -n "$pf" ] && cat "$pf" >> "$GITHUB_STEP_SUMMARY"
+              # miss-p95 artifact 只有 probes.tsv 没有 timings.tsv，逐文件判断
+              if [ -n "$tf" ]; then cat "$tf" >> "$GITHUB_STEP_SUMMARY"; fi
+              if [ -n "$pf" ]; then cat "$pf" >> "$GITHUB_STEP_SUMMARY"; fi
               echo '```' >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "- $ids（$d）：NOT-SELECTED" >> "$GITHUB_STEP_SUMMARY"
+              echo "- $ids（$name）：NOT-SELECTED" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          fp=$(find test-squid-function -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null || true)
+          fp=$(find artifacts/test-squid-function -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null || true)
           if [ -n "$fp" ]; then
             echo "### 域名探测" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
