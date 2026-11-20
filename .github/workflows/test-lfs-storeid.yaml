@@ -1,0 +1,85 @@
+# =============================================================================
+# test-lfs-storeid —— GitCode LFS/Release CDN 的 store_id 去 query 作缓存键
+#
+# 独立 workflow（不进 test-squid 整套）：调这一个用例不必拉起 20+ 个 job。
+# 脚本仍是 test-squid/repro-lfs-storeid.sh，跑通后再决定是否并回主套件。
+#
+# 覆盖两个 CDN 域：
+#   A. lfs-cdn  —— 两次 batch（同 oid）拿两个 auth_key 不同的下载 URL
+#   B. file-cdn —— 同一 Release 资产两次 302，Location 的 auth_key 不同
+# 每个域经 squid 各下载两次 → 断言第二发缓存命中、内容 sha256 一致。
+# 另有：一致性（LFS 内容寻址 / file-cdn 路径版本化 / 伪造签名）与
+# 同名替换实证（有 CQ_GITCODE_TOKEN 时：建临时仓库/release → 上传 A → 删附件
+# 同名重传 B → 比对 302 路径；路径不变则代理/直连对照，供旧副本即判红）。
+#
+# 前提：runner 已注入 squid（HTTP(S)_PROXY + MITM CA），且 squid 已开
+#       squid.storeId.enabled（gy-006 试点已开）。退出码 2 = SKIP，不判红。
+# =============================================================================
+name: test-lfs-storeid
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner 标签（JSON 数组字符串，多标签=AND；需已注入 squid）'
+        required: false
+        default: '["linux-amd64-cpu-2", "gy-006"]'
+      lfs_storeid_repo:
+        description: 'LFS 验证仓库（空=默认 ccijunk/lfs-test，含 64MiB/500MiB 两个对象）'
+        required: false
+        default: ''
+      lfs_storeid_max_mb:
+        description: '参与测试的 LFS 对象体积上限 MiB（默认 96；超过则记 SKIP）'
+        required: false
+        default: '96'
+      lfs_storeid_asset_url:
+        description: 'file-cdn 域的 Release 资产页（空=默认 gitcode-oauth 的 install.sh）'
+        required: false
+        default: ''
+      lfs_storeid_asset_url_alt:
+        description: '同名资产的另一个 release（空=默认 v0.0.2；证明换内容必换路径）'
+        required: false
+        default: ''
+      lfs_storeid_consistency_repo:
+        description: '同名替换实验用仓库（空=token 用户名下 squid-storeid-consistency，自动创建/删除）'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - 'test-squid/repro-lfs-storeid.sh'
+      - '.github/workflows/test-lfs-storeid.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  lfs-storeid:
+    name: GitCode LFS store_id 去 query 缓存键
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 store_id 缓存键验证
+        env:
+          LFS_STOREID_REPO: ${{ inputs.lfs_storeid_repo }}
+          LFS_STOREID_MAX_MB: ${{ inputs.lfs_storeid_max_mb }}
+          LFS_STOREID_ASSET_URL: ${{ inputs.lfs_storeid_asset_url }}
+          LFS_STOREID_ASSET_URL_ALT: ${{ inputs.lfs_storeid_asset_url_alt }}
+          LFS_STOREID_CONSISTENCY_REPO: ${{ inputs.lfs_storeid_consistency_repo }}
+          # 同名替换实验（⑦）：建/删临时仓库与 release 需写权限；无 secret 时该阶段记 SKIP
+          LFS_STOREID_GITCODE_TOKEN: ${{ secrets.CQ_GITCODE_TOKEN }}
+        run: |
+          # 退出码 2 = SKIP（前提不成立：无代理/任务域在 NO_PROXY/仓库无 LFS/需鉴权），不判红
+          rc=0
+          bash test-squid/repro-lfs-storeid.sh || rc=$?
+          if [ "$rc" -eq 2 ]; then echo "用例 SKIP（前提不成立）"; exit 0; fi
+          exit "$rc"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-lfs-storeid
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn

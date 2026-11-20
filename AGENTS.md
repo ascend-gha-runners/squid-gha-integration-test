@@ -43,11 +43,12 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 | `apt_byhash_release` | 空 | apt-byhash 组的 Release URL（空 = `repo.huaweicloud.com/ubuntu/dists/jammy/Release`；换套件/镜像时改这里） |
 | `apt_byhash_index` | 空 | Release 里要跟的索引路径（空 = `main/binary-amd64/Packages.gz`；脚本按该路径在 Release 的 SHA256 段里取哈希拼 by-hash URL） |
 | `gitcdn_unsynced` | `0` | `1` = 复现「git-cdn 无法为未同步 SHA 回源」（仅 gy-006 这类注入了 `insteadOf` → git-cdn 的 runner；2026-11-04 checkout `not our ref` 事故守卫，仅 workflow_dispatch；本 job 需 `contents: write` 建/删临时 ref） |
-| `lfs_store_id` | `0` | `1` = 验证 GitCode LFS/Release CDN 的 `store_id` 去 query 作缓存键（ascend-ci-deployment PR #2272 / issue #2260 守卫）。`lfs-cdn`（batch 双签名）+ `file-cdn`（Release 资产 302 双签名）两个域各断言「第二发命中缓存」，需目标 squid 已开 `squid.storeId.enabled`（gy-006 试点已开），仅 workflow_dispatch |
-| `lfs_storeid_repo` | 空 | LFS 验证仓库（空 = `https://gitcode.com/ccijunk/lfs-test.git`，含 64MiB / 500MiB 两个对象，脚本自动挑体积可控的那个） |
-| `lfs_storeid_max_mb` | `96` | 参与测试的 LFS 对象体积上限（MiB）；仓库里最小对象仍超限则记 SKIP |
-| `lfs_storeid_asset_url` | 空 | `file-cdn` 域的 Release 资产页（空 = `zhoucungen/gitcode-oauth` 的 `install.sh`；换仓库时填任一「附件」下载页） |
-| `lfs_storeid_asset_url_alt` | 空 | 同名资产的另一个 release（空 = 同仓 `v0.0.2` 的 `install.sh`）；用于证明「换内容必换路径」，防同名替换被旧副本污染 |
+| `lfs_store_id` | `0` | **已拆到独立 workflow `test-lfs-storeid.yaml`（见 1.6），test-squid 里该输入仅占位不生效**。内容：`lfs-cdn`（batch 双签名）+ `file-cdn`（Release 资产 302 双签名）两个域各断言「第二发命中缓存」，需目标 squid 已开 `squid.storeId.enabled`（gy-006 试点已开） |
+| `lfs_storeid_repo` | 空 | （`test-lfs-storeid.yaml` 输入）LFS 验证仓库（空 = `https://gitcode.com/ccijunk/lfs-test.git`，含 64MiB / 500MiB 两个对象，脚本自动挑体积可控的那个） |
+| `lfs_storeid_max_mb` | `96` | （`test-lfs-storeid.yaml` 输入）参与测试的 LFS 对象体积上限（MiB）；仓库里最小对象仍超限则记 SKIP |
+| `lfs_storeid_asset_url` | 空 | （`test-lfs-storeid.yaml` 输入）`file-cdn` 域的 Release 资产页（空 = `zhoucungen/gitcode-oauth` 的 `install.sh`；换仓库时填任一「附件」下载页） |
+| `lfs_storeid_asset_url_alt` | 空 | （`test-lfs-storeid.yaml` 输入）同名资产的另一个 release（空 = 同仓 `v0.0.2` 的 `install.sh`）；用于证明「换内容必换路径」，防同名替换被旧副本污染 |
+| `lfs_storeid_consistency_repo` | 空 | （`test-lfs-storeid.yaml` 输入）同名替换实验仓库（空 = token 用户名下 `squid-storeid-consistency`，自动创建/删除） |
 
 也可在 GitHub 网页端触发：仓库 → **Actions** → **test-squid** → **Run workflow**。
 
@@ -125,6 +126,26 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
   （repo / 真值 SHA / cdn HEAD / 结论 / 备注 / 耗时）。
 - 定时轮次不跑 `gitcdn-unsynced` job（避免每 30 分钟造一次临时 ref），该 job 仍
   在 workflow_dispatch / PR 上执行。
+
+### 6. GitCode LFS store_id 缓存键（test-lfs-storeid，独立 workflow）
+
+调这一个用例时用独立 workflow，不必拉起 test-squid 的 20+ 个 job（脚本仍是
+`test-squid/repro-lfs-storeid.sh`，跑通后再决定并回主套件）：
+
+```bash
+gh workflow run test-lfs-storeid.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+  --ref main
+# 换 runner / 换资产页 / 指定替换实验仓库
+gh workflow run test-lfs-storeid.yaml --ref main \
+  -f 'runner=["linux-amd64-cpu-2", "gy-006"]' \
+  -f lfs_storeid_asset_url='https://gitcode.com/<o>/<r>/releases/download/<tag>/<file>' \
+  -f lfs_storeid_consistency_repo='<owner>/<repo>'
+```
+
+判定见 job 表 `GitCode LFS store_id 缓存键` 一行：两个 CDN 域各断言第二发命中缓存；
+一致性阶段（LFS 内容寻址 / file-cdn 路径版本化 / 伪造签名）；仓库 secret
+`CQ_GITCODE_TOKEN` 存在时再做「同 release 同名换内容」替换实验（路径变了即安全，
+路径没变则代理/直连对照，代理供旧副本即判红）。退出码 2 = SKIP 不判红。
 
 ## 二、前置条件（缺一不可）
 
