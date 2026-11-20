@@ -28,6 +28,10 @@
 #   响应头无法硬区分「真 TCP_HIT」与「304」；override-lastmod 的收益（省掉回源
 #   RTT）需 squid access.log 的 TCP_HIT/HIER_NONE 佐证，本用例只留档 Age/耗时。
 #
+# 另加一致性判定（同名/同路径换内容会不会被旧副本污染）：
+#   LFS 路径必须是内容地址（含 oid）→ 同名必然同字节；
+#   file-cdn 同名资产在不同 release 下必须落在不同路径（untagger_<uuid>）；
+#   再用伪造 auth_key 打已缓存路径，记录 HIT 是否会跳过签名校验。
 # 另加负样本：非 CDN 域（默认 pypi.org 索引页）同 URL 二发应 HIT、换 query 必须
 # MISS，证明 store_id_access 的域限定没被放大。
 #
@@ -44,6 +48,8 @@
 #   LFS_STOREID_SIZE       直接指定 size（字节）
 #   LFS_STOREID_ASSET_URL  Release 资产页 URL（默认 gitcode-oauth 的 install.sh，
 #                          两次访问 302 到 file-cdn 且签名不同）
+#   LFS_STOREID_ASSET_URL_ALT 同名资产的另一个 release（默认 v0.0.2，用于证明
+#                          「换内容必换路径」）
 #   LFS_STOREID_NEG_URL    负样本 URL（空=用 pypi.org/simple/six/）
 #   LFS_STOREID_GET_TIMEOUT 单次下载超时秒数（默认 900）
 #   RESULTS_DIR            结果目录（默认 /tmp/test-squid-results）
@@ -58,6 +64,7 @@ MAX_MB="${LFS_STOREID_MAX_MB:-96}"
 OID="${LFS_STOREID_OID:-}"
 SIZE="${LFS_STOREID_SIZE:-}"
 ASSET_URL="${LFS_STOREID_ASSET_URL:-https://gitcode.com/zhoucungen/gitcode-oauth/releases/download/v0.0.1/install.sh}"
+ASSET_ALT="${LFS_STOREID_ASSET_URL_ALT:-https://gitcode.com/zhoucungen/gitcode-oauth/releases/download/v0.0.2/install.sh}"
 NEG_URL="${LFS_STOREID_NEG_URL:-https://pypi.org/simple/six/}"
 GET_TIMEOUT="${LFS_STOREID_GET_TIMEOUT:-900}"
 results="${RESULTS_DIR:-/tmp/test-squid-results}"
@@ -312,7 +319,72 @@ else
     fi
 fi
 
-# --- ⑤ 负样本：非 CDN 域不同 query 不得复用 ---------------------------------
+# --- ⑤ 一致性：同名/同路径换内容会不会被旧副本污染 --------------------------
+# store_id 把 query 从缓存键里去掉，所以必须证明「路径唯一决定内容」，否则上游
+# 替换同名文件后 squid 会继续供旧副本（refresh_pattern min=10080 分钟，最长 7 天）。
+t0=$(date +%s)
+cons_rc=2
+cons_notes=""
+# A. LFS：路径就是内容地址（/lfs-objects/aa/91/<oid 剩余部分>），同名必然同内容
+if [ -n "${href1:-}" ]; then
+    norm=$(strip_q "$href1" | tr -d '/')
+    if printf '%s' "$norm" | grep -q "$OID"; then
+        cons_notes="${cons_notes}LFS 路径含 oid（内容寻址，同名不可能换内容）；"
+        echo "✅ LFS 路径是内容地址（含 oid）→ 同路径必然同字节，无陈旧风险"
+        [ "$cons_rc" = 1 ] || cons_rc=0
+    else
+        cons_notes="${cons_notes}LFS 路径不含 oid（同名换内容风险）；"
+        echo "❌ LFS 路径不含 oid——同路径可能对应不同内容，store_id 会把新对象挡在缓存外"
+        cons_rc=1
+    fi
+fi
+# B. file-cdn：路径里的 untagger_<uuid> 是否随 release/上传变化（换了就不是同一个键）
+if [ -n "${loc1:-}" ] && [ -n "$ASSET_ALT" ]; then
+    loc_alt=$(resolve_location "$ASSET_ALT")
+    if [ -z "$loc_alt" ]; then
+        cons_notes="${cons_notes}file-cdn 对照资产不可达；"
+        echo "⚠️ 对照资产页无 302（$ASSET_ALT），路径版本化判定记 SKIP"
+    elif [ "$(url_host "$loc_alt")" != "file-cdn.gitcode.com" ]; then
+        cons_notes="${cons_notes}file-cdn 对照资产未落到 file-cdn；"
+        echo "⚠️ 对照资产跳到 $(url_host "$loc_alt")，路径版本化判定记 SKIP"
+    else
+        d1=$(strip_q "$loc1"); d1="${d1%/*}"
+        d2=$(strip_q "$loc_alt"); d2="${d2%/*}"
+        if [ "$d1" != "$d2" ]; then
+            cons_notes="${cons_notes}file-cdn 路径带上传 uuid（跨 release 不复用键）；"
+            echo "✅ file-cdn 同文件名在不同 release 下路径不同（$d1 vs $d2）→ 换内容必换缓存键"
+            [ "$cons_rc" = 1 ] || cons_rc=0
+        else
+            cons_notes="${cons_notes}file-cdn 同名跨 release 共用路径（替换风险）；"
+            echo "⚠️ 同文件名跨 release 落在同一路径——同名替换内容可能被旧副本污染，需按上传替换实验复核"
+            [ "$cons_rc" = 1 ] || cons_rc=0
+        fi
+    fi
+fi
+# C. 缓存命中是否会跳过签名校验：用伪造 auth_key 打已缓存的 LFS 路径
+if [ -n "${href1:-}" ]; then
+    bogus="$(strip_q "$href1")?auth_key=bogus-probe"
+    bc=$(curl -sS --max-time 120 -o /dev/null -D "$results/authbypass.hdr" -w '%{http_code}' "$bogus" 2>/dev/null)
+    bst=$(hdr_val cache-status "$results/authbypass.hdr")
+    echo "伪造 auth_key 请求: http=$bc ${bst:-<无缓存头>}"
+    case "$bc" in
+        200)
+            echo "ℹ️ 已缓存路径即使 auth_key 非法也返回 200 ${bst:+（$bst）}——HIT 不再回源校验签名；公开对象无影响，私有仓需评估"
+            cons_notes="${cons_notes}缓存命中会跳过签名校验（公开对象无影响）；" ;;
+        *)
+            cons_notes="${cons_notes}非法签名被拒（$bc），签名仍生效；" ;;
+    esac
+fi
+if [ -z "$cons_notes" ]; then
+    echo "⚠️ 一致性阶段没有可判定项"
+    step consistency SKIP $(( $(date +%s) - t0 ))
+else
+    echo "ℹ️ 一致性结论: $cons_notes"
+    printf 'consistency\t-\t%s\t-\t%s\t-\t-\t-\t%s\n' "$cons_notes" >> "$DETAIL"
+    step consistency "$([ $cons_rc = 2 ] && echo SKIP || echo $cons_rc)" $(( $(date +%s) - t0 ))
+fi
+
+# --- ⑥ 负样本：非 CDN 域不同 query 不得复用 ---------------------------------
 t0=$(date +%s)
 neg_rc=2
 if [ -z "$NEG_URL" ]; then
@@ -346,7 +418,7 @@ fi
 echo
 echo "== 证据（$DETAIL）=="
 cat "$DETAIL"
-if [ "$lfs_rc" = 1 ] || [ "$asset_rc" = 1 ] || [ "$neg_rc" = 1 ]; then
+if [ "$lfs_rc" = 1 ] || [ "$asset_rc" = 1 ] || [ "$cons_rc" = 1 ] || [ "$neg_rc" = 1 ]; then
     echo "== 结论：FAIL =="
     exit 1
 fi

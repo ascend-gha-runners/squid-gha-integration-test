@@ -135,6 +135,10 @@ on:
         description: 'file-cdn 域的 Release 资产页（空=默认 gitcode-oauth 的 install.sh；两次访问 302 到 file-cdn 且签名不同）'
         required: false
         default: ''
+      lfs_storeid_asset_url_alt:
+        description: '同名资产的另一个 release（空=默认 v0.0.2；用于证明换内容必换路径，防同名替换被旧副本污染）'
+        required: false
+        default: ''
   pull_request:
     paths:
       - 'test-squid/**'
@@ -658,6 +662,7 @@ jobs:
           LFS_STOREID_REPO: ${{ inputs.lfs_storeid_repo }}
           LFS_STOREID_MAX_MB: ${{ inputs.lfs_storeid_max_mb }}
           LFS_STOREID_ASSET_URL: ${{ inputs.lfs_storeid_asset_url }}
+          LFS_STOREID_ASSET_URL_ALT: ${{ inputs.lfs_storeid_asset_url_alt }}
         run: |
           # 退出码 2 = SKIP（前提不成立：无代理/任务域在 NO_PROXY/仓库无 LFS/需鉴权），不判红
           rc=0
