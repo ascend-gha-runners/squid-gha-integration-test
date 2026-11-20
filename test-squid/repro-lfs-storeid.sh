@@ -136,7 +136,10 @@ resolve_location() {
 # GC_MODE 由 phase_replace 探测后写入；query 形态会把 token 拼进 URL，故 curl 的
 # stderr 一律重定向到文件、不回显（日志里只有 HTTP 码与错误码，不含凭据）。
 gc_call() {  # <method> <api-path> [json-body] —— 响应体写 $results/gc.json，回显 HTTP 码
-    local m=$1 p=$2 body=${3:-} url="$GC_API$p" auth=()
+    local m=$1 p=$2 body=${3:-}
+    # 注意：url 必须单独一行声明——同一行 local 里的展开发生在赋值之前，
+    # 会读到全局残留的 p（发现阶段存过文件路径），把 API 路径拼坏。
+    local url="$GC_API$p" auth=()
     case "$GC_MODE" in
         token)  auth=(-H "Authorization: token $GC_TOKEN") ;;
         bearer) auth=(-H "Authorization: Bearer $GC_TOKEN") ;;
@@ -152,7 +155,7 @@ gc_call() {  # <method> <api-path> [json-body] —— 响应体写 $results/gc.j
 }
 
 gc_upload() {  # <api-path> <file> —— multipart 上传，回显 HTTP 码
-    local p=$1 url="$GC_API$1" auth=()
+    local url="$GC_API$1" auth=()
     case "$GC_MODE" in
         token)  auth=(-H "Authorization: token $GC_TOKEN") ;;
         bearer) auth=(-H "Authorization: Bearer $GC_TOKEN") ;;
@@ -190,14 +193,16 @@ phase_replace() {
         return 2
     fi
     # GitCode 的凭据形态与 Gitee 不完全一致：三种都试，取第一个能拿到用户信息的
+    local diag=""
     for mode in token bearer query; do
         GC_MODE=$mode
         code=$(gc_call GET /user); login=$(gc_field login)
         [ "$code" = "200" ] && [ -n "$login" ] && break
+        diag="$diag $mode=$code"
         login=""
     done
     if [ -z "$login" ]; then
-        echo "⚠️ token 不被 GitCode 接受（token/Bearer/access_token 三形态均失败，最后 HTTP $code）：$(head -c 160 "$results/gc.json" | tr -d '\n')"
+        echo "⚠️ token 不被 GitCode 接受（$diag）：$(head -c 160 "$results/gc.json" | tr -d '\n')"
         return 2
     fi
     echo "ℹ️ 凭据形态 $GC_MODE 可用（用户 $login）"
