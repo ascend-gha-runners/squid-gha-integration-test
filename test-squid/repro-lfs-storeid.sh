@@ -66,7 +66,12 @@
 #   LFS_STOREID_GET_TIMEOUT 单次下载超时秒数（默认 900）
 #   RESULTS_DIR            结果目录（默认 /tmp/test-squid-results）
 #
-# 输出：timings.tsv（phase/seconds/status/group）、probes.tsv、lfs-storeid.tsv
+# 输出：timings.tsv（id/phase/status/seconds/note，phase 依次为 K5-0-env、
+#       K5-1-discover、K5-A1-lfs-batch、K5-A2-lfs-reuse、K5-A3-lfs-content、
+#       K5-A4-lfs-authbypass、K5-B1-filecdn-resolve、K5-B2-filecdn-reuse、
+#       K5-B3-filecdn-version、K5-C1-domain-negative、K5-D1-replace）、
+#       probes.tsv、lfs-storeid.tsv
+# 判定：任一 phase FAIL → 红；A1/A2/B1/B2/D1 任一 PASS → 绿；否则 SKIP
 # 退出码：0=PASS；1=FAIL；2=SKIP（前提不成立）
 # =============================================================================
 set -uo pipefail
@@ -89,13 +94,22 @@ mkdir -p "$results"
 TSV="$results/timings.tsv"
 PROBES="$results/probes.tsv"
 DETAIL="$results/lfs-storeid.tsv"
-[ -f "$TSV" ] || printf 'phase\tseconds\tstatus\tgroup\n' > "$TSV"
+[ -f "$TSV" ] || printf 'id\tphase\tstatus\tseconds\tnote\n' > "$TSV"
 [ -f "$PROBES" ] || printf 'url\thttp_code\tseconds\n' > "$PROBES"
 printf 'case\tside\turl\thttp\tcache_status\tage\tbytes\tsha256_prefix\tseconds\tnote\n' > "$DETAIL"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
-step() { printf '%s\t%s\t%s\t%s\n' "$1" "$3" "$2" "${4:-lfs-storeid}" >> "$TSV"; }
+# 统一 timings 五列：id, phase, status, seconds, note（编号 K5 = LFS store_id 用例）
+step() {  # <phase> <status(0|1|SKIP)> <seconds> [note]
+    local ph=$1 st=$2 sec=$3 note=${4:-}
+    case "$st" in
+        0|PASS) st=PASS ;;
+        2|SKIP) st=SKIP ;;
+        *) st=FAIL ;;
+    esac
+    printf 'K5\tK5-%s\t%s\t%s\t%s\n' "$ph" "$st" "$sec" "$note" >> "$TSV"
+}
 
 hdr_val() {
     awk -v h="$1" 'tolower($1)==h":"{sub(/^[^:]*:[ \t]*/,""); sub(/\r$/,""); print; exit}' "$2" 2>/dev/null
@@ -475,12 +489,12 @@ echo "代理: ${proxy:-<空>}"
 echo "NO_PROXY: ${NO_PROXY:-${no_proxy:-<空>}}"
 if [ -z "$proxy" ]; then
     echo "⚠️ 无代理环境变量——runner 未注入 squid，本用例前提不成立"
-    step env SKIP 0; exit 2
+    step 0-env SKIP 0; exit 2
 fi
 if host_in_noproxy "$repo_host"; then
     echo "ℹ️ 仓库域在 NO_PROXY（batch/302 直连），被测的是 CDN 域的对象下载，稍后单独判定"
 fi
-step env 0 0
+step 0-env 0 0
 
 # --- ② 发现一个体积可控的 LFS 对象 -----------------------------------------
 t0=$(date +%s)
@@ -492,7 +506,7 @@ if [ -z "$OID" ] || [ -z "$SIZE" ]; then
              clone --depth 1 --single-branch -q "$REPO" "$wd" 2>"$results/lfs-storeid-clone.log"; then
         echo "⚠️ 浅克隆失败（仓库不可达或需鉴权），无法发现 LFS 对象"
         tail -n 5 "$results/lfs-storeid-clone.log" | sed 's/^/    | /'
-        step discover SKIP $(( $(date +%s) - t0 )); exit 2
+        step 1-discover SKIP $(( $(date +%s) - t0 )); exit 2
     fi
     found=""
     while IFS= read -r f; do
@@ -509,14 +523,14 @@ if [ -z "$OID" ] || [ -z "$SIZE" ]; then
     rm -rf "$wd"
     if [ -z "$OID" ] || [ -z "$SIZE" ]; then
         echo "⚠️ $REPO 的 HEAD 没有 LFS 对象，用例不适用"
-        step discover SKIP $(( $(date +%s) - t0 )); exit 2
+        step 1-discover SKIP $(( $(date +%s) - t0 )); exit 2
     fi
 fi
 if [ "$SIZE" -gt $(( MAX_MB * 1024 * 1024 )) ]; then
     echo "⚠️ 最小对象 ${SIZE}B 超过上限 ${MAX_MB}MiB——换 LFS_STOREID_REPO 或调大 LFS_STOREID_MAX_MB"
-    step discover SKIP $(( $(date +%s) - t0 )); exit 2
+    step 1-discover SKIP $(( $(date +%s) - t0 )); exit 2
 fi
-step discover 0 $(( $(date +%s) - t0 ))
+step 1-discover 0 $(( $(date +%s) - t0 ))
 
 # --- ③ LFS：两次 batch → 同路径、不同 auth_key -----------------------------
 t0=$(date +%s)
@@ -539,7 +553,7 @@ for i in 1 2; do
         -d "$body" 2>"$results/batch-$i.err")
     echo "batch#$i: http=$code $(head -c 160 "$results/batch-$i.json" | tr -d '\n')"
     [ "$code" = "200" ] || { echo "⚠️ batch 接口不可匿名访问（http=$code），LFS 域用例前提不成立"
-        step discover-batch SKIP $(( $(date +%s) - t0 )); href1=""; break; }
+        step 1-discover-batch SKIP $(( $(date +%s) - t0 )); href1=""; break; }
     if [ "$i" = 1 ]; then href1=$(get_href "$results/batch-$i.json"); else href2=$(get_href "$results/batch-$i.json"); fi
     sleep 2   # auth_key 含秒级时间戳，拉开两批确保签名不同
 done
@@ -550,19 +564,19 @@ if [ -n "$href1" ] && [ -n "$href2" ]; then
     lfs_host=$(url_host "$href1")
     if [ "$(strip_q "$href1")" != "$(strip_q "$href2")" ]; then
         echo "❌ 两批 LFS URL 路径不同，store_id 前提不成立"
-        step lfs-batch 1 $(( $(date +%s) - t0 )); exit 1
+        step A1-lfs-batch 1 $(( $(date +%s) - t0 )); exit 1
     elif [ "$href1" = "$href2" ]; then
         echo "⚠️ 两批 auth_key 相同（签名未轮换），无法证明跨签名复用"
-        step lfs-batch SKIP $(( $(date +%s) - t0 )); lfs_rc=2
+        step A1-lfs-batch SKIP $(( $(date +%s) - t0 )); lfs_rc=2
     elif host_in_noproxy "$lfs_host"; then
         echo "⚠️ $lfs_host 在 NO_PROXY 内——LFS 对象下载直连，store_id 无从验证"
-        step lfs-batch SKIP $(( $(date +%s) - t0 )); lfs_rc=2
+        step A1-lfs-batch SKIP $(( $(date +%s) - t0 )); lfs_rc=2
     else
         echo "✅ LFS 同路径、不同签名（CDN 域 ${lfs_host}）"
-        step lfs-batch 0 $(( $(date +%s) - t0 ))
+        step A1-lfs-batch 0 $(( $(date +%s) - t0 ))
         t0=$(date +%s)
         fetch_pair lfs "$href1" "$href2" "$OID"; lfs_rc=$?
-        step lfs-reuse "$([ $lfs_rc = 2 ] && echo SKIP || echo $lfs_rc)" $(( $(date +%s) - t0 ))
+        step A2-lfs-reuse "$([ $lfs_rc = 2 ] && echo SKIP || echo $lfs_rc)" $(( $(date +%s) - t0 ))
     fi
 fi
 
@@ -571,7 +585,7 @@ t0=$(date +%s)
 asset_rc=2
 if [ -z "$ASSET_URL" ]; then
     echo "⚠️ 未配置 Release 资产 URL，跳过 file-cdn 域"
-    step asset-resolve SKIP 0
+    step B1-filecdn-resolve SKIP 0
 else
     loc1=$(resolve_location "$ASSET_URL")
     sleep 2
@@ -580,19 +594,19 @@ else
     echo "资产 302#2: ${loc2:0:140}"
     if [ -z "$loc1" ] || [ -z "$loc2" ]; then
         echo "⚠️ 资产页没有 302（$ASSET_URL 可能已失效/不再是附件），file-cdn 域记 SKIP"
-        step asset-resolve SKIP $(( $(date +%s) - t0 ))
+        step B1-filecdn-resolve SKIP $(( $(date +%s) - t0 ))
     elif [ "$(url_host "$loc1")" != "file-cdn.gitcode.com" ]; then
         echo "⚠️ 资产跳转落到 $(url_host "$loc1")，不是 file-cdn.gitcode.com，本域记 SKIP"
-        step asset-resolve SKIP $(( $(date +%s) - t0 ))
+        step B1-filecdn-resolve SKIP $(( $(date +%s) - t0 ))
     elif [ "$(strip_q "$loc1")" != "$(strip_q "$loc2")" ]; then
         echo "❌ 两次 302 路径不同（附件可能被替换），无法验证同路径复用"
-        step asset-resolve 1 $(( $(date +%s) - t0 )); asset_rc=1
+        step B1-filecdn-resolve 1 $(( $(date +%s) - t0 )); asset_rc=1
     elif host_in_noproxy "$(url_host "$loc1")"; then
         echo "⚠️ file-cdn.gitcode.com 在 NO_PROXY 内——资产下载直连，store_id 无从验证"
-        step asset-resolve SKIP $(( $(date +%s) - t0 ))
+        step B1-filecdn-resolve SKIP $(( $(date +%s) - t0 ))
     else
         echo "✅ Release 资产同路径、不同签名（file-cdn.gitcode.com）"
-        step asset-resolve 0 $(( $(date +%s) - t0 ))
+        step B1-filecdn-resolve 0 $(( $(date +%s) - t0 ))
         if [ "$loc1" = "$loc2" ]; then
             echo "ℹ️ 两次 302 的签名相同，只能验证普通缓存，无法验证跨签名复用"
         fi
@@ -609,7 +623,7 @@ else
                 fetch_pair filecdn-retry "$loc3" "${loc4:-$loc3}"; asset_rc=$?
             fi
         fi
-        step filecdn-reuse "$([ $asset_rc = 2 ] && echo SKIP || echo $asset_rc)" $(( $(date +%s) - t0 ))
+        step B2-filecdn-reuse "$([ $asset_rc = 2 ] && echo SKIP || echo $asset_rc)" $(( $(date +%s) - t0 ))
     fi
 fi
 
@@ -617,45 +631,61 @@ fi
 # store_id 把 query 从缓存键里去掉，所以必须证明「路径唯一决定内容」，否则上游
 # 替换同名文件后 squid 会继续供旧副本（refresh_pattern min=10080 分钟，最长 7 天）。
 t0=$(date +%s)
-cons_rc=2
 cons_notes=""
-# A. LFS：路径就是内容地址（/lfs-objects/aa/91/<oid 剩余部分>），同名必然同内容
+a3_rc=2
+# A3. LFS：路径就是内容地址（/lfs-objects/aa/91/<oid 剩余部分>），同名必然同内容
 if [ -n "${href1:-}" ]; then
     norm=$(strip_q "$href1" | tr -d '/')
     if printf '%s' "$norm" | grep -q "$OID"; then
         cons_notes="${cons_notes}LFS 路径含 oid（内容寻址，同名不可能换内容）；"
         echo "✅ LFS 路径是内容地址（含 oid）→ 同路径必然同字节，无陈旧风险"
-        [ "$cons_rc" = 1 ] || cons_rc=0
+        a3_rc=0
+        step A3-lfs-content 0 $(( $(date +%s) - t0 )) "路径含 oid（内容寻址）"
     else
         cons_notes="${cons_notes}LFS 路径不含 oid（同名换内容风险）；"
         echo "❌ LFS 路径不含 oid——同路径可能对应不同内容，store_id 会把新对象挡在缓存外"
-        cons_rc=1
+        a3_rc=1
+        step A3-lfs-content 1 $(( $(date +%s) - t0 )) "路径不含 oid"
     fi
+else
+    echo "⚠️ 未取到 LFS 下载 URL，内容寻址判定记 SKIP"
+    step A3-lfs-content SKIP 0 "LFS URL 未取到"
 fi
-# B. file-cdn：路径里的 untagger_<uuid> 是否随 release/上传变化（换了就不是同一个键）
+# B3. file-cdn：路径里的 untagger_<uuid> 是否随 release/上传变化（换了就不是同一个键）
+b3_rc=2; b3_note=""
 if [ -n "${loc1:-}" ] && [ -n "$ASSET_ALT" ]; then
     loc_alt=$(resolve_location "$ASSET_ALT")
     if [ -z "$loc_alt" ]; then
         cons_notes="${cons_notes}file-cdn 对照资产不可达；"
         echo "⚠️ 对照资产页无 302（$ASSET_ALT），路径版本化判定记 SKIP"
+        b3_note="对照资产无 302"
     elif [ "$(url_host "$loc_alt")" != "file-cdn.gitcode.com" ]; then
         cons_notes="${cons_notes}file-cdn 对照资产未落到 file-cdn；"
         echo "⚠️ 对照资产跳到 $(url_host "$loc_alt")，路径版本化判定记 SKIP"
+        b3_note="对照资产未落 file-cdn"
     else
         d1=$(strip_q "$loc1"); d1="${d1%/*}"
         d2=$(strip_q "$loc_alt"); d2="${d2%/*}"
         if [ "$d1" != "$d2" ]; then
             cons_notes="${cons_notes}file-cdn 路径带上传 uuid（跨 release 不复用键）；"
             echo "✅ file-cdn 同文件名在不同 release 下路径不同（$d1 vs $d2）→ 换内容必换缓存键"
-            [ "$cons_rc" = 1 ] || cons_rc=0
+            b3_rc=0; b3_note="跨 release 路径不同"
         else
             cons_notes="${cons_notes}file-cdn 同名跨 release 共用路径（替换风险）；"
             echo "⚠️ 同文件名跨 release 落在同一路径——同名替换内容可能被旧副本污染，需按上传替换实验复核"
-            [ "$cons_rc" = 1 ] || cons_rc=0
+            b3_rc=0; b3_note="跨 release 共用路径（需 D1 复核）"
         fi
     fi
+else
+    echo "⚠️ 未配置对照资产页（LFS_STOREID_ASSET_URL_ALT），路径版本化判定记 SKIP"
+    b3_note="未配置对照资产页"
 fi
-# C. 缓存命中是否会跳过签名校验：用伪造 auth_key 打已缓存的 LFS 路径
+[ "$b3_rc" = 2 ] && step B3-filecdn-version SKIP $(( $(date +%s) - t0 )) "$b3_note" \
+    || step B3-filecdn-version "$b3_rc" $(( $(date +%s) - t0 )) "$b3_note"
+
+# A4. 缓存命中是否会跳过签名校验：用伪造 auth_key 打已缓存的 LFS 路径
+#     只留档不判红（公开对象无影响；私有仓再评估）
+t0=$(date +%s)
 if [ -n "${href1:-}" ]; then
     bogus="$(strip_q "$href1")?auth_key=bogus-probe"
     bc=$(curl -sS --max-time 120 -o /dev/null -D "$results/authbypass.hdr" -w '%{http_code}' "$bogus" 2>/dev/null)
@@ -664,18 +694,18 @@ if [ -n "${href1:-}" ]; then
     case "$bc" in
         200)
             echo "ℹ️ 已缓存路径即使 auth_key 非法也返回 200 ${bst:+（$bst）}——HIT 不再回源校验签名；公开对象无影响，私有仓需评估"
-            cons_notes="${cons_notes}缓存命中会跳过签名校验（公开对象无影响）；" ;;
+            cons_notes="${cons_notes}缓存命中会跳过签名校验（公开对象无影响）；"
+            step A4-lfs-authbypass 0 $(( $(date +%s) - t0 )) "HIT 跳过签名校验（仅留档）" ;;
         *)
-            cons_notes="${cons_notes}非法签名被拒（$bc），签名仍生效；" ;;
+            cons_notes="${cons_notes}非法签名被拒（$bc），签名仍生效；"
+            step A4-lfs-authbypass 0 $(( $(date +%s) - t0 )) "非法签名被拒 http=$bc（仅留档）" ;;
     esac
-fi
-if [ -z "$cons_notes" ]; then
-    echo "⚠️ 一致性阶段没有可判定项"
-    step consistency SKIP $(( $(date +%s) - t0 ))
 else
+    step A4-lfs-authbypass SKIP 0 "LFS URL 未取到"
+fi
+if [ -n "$cons_notes" ]; then
     echo "ℹ️ 一致性结论: $cons_notes"
     printf 'consistency\t-\t%s\t-\t%s\t-\t-\t-\t%s\n' "$cons_notes" >> "$DETAIL"
-    step consistency "$([ $cons_rc = 2 ] && echo SKIP || echo $cons_rc)" $(( $(date +%s) - t0 ))
 fi
 
 # --- ⑥ 负样本：非 CDN 域不同 query 不得复用 ---------------------------------
@@ -683,7 +713,7 @@ t0=$(date +%s)
 neg_rc=2
 if [ -z "$NEG_URL" ]; then
     echo "⚠️ 未配置 LFS_STOREID_NEG_URL，跳过域隔离负样本"
-    step negative SKIP 0
+    step C1-domain-negative SKIP 0
 else
     sep='?'; case "$NEG_URL" in *\?*) sep='&' ;; esac
     u1="${NEG_URL}${sep}storeid_probe=$RUN_ID"
@@ -705,19 +735,29 @@ else
         echo "✅ 非 CDN 域换 query 仍 MISS → store_id 只作用于两个 CDN 域"
         neg_rc=0
     fi
-    step negative "$([ $neg_rc = 2 ] && echo SKIP || echo $neg_rc)" $(( $(date +%s) - t0 ))
+    step C1-domain-negative "$([ $neg_rc = 2 ] && echo SKIP || echo $neg_rc)" $(( $(date +%s) - t0 ))
 fi
 
 # --- ⑦ 同名替换实验：同 release 里同名换内容是否被旧副本污染 ------------------
 t0=$(date +%s)
 phase_replace; repl_rc=$?
-step replace "$([ "$repl_rc" = 2 ] && echo SKIP || echo "$repl_rc")" $(( $(date +%s) - t0 ))
+step D1-replace "$([ "$repl_rc" = 2 ] && echo SKIP || echo "$repl_rc")" $(( $(date +%s) - t0 ))
 
 # --- 结论 -------------------------------------------------------------------
 echo
 echo "== 证据（$DETAIL）=="
 cat "$DETAIL"
-if [ "$lfs_rc" = 1 ] || [ "$asset_rc" = 1 ] || [ "$cons_rc" = 1 ] || [ "$neg_rc" = 1 ] || [ "$repl_rc" = 1 ]; then
+echo
+echo "== K5 分组结论 =="
+awk -F'\t' 'NR>1{
+    if ($2 ~ /-A[0-9]/) g="A. lfs-cdn";
+    else if ($2 ~ /-B[0-9]/) g="B. file-cdn";
+    else if ($2 ~ /-C[0-9]/) g="C. 域隔离（负样本）";
+    else if ($2 ~ /-D[0-9]/) g="D. 同名替换";
+    else g="0. 前置/发现";
+    printf "  %-22s %-28s %-5s %ss %s\n", g, $2, $3, $4, $5
+}' "$TSV"
+if [ "$lfs_rc" = 1 ] || [ "$asset_rc" = 1 ] || [ "$a3_rc" = 1 ] || [ "$b3_rc" = 1 ] || [ "$neg_rc" = 1 ] || [ "$repl_rc" = 1 ]; then
     echo "== 结论：FAIL =="
     exit 1
 fi

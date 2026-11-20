@@ -34,6 +34,16 @@
 #                  （lfs-cdn × file-cdn 两域跨签名复用 + 同名替换一致性，
 #                  PR #2272 / issue #2260 回归守卫）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
+#
+# 用例编号（台账见 CASES.md「用例台账」）：每个 job 对应一个或多个编号，
+# workflow_dispatch 可用 `only` 白名单只跑其中几条（空=全跑，PR 事件全跑）：
+#   only=k5                → 只跑 GitCode LFS store_id（编号）
+#   only=lfs-storeid       → 同上（job id）
+#   only=k5,p7             → 两条一起
+# 编号规则：面+序号（P 代理基础 / K 缓存语义 / W 重写路由 / T 真实工具链 /
+# G git 服务 / B 构建网络 / O 运维探针），层级后缀 -r runner / -c CANN / -e openEuler。
+# 注意：容器层 job 的 needs 链不变——只选容器层编号时，其 needs 上游未选会被
+# 跳过，请把依赖编号一起写进 only（如 only=p1,p1-c）。
 # =============================================================================
 name: test-squid
 
@@ -44,6 +54,10 @@ on:
         description: 'runner 标签（JSON 数组字符串，多标签=AND；需已注入 squid 代理）'
         required: false
         default: '["linux-amd64-cpu-2", "gy-006"]'
+      only:
+        description: '只跑指定用例（逗号分隔的编号或 job id，如 k5 或 lfs-storeid；空=全跑）'
+        required: false
+        default: ''
       ladder:
         description: '并发度阶梯（空格分隔）'
         required: false
@@ -116,10 +130,6 @@ on:
         description: 'apt-byhash 组跟的索引路径（空=main/binary-amd64/Packages.gz）'
         required: false
         default: ''
-      gitcdn_unsynced:
-        description: '1=复现 git-cdn 无法为未同步 SHA 回源（需 runner 已注入 insteadOf→git-cdn，如 gy-006；2026-11-04 checkout 事故守卫）'
-        required: false
-        default: '0'
       lfs_store_id:
         description: '1=启用 GitCode LFS/Release CDN 的 store_id 去 query 缓存键验证（需目标 squid 已开 squid.storeId.enabled）'
         required: false
@@ -157,6 +167,7 @@ permissions:
 jobs:
   function:
     name: squid 功能测试
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p1,') || contains(format(',{0},', inputs.only), ',p2,') || contains(format(',{0},', inputs.only), ',p3,') || contains(format(',{0},', inputs.only), ',p4,') || contains(format(',{0},', inputs.only), ',p5,') || contains(format(',{0},', inputs.only), ',function,') }}
     # 多标签必须用 JSON 数组：表达式里的逗号字符串不会被拆成多标签（会变成
     # 一个字面标签，永远匹配不到 → job 永久 queued）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
@@ -189,6 +200,7 @@ jobs:
 
   concurrency:
     name: squid 并发测试
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p6,') || contains(format(',{0},', inputs.only), ',concurrency,') }}
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -211,6 +223,7 @@ jobs:
 
   container-function:
     name: 容器层·功能测试（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p1-c,') || contains(format(',{0},', inputs.only), ',p2-c,') || contains(format(',{0},', inputs.only), ',p3-c,') || contains(format(',{0},', inputs.only), ',p4-c,') || contains(format(',{0},', inputs.only), ',p5-c,') || contains(format(',{0},', inputs.only), ',container-function,') }}
     timeout-minutes: 60
     needs: function
     # container: 形态 —— 验证 squid 注入在用户镜像内同样生效（env 传递 + CA 灌库）
@@ -247,6 +260,7 @@ jobs:
 
   container-concurrency:
     name: 容器层·并发测试（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p6-c,') || contains(format(',{0},', inputs.only), ',container-concurrency,') }}
     timeout-minutes: 60
     # 容器层五 job 用 needs 链串行（runner 层照常并行）：并行触发多个
     # container hook 会踩 runner-container-hooks 的挂死竞态（连接死亡后
@@ -275,6 +289,7 @@ jobs:
 
   vllm:
     name: vllm 通信模拟（runner 层）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p7,') || contains(format(',{0},', inputs.only), ',vllm,') }}
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -292,6 +307,7 @@ jobs:
 
   container-vllm:
     name: vllm 通信模拟（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p7-c,') || contains(format(',{0},', inputs.only), ',container-vllm,') }}
     timeout-minutes: 60
     needs: [vllm, container-concurrency]
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
@@ -313,6 +329,7 @@ jobs:
 
   parity:
     name: 透明重写同构校验（tool-17 全量）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',w1,') || contains(format(',{0},', inputs.only), ',parity,') }}
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -330,6 +347,7 @@ jobs:
 
   tools:
     name: 真实工具链 e2e（no-mirror 形态）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',t1,') || contains(format(',{0},', inputs.only), ',t2,') || contains(format(',{0},', inputs.only), ',tools,') }}
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -357,6 +375,7 @@ jobs:
 
   container-tools:
     name: 容器层·真实工具 e2e（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',t1-c,') || contains(format(',{0},', inputs.only), ',t2-c,') || contains(format(',{0},', inputs.only), ',container-tools,') }}
     timeout-minutes: 60
     needs: [tools, container-vllm]
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
@@ -387,6 +406,7 @@ jobs:
 
   upstream:
     name: 上游通道健康（R17：gh-proxy/read_timeout）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',p8,') || contains(format(',{0},', inputs.only), ',upstream,') }}
     # runner 层 only：gh-proxy 是 runner 环境关心的事，与执行层（容器/CA）无关；
     # Actions 构件通道两域已入 NO_PROXY 直连，不测不过 squid 的流量（META R17）
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["linux-amd64-cpu-2", "gy-006"]' || inputs.runner) }}
@@ -406,6 +426,7 @@ jobs:
 
   imagebuild:
     name: 镜像构建网络模拟（vllm-ascend 外网面）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',b1,') || contains(format(',{0},', inputs.only), ',imagebuild,') }}
     # runner 层 only：复刻 Dockerfile.310p 构建的出网面——catlass 子模块
     # （gitcode.com）、cmake 第三方压缩包（gitcode.com/cann-src-third-party）、
     # GIT_PROXY insteadOf clone vllm（github.com 大 pack）；集群内 cache-service
@@ -427,6 +448,7 @@ jobs:
 
   cabundle:
     name: no_proxy × CA 注入矩阵
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',w3,') || contains(format(',{0},', inputs.only), ',cabundle,') }}
     # 平台向 pod 注入 6 个 CA 变量（全指向 /etc/squid-ca/squid-ca.pem）：排他
     # CAfile（CURL_CA_BUNDLE/REQUESTS_CA_BUNDLE/GIT_SSL_CAINFO/PIP_CERT）、
     # 库级 union（SSL_CERT_FILE）、追加（NODE_EXTRA_CA_CERTS）。风险：no_proxy
@@ -472,7 +494,7 @@ jobs:
     # runner 容器走的是 AutoscalingRunnerSet values.yaml 的 env/postStart，
     # 没有这条重写（gy-005 cpu-8 实测），runner 层跑必判"未重写"。
     # always() 保证前面容器环节失败时这条定向验证仍能给出结论。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.gitcode == '1'
+    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.gitcode == '1') && (github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',w2,') || contains(format(',{0},', inputs.only), ',gitcode,')) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     container:
       image: ${{ inputs.container_image || 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12' }}
@@ -499,6 +521,7 @@ jobs:
 
   miss-p95:
     name: MISS p95 假慢复现（broker 长轮询诊断）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',k6,') || contains(format(',{0},', inputs.only), ',miss-p95,') }}
     # 2026-10-09 SquidMissP95Slow 告警诊断的复现场景：GHA runner 保活长轮询
     # （broker.actions.githubusercontent.com）hold ~57s 才回，占比 >5% 即把
     # 滚动窗 MISS p95 钉在 hold 值上（aiframework p95=57.44813 两分片同值）。
@@ -533,7 +556,7 @@ jobs:
     # 两个阶段：mock 机制复现（长 max-age + 翻页后仍供旧页）+ 真实索引页
     # squid×源站直连清单对照（test-squid/repro-stale-index.sh，R15 回归守卫）。
     # opt-in：stale_index=1 才跑（修复未落地时 parity 会红，属预期）。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.stale_index == '1'
+    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.stale_index == '1') && (github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',k2,') || contains(format(',{0},', inputs.only), ',stale-index,')) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -563,7 +586,7 @@ jobs:
     # 阶段：mock 机制+判定（三种后缀 deny / identity 完整性 / 本体仍可 HIT）
     # + 真实域 metadata 不缓存 + 真实 pip 解析（test-squid/repro-pip-metadata.sh）。
     # opt-in：pip_metadata=1 才跑（修复未落地时 mock/real 会红，属预期）。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.pip_metadata == '1'
+    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.pip_metadata == '1') && (github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',k3,') || contains(format(',{0},', inputs.only), ',pip-metadata,')) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -593,7 +616,7 @@ jobs:
     # 非 by-hash 可变索引（InRelease / Packages.gz）仍不得缓存（负样本守卫，
     # test-squid/repro-apt-byhash.sh，META R24）。
     # opt-in：apt_byhash=1 才跑（chart 未 rollout 时 by-hash 全 MISS 会红，属预期）。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.apt_byhash == '1'
+    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.apt_byhash == '1') && (github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',k4,') || contains(format(',{0},', inputs.only), ',apt-byhash,')) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     steps:
       - uses: actions/checkout@v7
@@ -612,38 +635,6 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
-  gitcdn-unsynced:
-    name: git-cdn 未同步 SHA 回源复现
-    # 2026-11-04 gy-006（run 41762789640 attempt 1，9/11 job 红在 actions/checkout）：
-    # runner 的 /root/.gitconfig 有 insteadOf github.com → 集群内 git-cdn，客户端的
-    # fetch 按 SHA 直接打到 git-cdn（不经 squid，故与 squid 的 github 302 规则无关）。
-    # git-cdn 缓存里没有该 SHA 时回源，回源 URL 被 git_cdn/util.py:generate_url 把
-    # base 里的每个 https:// 都插一次凭据（GITSERVER_UPSTREAM 自带 .../https://github.com/
-    # → token 双拼），gh-proxy 立即 403 → git-cdn 回 `upload-pack: not our ref`。
-    # 本 job 正向断言「git-cdn 能回源未同步 SHA」：用 API 建临时 ref 造出一个上游
-    # 可服务而缓存必然缺失的 SHA（cache-warmer 每 30 分钟才同步），再按真实客户端
-    # 形态（Basic 凭据）经 git-cdn 取；缺陷未修时红属预期。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.gitcdn_unsynced == '1'
-    runs-on: ${{ fromJSON(inputs.runner) }}
-    permissions:
-      contents: write   # 建/删临时 ref（造缓存缺失的 SHA），仅本 job
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: 运行 git-cdn 未同步 SHA 回源复现
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO_SLUG: ${{ github.repository }}
-        run: bash test-squid/run-suite.sh --mode gitcdn-unsynced
-
-      - name: 上传结果
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-squid-gitcdn-unsynced
-          path: /tmp/test-squid-results/
-          if-no-files-found: warn
-
   lfs-storeid:
     name: GitCode LFS store_id 去 query 缓存键
     # ascend-ci-deployment PR #2272 / issue #2260 守卫（chart ≥ 0.1.32，squid.storeId.enabled）：
@@ -652,7 +643,7 @@ jobs:
     # 判定两个域「第二发不同签名命中缓存」；另含内容一致性（LFS 内容寻址 / file-cdn
     # 路径版本化 / 伪造签名）与同名替换实证（有 CQ_GITCODE_TOKEN 时建临时仓库/release：
     # 上传 A → 删附件同名重传 B → 比 302 路径；路径不变则代理/直连对照，供旧副本判红）。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.lfs_store_id == '1'
+    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.lfs_store_id == '1') && (github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',k5,') || contains(format(',{0},', inputs.only), ',lfs-storeid,')) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 60
     steps:
@@ -678,60 +669,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: test-squid-lfs-storeid
+          name: test-squid-K5
           path: /tmp/test-squid-results/
-          if-no-files-found: warn
-
-  git-container-probe:
-    name: 容器层 git 路由探针（容器内是否可见 insteadOf）
-    # runner 层实测：job 以 uid 1001 / HOME=/home/runner 跑，/root/.gitconfig 读不到
-    # （Permission denied），insteadOf 不生效。容器层是 root，需要单独取证：
-    # 若容器里能看到 /root/.gitconfig，则容器作业的 checkout 会直连 git-cdn（无 302）。
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.git_probe == '1'
-    runs-on: ${{ fromJSON('["linux-amd64-cpu-2", "gy-006"]') }}
-    timeout-minutes: 40
-    container:
-      image: ${{ inputs.container_image || 'swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.12' }}
-    steps:
-      - name: 取证与 fetch
-        run: |
-          set -uo pipefail
-          R=/tmp/git-route-probe; mkdir -p "$R"
-          repo="$GITHUB_REPOSITORY"; sha="$GITHUB_SHA"
-          {
-            echo "id=$(id -u) user=$(id -un) HOME=${HOME:-<空>}"
-            echo "--- 配置文件 ---"
-            ls -l /root/.gitconfig /home/runner/.gitconfig /etc/gitconfig 2>&1 || true
-            echo "--- /root/.gitconfig ---"
-            cat /root/.gitconfig 2>&1 || true
-            echo "--- git 可见 url.* ---"
-            git config --show-origin --get-regexp '^url\.' || echo '(空)'
-            echo "--- ls-remote --get-url ---"
-            git ls-remote --get-url "https://github.com/$repo.git" || true
-          } | tee "$R/report.txt"
-
-          echo "### fetch（容器内，与 checkout 同一条命令）" | tee -a "$R/report.txt"
-          wd=$(mktemp -d); git -C "$wd" init -q
-          git -C "$wd" remote add origin "https://github.com/$repo"
-          start=$(date +%s)
-          GIT_TRACE_CURL=1 GIT_TERMINAL_PROMPT=0 timeout 180 \
-            git -C "$wd" fetch --no-tags --prune --depth=1 origin "+$sha:refs/probe" \
-            >"$R/fetch-container.log" 2>&1
-          rc=$?; sec=$(( $(date +%s) - start))
-          echo "fetch-container rc=$rc ${sec}s" | tee -a "$R/report.txt"
-          grep -aE 'redirecting to|Connected to |CONNECT |Host:|HTTP/[12] [0-9]{3}|Location:|fatal:' \
-            "$R/fetch-container.log" | head -16 | tee -a "$R/report.txt"
-
-      - name: 上传证据
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: git-container-probe
-          path: /tmp/git-route-probe/
           if-no-files-found: warn
 
   container-miss-p95:
     name: 容器层·MISS p95 假慢复现（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',k6-c,') || contains(format(',{0},', inputs.only), ',container-miss-p95,') }}
     timeout-minutes: 60
     needs: [miss-p95, container-tools]
     # 告警里的 MISS 流量负载（artifact 上传/长轮询等）实际在用户容器里产生，
@@ -758,6 +702,7 @@ jobs:
 
   container-imagebuild:
     name: 容器层·镜像构建网络模拟（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',b1-c,') || contains(format(',{0},', inputs.only), ',container-imagebuild,') }}
     timeout-minutes: 60
     needs: [imagebuild, container-miss-p95]
     # 容器层复刻更贴近真实构建执行环境：cmake REQ_URL 拉包与 Dockerfile L92 的
@@ -782,6 +727,7 @@ jobs:
 
   container-cabundle:
     name: 容器层·no_proxy × CA 注入矩阵（CANN 镜像）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',w3-c,') || contains(format(',{0},', inputs.only), ',container-cabundle,') }}
     timeout-minutes: 60
     needs: [cabundle, container-imagebuild]
     # 容器内 env 由 postStart/CA 卷注入同一组变量，多验一层 CA 信任路径与
@@ -807,6 +753,7 @@ jobs:
 
   container-pkg:
     name: 容器层·dnf/yum（openEuler 24.03）
+    if: ${{ github.event_name == 'pull_request' || inputs.only == '' || contains(format(',{0},', inputs.only), ',t3-e,') || contains(format(',{0},', inputs.only), ',container-pkg,') }}
     timeout-minutes: 60
     needs: [container-cabundle]
     # dnf/yum 只有 openEuler/RHEL 基底才能真实执行（runner 与 CANN 镜像均 ubuntu，
@@ -838,7 +785,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, apt-byhash, gitcdn-unsynced, lfs-storeid, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, apt-byhash, lfs-storeid, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -852,10 +799,21 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-apt-byhash test-squid-gitcdn-unsynced test-squid-lfs-storeid \
-                   test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
+          # 每个产物目录对应一个用例编号；未出现的目录说明该 job 未被 only 选中
+          # （或 opt-in 开关关闭），记 NOT-SELECTED 而不是静默省略。
+          for pair in \
+            'test-squid-function:P1-P5' 'test-squid-concurrency:P6' 'test-squid-vllm:P7' \
+            'test-squid-parity:W1' 'test-squid-upstream:P8' 'test-squid-imagebuild:B1' \
+            'test-squid-cabundle:W3' 'test-squid-tools:T1-T2' 'test-squid-miss-p95:K6' \
+            'test-squid-gitcode:W2' 'test-squid-stale-index:K2' 'test-squid-pip-metadata:K3' \
+            'test-squid-apt-byhash:K4' 'test-squid-K5:K5' \
+            'test-squid-container-function:P1-P5-c' 'test-squid-container-concurrency:P6-c' \
+            'test-squid-container-vllm:P7-c' 'test-squid-container-tools:T1-T2-c' \
+            'test-squid-container-miss-p95:K6-c' 'test-squid-container-imagebuild:B1-c' \
+            'test-squid-container-cabundle:W3-c' 'test-squid-container-pkg:T3-e'; do
+            d="${pair%%:*}"; ids="${pair#*:}"
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
-              echo "### $d" >> "$GITHUB_STEP_SUMMARY"
+              echo "### $d（$ids）" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
               # 逐文件判断后 cat：miss-p95 artifact 只有 probes.tsv 没有
               # timings.tsv，cat 对缺失文件 exit 1 会让 bash -e 直接退出
@@ -865,6 +823,8 @@ jobs:
                 fi
               done
               echo '```' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- $ids（$d）：NOT-SELECTED" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
           if [ -f test-squid-function/probes.tsv ]; then

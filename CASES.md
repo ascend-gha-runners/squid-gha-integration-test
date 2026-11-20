@@ -26,9 +26,10 @@ pkg 组另用 openEuler 24.03 基底镜像（dnf/yum 原生形态，见下文 R2
 test-squid/run-suite.sh             # 全部场景逻辑（run_timed 阶段计时 + TSV）
 ```
 
-workflow 四个 job 调同一脚本（runner 层 × container 层 × function/concurrency 两组），
-summary job 拉回 artifacts 输出汇总表。所有场景通过 run-suite.sh 的阶段函数实现，
-不拆独立 case 脚本。
+test-squid.yaml 用多个 job 调同一脚本（runner 层 × container 层各一遍）；summary
+job 拉回 artifacts 输出汇总表。git 专题与运维探针另有独立 workflow 承载（见台账
+「载体」列，共 7 个 workflow，不再新增）。所有场景通过 run-suite.sh 的阶段函数实现，
+不拆独立 case 脚本（专题用例如 store_id 例外，单独脚本但仍挂在 test-squid 的 job 上）。
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
@@ -39,8 +40,58 @@ summary job 拉回 artifacts 输出汇总表。所有场景通过 run-suite.sh �
 | `URL_HEAVY` | files.pythonhosted torch 2.10.0 aarch64 wheel（~146MB） | 大载荷，仅 `HEAVY=1` 启用（R6） |
 | `HEAVY` | `0` | 大载荷压测模式开关（R6） |
 
-判定输出统一 TSV：`phase<TAB>seconds<TAB>status<TAB>group`，
+判定输出统一 TSV（存量阶段为 `phase,seconds,status,group`；K5 已按新口径
+`id,phase,status,seconds,note` 试点，其余阶段逐步迁移），
 summary job 汇总进 GITHUB_STEP_SUMMARY，artifact 一并上传。
+
+## 用例台账（编号 ↔ 问题 ↔ 脚本入口 ↔ 载体）
+
+一个 case = 一个问题 + 一个编号 + 一个脚本入口 + 一行 timings。编号 = 面 + 序号：
+
+| 面 | 含义 |
+|---|---|
+| P | 代理基础（连通性、MITM、完整性、失败面、并发、vllm、上游通道） |
+| K | 缓存语义（MISS→HIT、陈旧、编码变体、by-hash、store_id、p99 口径） |
+| W | 重写/路由（透明重写、insteadOf、CA 注入、git 302、子模块） |
+| T | 真实工具链（pip/apt/npm/uv/go/wget/git-lfs、大载荷、dnf/yum） |
+| G | git 服务（git-cdn 最新 commit、gitcode clone、未同步 SHA 回源） |
+| B | 构建网络（镜像构建外网面） |
+| O | 运维探针（出网矩阵、部分克隆过滤） |
+
+层级用后缀（同编号的变体，不另立 case）：`-r` runner 层（默认）、`-c` CANN 容器层、
+`-e` openEuler 24.03。载体只有 7 个 workflow，不新增；单跑用 test-squid 的
+`only` 白名单（`-f only=k5`），PR 事件恒全跑。
+
+| 编号 | 问题 | 脚本入口 | 载体（workflow / job） | 开关 | 判定 |
+|---|---|---|---|---|---|
+| P1 | 流量是否真的过 squid（专属痕迹） | `run-suite.sh --mode function` 的 `meta-trace` | test-squid / function、container-function（P1-c） | 默认 | 有 squid 痕迹=PASS，否则 FAIL |
+| P2 | http / CONNECT / MITM 证书是否可用 | 同上 `basic-proxy` | 同上 | 默认 | exit=0 且内容非空 |
+| P3 | 下载内容完整性 | 同上 `integrity` | 同上 | 默认 | 两次 sha256 一致 |
+| P4 | 坏域/拒绝端口是否快速干净失败 | 同上 `failure-face` | 同上 | 默认 | ≤30s 非零退出且后续正常 |
+| P5 | GHA artifact 下载是否经 squid | container-function 步骤 `场景 artifact-download` | test-squid / container-function | 默认 | 下载文件 sha256 与上传一致 |
+| P6 | 同/异对象并发是否正确（P6a 阶梯 / P6b 异对象 / P6c 混合工具） | `run-suite.sh --mode concurrency` | test-squid / concurrency、container-concurrency（P6-c） | `ladder` | 全部 sha256 一致、0 错误 |
+| P7 | vLLM 通信模拟（模型下载 + SSE 并发） | `run-suite.sh --mode vllm` | test-squid / vllm、container-vllm（P7-c） | 默认 | 双通道下载 + 8 并发 SSE 全绿 |
+| P8 | 上游通道健康（gh-proxy 延迟 / read_timeout） | `run-suite.sh --mode upstream` | test-squid / upstream | 默认 | p50≤5s（A/B 对照） |
+| K1 | 缓存是否 MISS→HIT | `run-suite.sh --mode function` 的 `cache-hitmiss` | test-squid / function | 默认 | HIT=PASS；无头/全 MISS 仅留档 |
+| K2 | 索引页 15 天 max-age 是否供旧页 | `run-suite.sh --mode stale-index` | test-squid / stale-index | `stale_index=1` | 真实索引页 HIT/`fwd=stale`/Vary mismatch 判红 |
+| K3 | PEP 658 metadata 编码变体是否被缓存毒化 | `run-suite.sh --mode pip-metadata` | test-squid / pip-metadata | `pip_metadata=1` | metadata 出现缓存命中即红 |
+| K4 | apt by-hash 不可变索引是否被 deny 误伤 | `run-suite.sh --mode apt-byhash` | test-squid / apt-byhash | `apt_byhash=1` | by-hash 必须 HIT 且哈希==文件名；可变索引不得缓存 |
+| K5 | GitCode LFS/Release CDN 的 store_id 去 query 缓存键 | `repro-lfs-storeid.sh` | test-squid / lfs-storeid | `lfs_store_id=1`（单跑 `only=k5`） | 第二发不同签名命中=PASS；任一 phase FAIL 判红 |
+| K6 | MISS p95 假慢（broker 长轮询顶爆口径） | `repro-miss-p95.sh` | test-squid / miss-p95、container-miss-p95（K6-c） | 默认 | 全量 p95 落 hold 区间且排除 poll 后健康 |
+| W1 | 13 条透明重写规则是否同构 | `run-suite.sh --mode parity` | test-squid / parity | 默认（`stale_strict`） | 规则签名 + 负样本全绿 |
+| W2 | gitcode.com → 缓存后端 insteadOf 是否生效并有缓存收益 | `run-suite.sh --mode gitcode --container` | test-squid / gitcode | `gitcode=1`、`gitcode_backend` | 重写生效 + 第二次 clone 命中缓存 |
+| W3 | no_proxy × CA 注入矩阵（排他/union/追加、直连域绕行） | `run-suite.sh --mode cabundle` | test-squid / cabundle、container-cabundle（W3-c） | 默认（`bundle_fix`、`np_strict`） | TLS-FAIL / NO_PROXY-MISS 判红 |
+| W4 | 各种 git 远端命令是否都走 squid 302 → git-cdn | `repro-git-302.sh` | test-git302 / git302 | 默认 | 真实 git 命令 rc=0 且 redirecting to git-cdn |
+| W5 | 子模块是否不被浅克隆截断（腿 D） | workflow 内联 `git submodule` 步骤 | test-submodule-legd / submodule-legd | `submodules`、`repo` | 子模块提交完整可取 |
+| T1 | 真实客户端工具链是否零配置跑通 | `run-suite.sh --mode tools` | test-squid / tools、container-tools（T1-c） | 默认 | 各工具 rc=0（缺工具记 SKIP） |
+| T2 | 大载荷（~146MB wheel 等）工具链 | 同 T1，`HEAVY=1` | test-squid / tools | `heavy=1` | 大载荷下载成功且哈希一致 |
+| T3 | dnf/yum 包管理链路（RHEL 系 CA 路径） | `run-suite.sh --mode pkg --container` | test-squid / container-pkg | 默认 | makecache/install 全绿 |
+| G1 | git-cdn 是否跟得上上游最新 commit | `repro-gitcdn-latest.sh` | test-gitcdn / gitcdn-latest | `latest=1` 或定时 | 逐仓库 HEAD 可达且未落后 |
+| G2 | gitcode clone 性能（容器层） | `gitcode-clone-bench.sh` | test-gitcode-clone / clone-bench | 默认 | 两次 clone 全绿 + 缓存收益 |
+| G3 | git-cdn 能否为未同步 SHA 回源 | `repro-gitcdn-unsynced-sha.sh` | test-gitcdn / gitcdn-unsynced | 非 schedule 轮次 | 正向取到该 SHA；`not our ref` 判红 |
+| B1 | 镜像构建外网面（子模块/cmake 包/vllm 大 pack/OBS 资产） | `run-suite.sh --mode imagebuild` | test-squid / imagebuild、container-imagebuild（B1-c） | 默认 | 四路全通；无 302 即判红 |
+| O1 | 单 runner 出网矩阵（每域 squid vs 直连对照） | workflow 内联 `probe` 函数 | probe-domain / probe | `runner`、`repeat`、`only_domains` | 只出证据 TSV，不判红 |
+| O2 | git-cdn 部分克隆的过滤行为 | workflow 内联探针 | probe-gitcdn-filter / probe | 默认 | 只出证据 TSV，不判红 |
 
 ## 场景矩阵（run-suite.sh 阶段 ↔ 元规则）
 

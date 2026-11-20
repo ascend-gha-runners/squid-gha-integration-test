@@ -26,6 +26,7 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `runner` | `["linux-amd64-cpu-2", "gy-006"]` | runner 标签，**JSON 数组字符串**。数组内多标签是 AND 关系（必须全命中）。⚠️ 不要写成逗号字符串——表达式里的逗号串不会拆成多标签，job 会永久 queued |
+| `only` | 空 | 只跑指定用例：逗号分隔的编号（`k5`）或 job id（`lfs-storeid`），如 `only=k5,p7`；空 = 全跑，PR 事件恒全跑。台账与编号见 `CASES.md`。容器层 job 的 needs 链不变，只选容器层编号时要把依赖编号一起写上（`only=p1,p1-c`） |
 | `ladder` | `1 4 8 16` | 同对象并发的阶梯并发度 |
 | `heavy` | `0` | `1` = 启用 ~146MB 大载荷场景（耗时长，日常不用开） |
 | `np_strict` | `0` | `1` = 新增直连域（云元数据端点 + LLM 统计/API 域）必须全部命中 NO_PROXY，用于 gy-006 cpu-2 配置落地验证；默认宽松（未纳入本批的 runner set 记 SKIP） |
@@ -42,8 +43,7 @@ gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-
 | `apt_byhash` | `0` | `1` = 启用 apt by-hash 长缓存验证（by-hash 是内容寻址不可变索引，却被 `mutable_meta_with_by_hash` 的 deny 误伤 → 每次 `apt-get update` 全量回源；chart 0.1.31 / PR #2746 回归守卫，仅 workflow_dispatch） |
 | `apt_byhash_release` | 空 | apt-byhash 组的 Release URL（空 = `repo.huaweicloud.com/ubuntu/dists/jammy/Release`；换套件/镜像时改这里） |
 | `apt_byhash_index` | 空 | Release 里要跟的索引路径（空 = `main/binary-amd64/Packages.gz`；脚本按该路径在 Release 的 SHA256 段里取哈希拼 by-hash URL） |
-| `gitcdn_unsynced` | `0` | `1` = 复现「git-cdn 无法为未同步 SHA 回源」（仅 gy-006 这类注入了 `insteadOf` → git-cdn 的 runner；2026-11-04 checkout `not our ref` 事故守卫，仅 workflow_dispatch；本 job 需 `contents: write` 建/删临时 ref） |
-| `lfs_store_id` | `0` | `1` = 启用 GitCode LFS/Release CDN 的 store_id 去 query 缓存键验证（仅 workflow_dispatch）。内容：`lfs-cdn`（batch 双签名）+ `file-cdn`（Release 资产 302 双签名）两个域各断言「第二发命中缓存」，需目标 squid 已开 `squid.storeId.enabled`（gy-006 试点已开）。也可用独立 workflow `test-lfs-storeid.yaml` 单跑（见 1.6） |
+| `lfs_store_id` | `0` | `1` = 启用 GitCode LFS/Release CDN 的 store_id 去 query 缓存键验证（K5，仅 workflow_dispatch）。内容：`lfs-cdn`（batch 双签名）+ `file-cdn`（Release 资产 302 双签名）两个域各断言「第二发命中缓存」，需目标 squid 已开 `squid.storeId.enabled`（gy-006 试点已开）。单跑用 `-f only=k5 -f lfs_store_id=1`（见 1.6） |
 | `lfs_storeid_repo` | 空 | LFS 验证仓库（空 = `https://gitcode.com/ccijunk/lfs-test.git`，含 64MiB / 500MiB 两个对象，脚本自动挑体积可控的那个） |
 | `lfs_storeid_max_mb` | `96` | 参与测试的 LFS 对象体积上限（MiB）；仓库里最小对象仍超限则记 SKIP |
 | `lfs_storeid_asset_url` | 空 | `file-cdn` 域的 Release 资产页（空 = `zhoucungen/gitcode-oauth` 的 `install.sh`；换仓库时填任一「附件」下载页） |
@@ -127,31 +127,32 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 - 定时轮次不跑 `gitcdn-unsynced` job（避免每 30 分钟造一次临时 ref），该 job 仍
   在 workflow_dispatch / PR 上执行。
 
-### 6. GitCode LFS store_id 缓存键（test-squid 的 lfs-storeid，opt-in）
+### 6. GitCode LFS store_id 缓存键（test-squid 的 lfs-storeid = K5，opt-in）
 
-主套件里是 opt-in job（`-f lfs_store_id=1`，需目标 squid 已开
-`squid.storeId.enabled`）；只想单独跑这一条用例时用独立 workflow
-`test-lfs-storeid.yaml`，不必拉起 test-squid 的 20+ 个 job（脚本同为
-`test-squid/repro-lfs-storeid.sh`）：
+opt-in job（`-f lfs_store_id=1`，需目标 squid 已开 `squid.storeId.enabled`）。
+只想跑这一条用例时用 `only` 白名单，不必拉起 test-squid 的 20+ 个 job
+（脚本 `test-squid/repro-lfs-storeid.sh`，用例编号 K5）：
 
 ```bash
-# 主套件（与其它 job 一起跑）
+# 与其它 job 一起跑（全量）
 gh workflow run test-squid.yaml --repo ascend-gha-runners/squid-gha-integration-test \
   --ref main -f lfs_store_id=1
 
-# 单独跑这一条用例
-gh workflow run test-lfs-storeid.yaml --ref main
+# 单独跑这一条（只有 lfs-storeid + summary 两个 job）
+gh workflow run test-squid.yaml --ref main -f only=k5 -f lfs_store_id=1
+
 # 换 runner / 换资产页 / 指定替换实验仓库
-gh workflow run test-lfs-storeid.yaml --ref main \
+gh workflow run test-squid.yaml --ref main -f only=k5 -f lfs_store_id=1 \
   -f 'runner=["linux-amd64-cpu-2", "gy-006"]' \
   -f lfs_storeid_asset_url='https://gitcode.com/<o>/<r>/releases/download/<tag>/<file>' \
   -f lfs_storeid_consistency_repo='<owner>/<repo>'
 ```
 
-判定见 job 表 `GitCode LFS store_id 缓存键` 一行：两个 CDN 域各断言第二发命中缓存；
-一致性阶段（LFS 内容寻址 / file-cdn 路径版本化 / 伪造签名）；仓库 secret
-`CQ_GITCODE_TOKEN` 存在时再做「同 release 同名换内容」替换实验（路径变了即安全，
-路径没变则代理/直连对照，代理供旧副本即判红）。退出码 2 = SKIP 不判红。
+`only` 接受编号（`k5`）或 job id（`lfs-storeid`）；未在 `only` 里的 job 记
+NOT-SELECTED，summary 里逐条列出。判定见 `CASES.md` 的 K5 一行：两个 CDN 域各
+断言第二发命中缓存；一致性阶段（LFS 内容寻址 / file-cdn 路径版本化 / 伪造签名）；
+仓库 secret `CQ_GITCODE_TOKEN` 存在时再做「同 release 同名换内容」替换实验（路径
+变了即安全，路径没变则代理/直连对照，代理供旧副本即判红）。退出码 2 = SKIP 不判红。
 实测结论（run 44728228545）：同名换内容后 302 落到新的 `untagger_<uuid>` 路径，
 新路径经 squid 拿到新内容 → 缓存键随内容变化，无旧副本污染。
 
@@ -234,7 +235,7 @@ git-cdn / gitcode-cdn 两个独立 workflow（`test-gitcdn.yaml`、`test-gitcode
 | `PEP 658 metadata 不缓存` | R22 opt-in（`pip_metadata=1`）：2026-10-31 pip hash 校验事故回归守卫。CDN 按 `Accept-Encoding` 实际压缩但不发 `Vary`，squid 存储副本无 Vary 键 → 首个请求者编码定型共享（`reply_header_replace` 只改客户端响应头，不影响存储副本与缓存键）；pip metadata 请求只收 identity 且不解码（`decode_content=False`），拿到 gzip 变体后 sha256 必挂。三个判定：mock origin（三种后缀 `.whl/.tar.gz/.zip.metadata` 的 gzip 预热 + identity 请求，`Cache-Status` 出现 hit/`fwd=stale`/`detail=mismatch` 即**判红**，且 identity 响应体 sha256 必须等于源站 identity、不得是 gzip 魔数；同 host 三种本体二连发必须 HIT 作负样本守卫）+ 真实域 `.whl.metadata`（默认 torch wheel + `.metadata`）经 squid 3 发不得 HIT、identity 体与源站直连 sha256 一致 + 真实 pip 解析（`--dry-run --no-deps`，出现 hash mismatch 判红，网络/版本原因记 SKIP）。修复配置：`acl pip_metadata urlpath_regex -i \.(whl|tar\.gz|zip)\.metadata$` + `cache deny pip_metadata` + `collapsed_forwarding_access deny pip_metadata`（后缀全 host 生效，本体不受影响）。独立脚本 `repro-pip-metadata.sh`，runner 层 only |
 | `apt by-hash 长缓存` | R24 opt-in（`apt_byhash=1`）：#2443 回归守卫（chart 0.1.31 / PR #2746）。`/ubuntu(-ports)/dists/.../by-hash/<alg>/<hash>` 是内容寻址不可变对象（文件名即内容 sha256，源站 `max-age=1296000`），却被 `cache deny hc_repo mutable_meta_with_by_hash` 一并拒缓存 → `apt-get update` 每次全量回源（cn12-001 单副本 81min / 592 请求 / 560 MISS / 1.8 GiB）。两个判定：`byhash`（从真实 Release 的 SHA256 段解析出对象 URL，经 squid 连打 6 发，必须出现 HIT，且每发 200 的响应体 sha256 必须等于文件名哈希 → 否则判红，全 MISS 说明 deny 例外未落地）+ `mutable`（同一 dists 下非 by-hash 的 `InRelease` / 原 `Packages.gz` 带 run 唯一 query 连打 3 发，不得由缓存作答 → 否则判红，证明 `!by_hash` 没把可变索引一起放开）。另有 `immutable` 阶段证明长缓存前提成立：源站真值两遍（不同 cache-buster）+ 条件请求（`If-None-Match` 用首遍 ETag，应 304）+ 对端镜像（`mirrors.huaweicloud.com`）同路径 + 非 by-hash 索引本体当前内容，四路都必须哈希成文件名里的 sha256，任一不符判红（内容漂移必然反映为哈希不等，所以每轮都能抓到）；该阶段不需要 squid，本地可直跑。独立脚本 `repro-apt-byhash.sh`，runner 层 only；`immutable_file` 豁免（`squid_stale_index_hit_total` 恒 0）只在 squid 内部日志/Prometheus 可见，脚本只留档 HIT 时的 Age |
 | `真实工具链 e2e` | 真实客户端工具（pip/apt/npm/uv/go/wget/git-lfs/modelscope/model+dataset/git）零镜像配置跑通；另复刻上游仓库 CI 现状：`download.pytorch.org` torch 索引、`hf download` + `HF_ENDPOINT=hf-mirror.com`；`heavy=1` 追加 torch wheel 全量下载 + rustup/conda/cmake/bazel/precommit |
-| `git-cdn 未同步 SHA 回源复现` | R23 opt-in（`gitcdn_unsynced=1`）：2026-11-04 gy-006 9/11 job 红在 checkout 的回归守卫。runner 的 `/root/.gitconfig` 把 github.com `insteadOf` 到集群内 git-cdn（`.svc.cluster.local` 在 NO_PROXY 内，不经 squid，故与 squid 302 无关）；checkout 按 SHA 浅取时，缓存缺该 SHA 会回源，而回源 URL 被 `git_cdn/util.py:generate_url` 把 base 里每个 `https://` 都插一次凭据（`GITSERVER_UPSTREAM` 自带 `.../https://github.com/` → token 双拼）→ gh-proxy 403 → 客户端收 `upload-pack: not our ref`。用例造一个上游可服务而缓存必然缺失的 SHA（API 建临时 ref + 空提交，cache-warmer 30 分钟窗口内不会同步），按真实客户端形态（Basic 凭据）经 git-cdn 取，正向断言应成功；缺陷未修则红。独立脚本 `repro-gitcdn-unsynced-sha.sh`，runner 层 only，需 `contents: write` |
+| ~~`git-cdn 未同步 SHA 回源复现`~~ | R23（G3）已从本套件摘除，统一在 `test-gitcdn.yaml` 的 `gitcdn-unsynced` job 执行（见 1.5），避免同一条用例两处维护 |
 | `GitCode LFS store_id 缓存键` | opt-in（`lfs_store_id=1`）：两个 CDN 域各测一遍——**A. `lfs-cdn`**：两次 POST batch（同 oid）拿同路径、不同 `auth_key` 的下载 URL；**B. `file-cdn`**：同一 Release 资产两次访问，302 的 `Location` 路径相同、`auth_key` 不同（默认 `zhoucungen/gitcode-oauth` 的 `install.sh`）。每个域经 squid 各下载两次，断言 ① 两发 200 且内容 sha256 一致（LFS 还须 == pointer `oid`，证明签名没被拆坏）② 第二发响应 `Cache-Status`/`X-Cache-Lookup` 有 `hit`（决定性判据；第一发若已是命中说明对象被预热，仍能证明新签名复用既有缓存对象）③ 至少一发有 squid 痕迹，否则用例无效 ④ 负样本：非 CDN 域（默认 `pypi.org/simple/six/`）同 URL 二发 HIT、换 query 必须 MISS，证明 `store_id_access` 只放行两个 CDN 域。注意 squid 7.x 把 `TCP_REFRESH_UNMODIFIED` 也标成 `hit`，客户端无法硬区分真 `TCP_HIT`，`override-lastmod` 的收益需 access.log `HIER_NONE` 佐证。另有一致性阶段（同名/同路径换内容是否会被旧副本污染，因 refresh `min` 达 10080 分钟）：LFS 路径必须含 oid（内容寻址，不满足即判红）；file-cdn 同名资产在两个 release 下必须落在不同路径（`untagger_<uuid>`，相同只记 ⚠️）；再用伪造 `auth_key` 打已缓存路径，记录 HIT 是否会跳过签名校验（公开对象无影响，仅留档）。仓库 secret `CQ_GITCODE_TOKEN` 存在时会再做「同名替换」实证：建临时仓库/release → 上传 `probe.bin`（A）→ 经 squid 预热确认 HIT → 删附件同名重传（B）→ 再取 302 比路径；路径变了即「换内容必换键」，路径没变则代理/直连对照，代理供旧 A 而直连是新 B 判红（实证旧副本污染），结束删 release/自建仓库。file-cdn 单轮 `detail=mismatch` 会换新签名重试一轮，两轮都 MISS 才判红。前提不成立（无代理 / 域名在 NO_PROXY / 仓库无 LFS / batch 需鉴权 / 对象超上限 / 资产 URL 失效 / token 无写权限）记 SKIP。独立脚本 `repro-lfs-storeid.sh`，runner 层 only |
 | `容器层·*（CANN 镜像）` | 功能/并发/vllm/工具链/miss-p95/镜像构建/no_proxy×CA 矩阵七组在 `cann:9.0.0-a3-ubuntu22.04-py3.12` 容器里各跑一遍（多验 CA 信任路径 + 镜像内 gitconfig 形态）；容器层 job 用 needs 链串行（container hook 并发挂死竞态，issue #2） |
 | `容器层·dnf/yum（openEuler 24.03）` | R20：`swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/openeuler/openeuler:24.03` 里真实跑 `dnf makecache` + `dnf install tree` + `yum install jq`；首步 dnf 装 `git-core` 引导 checkout。这是套件里唯一覆盖 RHEL 系 CA 信任路径（anchors + `update-ca-trust`，不靠 CA env）的样本 |
