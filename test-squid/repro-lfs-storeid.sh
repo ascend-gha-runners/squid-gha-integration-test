@@ -33,8 +33,9 @@
 #   file-cdn 同名资产在不同 release 下必须落在不同路径（untagger_<uuid>）；
 #   再用伪造 auth_key 打已缓存路径，记录 HIT 是否会跳过签名校验。
 # 有 gitcode token（repository secret CQ_GITCODE_TOKEN）时再做「同名替换」实证：
-#   建临时仓库 → 建临时 release → 上传 probe.bin（内容 A）→ 经 squid 预热并确认
-#   HIT → 删附件后同名重传（内容 B）→ 再取 302：
+#   建临时仓库 → 建临时 release（GitCode 的 release 用 tag 作路径句柄，创建响应
+#   不含 id）→ 上传 probe.bin（内容 A，走 GET upload_url 再 PUT 到 OBS）→ 经 squid
+#   预热并确认 HIT → 删附件后同名重传（内容 B）→ 再取 302：
 #     · 路径变了（新 untagger_<uuid>）→ 换内容必换缓存键，安全；
 #     · 路径没变 → 经 squid 取 vs 直连取对照：squid 供 A、直连是 B 即实证污染
 #       （refresh_pattern min=10080 分钟，最长 7 天不回源）；
@@ -154,15 +155,67 @@ gc_call() {  # <method> <api-path> [json-body] —— 响应体写 $results/gc.j
     fi
 }
 
-gc_upload() {  # <api-path> <file> —— multipart 上传，回显 HTTP 码
-    local url="$GC_API$1" auth=()
-    case "$GC_MODE" in
-        token)  auth=(-H "Authorization: token $GC_TOKEN") ;;
-        bearer) auth=(-H "Authorization: Bearer $GC_TOKEN") ;;
-        query)  case "$url" in *\?*) url="$url&access_token=$GC_TOKEN" ;; *) url="$url?access_token=$GC_TOKEN" ;; esac ;;
+gc_list_field() {  # <name> <key> —— 从当前 gc.json（列表或含 assets 的对象）按 name 取字段
+    python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+items = d if isinstance(d, list) else (d.get("data") or d.get("assets") or [])
+for it in items:
+    if isinstance(it, dict) and it.get("name") == sys.argv[2]:
+        v = it.get(sys.argv[3])
+        print("" if v is None else v)
+        break
+' "$results/gc.json" "$1" "$2" 2>/dev/null
+}
+
+gc_attach_id() {  # <slug> <tag> <name> —— 取附件 id（先 attach_files，再退到 release 详情）
+    local slug=$1 tag=$2 name=$3 id
+    gc_call GET "/repos/$slug/releases/$tag/attach_files" >/dev/null
+    id=$(gc_list_field "$name" id)
+    if [ -z "$id" ]; then
+        gc_call GET "/repos/$slug/releases/tags/$tag" >/dev/null
+        id=$(gc_list_field "$name" id)
+    fi
+    printf '%s' "$id"
+}
+
+# GitCode 的附件上传不是 multipart POST，而是两步：
+#   GET /repos/<o>/<r>/releases/<tag>/upload_url?file_name=<name>&access_token=...
+#     → {"url": "<OBS 预签名>", "headers": {"x-obs-...": "...", "Content-Type": "..."}}
+#   PUT <url>（带上返回的 headers）→ 文件进 OBS，平台回调后挂到该 tag 的 release 上
+gc_put_asset() {  # <slug> <tag> <file>
+    local slug=$1 tag=$2 f=$3 name url code pc line
+    name=$(basename "$f")
+    local ap="/repos/$slug/releases/$tag/upload_url?file_name=$name"
+    # 文档要求 access_token 走 query；query 形态由 gc_call 自动追加，其余形态这里补
+    [ "$GC_MODE" = "query" ] || ap="$ap&access_token=$GC_TOKEN"
+    code=$(gc_call GET "$ap")
+    if [ "$code" != "200" ]; then
+        echo "⚠️ 取附件上传地址失败 HTTP $code：$(head -c 160 "$results/gc.json" | tr -d '\n')" >&2
+        return 1
+    fi
+    url=$(gc_field url)
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k, v in (d.get("headers") or {}).items():
+    print("%s: %s" % (k, v))
+' "$results/gc.json" > "$results/gc.put.hdr" 2>/dev/null
+    local -a H=()
+    while IFS= read -r line; do [ -n "$line" ] && H+=(-H "$line"); done < "$results/gc.put.hdr"
+    if [ -z "$url" ]; then
+        echo "⚠️ upload_url 响应无 url：$(head -c 160 "$results/gc.json" | tr -d '\n')" >&2
+        return 1
+    fi
+    pc=$(curl -sS -m 180 -X PUT "${H[@]}" --data-binary "@$f" \
+        -o "$results/gc.put.json" -w '%{http_code}' "$url" 2>"$results/gc.put.err")
+    case "$pc" in
+        200|201|204) return 0 ;;
+        *) echo "⚠️ 附件 PUT 失败 HTTP $pc：$(head -c 160 "$results/gc.put.err" | tr -d '\n')" >&2; return 1 ;;
     esac
-    curl -sS -m 180 -X POST "${auth[@]}" -F "file=@$2" \
-        -o "$results/gc.json" -w '%{http_code}' "$url" 2>"$results/gc.err"
 }
 
 gc_field() {  # <json keys...> —— 从 $results/gc.json 取嵌套字段
@@ -185,8 +238,8 @@ print("" if d is None else d)
 # 返回 0=PASS（换内容必换键，或缓存未供旧副本）/ 1=FAIL（实证供旧副本）/ 2=SKIP
 # -----------------------------------------------------------------------------
 phase_replace() {
-    local code login slug rname created_repo=0 tag rid page shaA shaB aidA aidB mode
-    local locA locA2 locB warm_rc cb bb tb sb pc sp delc dc sd
+    local code login slug rname created_repo=0 tag page shaA shaB aidA aidB mode
+    local locA locA2 locB warm_rc cb bb tb sb pc sp dc sd delc
     GC_TOKEN=$(printf '%s' "$GC_TOKEN" | tr -d ' \t\r\n')
     if [ -z "$GC_TOKEN" ]; then
         echo "⚠️ 无 LFS_STOREID_GITCODE_TOKEN（repository secret CQ_GITCODE_TOKEN）——跳过同名替换实验"
@@ -213,9 +266,9 @@ phase_replace() {
     fi
     rname="${slug##*/}"
     code=$(gc_call GET "/repos/$slug")
+    echo "仓库 $slug：探测 HTTP $code"
     if [ "$code" = "404" ]; then
         code=$(gc_call POST /user/repos "$(printf '{"name":"%s","private":false,"auto_init":true,"description":"store_id consistency probe (auto-created by squid-gha test)"}' "$rname")")
-        [ "$code" = "201" ] && created_repo=1
         echo "临时仓库 $slug：创建 HTTP $code"
     fi
     if [ "$code" != "200" ] && [ "$code" != "201" ]; then
@@ -223,11 +276,16 @@ phase_replace() {
         echo "   token 需对目标仓库有写权限（或允许在用户名下建仓），记 SKIP"
         return 2
     fi
+    # 默认命名的仓库是本用例专用产物：即使本次没建（上次中断残留），结束也一并删
+    [ -n "$CONS_REPO" ] || created_repo=1
     tag="storeid-probe-$RUN_ID"
     code=$(gc_call POST "/repos/$slug/releases" "$(printf '{"tag_name":"%s","name":"%s","body":"store_id 一致性探针（自动创建，结束即删）"}' "$tag" "$tag")")
-    rid=$(gc_field id)
-    if [ -z "$rid" ]; then
-        echo "⚠️ 建 release 失败（HTTP $code）：$(head -c 200 "$results/gc.json" | tr -d '\n')——记 SKIP"
+    echo "建 release：HTTP $code tag=$tag"
+    # 实测 GitCode 创建 release 的响应不含 id（只有 tag_name/author/assets），
+    # 后续所有 release 子资源一律用 tag 作句柄（文档：/releases/{tag}/...）
+    code=$(gc_call GET "/repos/$slug/releases/tags/$tag")
+    if [ "$code" != "200" ]; then
+        echo "⚠️ release 建后按 tag 查不到（HTTP $code）：$(head -c 200 "$results/gc.json" | tr -d '\n')——记 SKIP"
         return 2
     fi
     page="https://gitcode.com/$slug/releases/download/$tag/probe.bin"
@@ -237,13 +295,19 @@ phase_replace() {
     shaA=$(sha256sum "$results/repA/probe.bin" | cut -d' ' -f1)
     shaB=$(sha256sum "$results/repB/probe.bin" | cut -d' ' -f1)
 
-    code=$(gc_upload "/repos/$slug/releases/$rid/attach_files" "$results/repA/probe.bin")
-    aidA=$(gc_field id)
+    if ! gc_put_asset "$slug" "$tag" "$results/repA/probe.bin"; then
+        echo "⚠️ 附件 A 上传失败——同名替换实验记 SKIP"
+        gc_call DELETE "/repos/$slug/releases/$tag" >/dev/null
+        [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
+        return 2
+    fi
+    sleep 2   # 等平台把 OBS 对象回调挂到 release 上
+    aidA=$(gc_attach_id "$slug" "$tag" probe.bin)
     locA=$(resolve_location "$page")
-    echo "上传 A：HTTP $code 附件id=${aidA:-无} 302=${locA:0:120}"
-    if [ -z "$aidA" ] || [ -z "$locA" ]; then
-        echo "⚠️ 附件上传或 302 解析失败——同名替换实验记 SKIP"
-        gc_call DELETE "/repos/$slug/releases/$rid" >/dev/null
+    echo "上传 A：附件id=${aidA:-无} 302=${locA:0:120}"
+    if [ -z "$locA" ]; then
+        echo "⚠️ 附件 A 已上传但资产页仍取不到 302（回调延迟/附件未公开）——记 SKIP"
+        gc_call DELETE "/repos/$slug/releases/$tag" >/dev/null
         [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
         return 2
     fi
@@ -254,14 +318,26 @@ phase_replace() {
     [ "$warm_rc" = 0 ] || echo "⚠️ 预热未拿到 HIT（rc=$warm_rc），旧副本存在性无法确认，后续污染判定降级为对照"
 
     # ③ 同名替换：删旧附件 → 同名重传新内容 → 重新解析 302
-    code=$(gc_call DELETE "/repos/$slug/releases/$rid/attach_files/$aidA"); delc=$code
-    code=$(gc_upload "/repos/$slug/releases/$rid/attach_files" "$results/repB/probe.bin")
-    aidB=$(gc_field id)
-    echo "替换：删 A HTTP $delc；同名重传 B HTTP $code 附件id=${aidB:-无}"
+    if [ -z "$aidA" ]; then
+        echo "⚠️ 取不到附件 id（attach_files 接口不可用），无法删后同名重传——记 SKIP"
+        gc_call DELETE "/repos/$slug/releases/$tag" >/dev/null
+        [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
+        return 2
+    fi
+    delc=$(gc_call DELETE "/repos/$slug/releases/$tag/attach_files/$aidA"); echo "删 A：HTTP $delc"
+    if ! gc_put_asset "$slug" "$tag" "$results/repB/probe.bin"; then
+        echo "⚠️ 同名重传 B 失败——记 SKIP"
+        gc_call DELETE "/repos/$slug/releases/$tag" >/dev/null
+        [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
+        return 2
+    fi
+    sleep 2
+    aidB=$(gc_attach_id "$slug" "$tag" probe.bin)
+    echo "同名重传 B：附件id=${aidB:-无}"
     locB=$(resolve_location "$page")
     if [ -z "$locB" ]; then
         echo "⚠️ 替换后取不到 302——记 SKIP"
-        gc_call DELETE "/repos/$slug/releases/$rid" >/dev/null
+        gc_call DELETE "/repos/$slug/releases/$tag" >/dev/null
         [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
         return 2
     fi
@@ -307,8 +383,18 @@ phase_replace() {
             echo "⚠️ 两次内容都不符合预期（proxy=$sp direct=$sd B=$shaB）——记 SKIP"
         fi
     fi
-    # 清理：删 release（连带附件），自建仓库一并删
-    code=$(gc_call DELETE "/repos/$slug/releases/$rid"); echo "清理：删 release HTTP $code"
+    # 清理：删 release（连带附件），自建/专用仓库一并删
+    code=$(gc_call DELETE "/repos/$slug/releases/$tag"); echo "清理：删 release(tag) HTTP $code"
+    case "$code" in
+        200|204) ;;
+        *)
+            # 回落 Gitee 风格：用 release 数字 id
+            gc_call GET "/repos/$slug/releases/tags/$tag" >/dev/null
+            local rel_id; rel_id=$(gc_field id)
+            if [ -n "$rel_id" ]; then
+                code=$(gc_call DELETE "/repos/$slug/releases/$rel_id"); echo "清理：删 release(id=$rel_id) HTTP $code"
+            fi ;;
+    esac
     if [ "$created_repo" = 1 ]; then
         code=$(gc_call DELETE "/repos/$slug"); echo "清理：删临时仓库 $slug HTTP $code"
     fi
