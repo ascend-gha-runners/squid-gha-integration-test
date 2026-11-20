@@ -818,8 +818,8 @@ jobs:
             'test-squid-container-cabundle:W3-c' 'test-squid-container-pkg:T3-e'; do
             d="${pair%%:*}"; ids="${pair#*:}"
             # artifact 解包后可能多一层同名目录（path 是目录时），统一用 find 兜住
-            tf=$(find "$d" -maxdepth 3 -name timings.tsv -print -quit 2>/dev/null)
-            pf=$(find "$d" -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null)
+            tf=$(find "$d" -maxdepth 3 -name timings.tsv -print -quit 2>/dev/null || true)
+            pf=$(find "$d" -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null || true)
             if [ -n "$tf" ] || [ -n "$pf" ]; then
               echo "### $d（$ids）" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -832,7 +832,7 @@ jobs:
               echo "- $ids（$d）：NOT-SELECTED" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          fp=$(find test-squid-function -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null)
+          fp=$(find test-squid-function -maxdepth 3 -name probes.tsv -print -quit 2>/dev/null || true)
           if [ -n "$fp" ]; then
             echo "### 域名探测" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
