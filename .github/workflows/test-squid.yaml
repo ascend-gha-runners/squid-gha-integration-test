@@ -30,6 +30,8 @@
 #                  毒化，2026-10-31 pip hash 校验事故回归守卫）
 #   apt-byhash  —— apt by-hash 长缓存（内容寻址不可变索引被 deny 误伤 → 每次
 #                  apt-get update 全量回源；chart 0.1.31 / PR #2746 回归守卫）
+#   lfs-storeid —— GitCode LFS/Release CDN 的 store_id 去 query 作缓存键
+#                  （auth_key 每批都变 → 默认键永 MISS；deployment PR #2272 守卫）
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
 # =============================================================================
 name: test-squid
@@ -117,6 +119,22 @@ on:
         description: '1=复现 git-cdn 无法为未同步 SHA 回源（需 runner 已注入 insteadOf→git-cdn，如 gy-006；2026-11-04 checkout 事故守卫）'
         required: false
         default: '0'
+      lfs_store_id:
+        description: '1=启用 GitCode LFS/Release CDN store_id 去 query 缓存键验证（需 squid 已开 storeId，如 gy-006；deployment PR #2272 守卫）'
+        required: false
+        default: '0'
+      lfs_storeid_repo:
+        description: 'LFS 验证仓库（空=默认 ccijunk/lfs-test，含 64MiB/500MiB 两个对象）'
+        required: false
+        default: ''
+      lfs_storeid_max_mb:
+        description: '参与测试的 LFS 对象体积上限 MiB（默认 96；超过则记 SKIP）'
+        required: false
+        default: '96'
+      lfs_storeid_asset_url:
+        description: 'file-cdn 域的 Release 资产页（空=默认 gitcode-oauth 的 install.sh；两次访问 302 到 file-cdn 且签名不同）'
+        required: false
+        default: ''
   pull_request:
     paths:
       - 'test-squid/**'
@@ -617,6 +635,44 @@ jobs:
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 
+  lfs-storeid:
+    name: GitCode LFS store_id 去 query 缓存键
+    # deployment PR #2272（issue #2260）：lfs-cdn/file-cdn.gitcode.com 的下载 URL
+    # 路径稳定，但 auth_key 每次 batch 都变 → 默认缓存键（完整 URL）永远 MISS，
+    # 500MiB 对象每批重下。修复用 store_id 只去掉 query 作键（回源保留签名），
+    # 并要求 refresh_pattern 带 override-lastmod（否则永远 TCP_REFRESH_UNMODIFIED）。
+    # 本 job 覆盖两个 CDN 域，各走一遍「同路径、不同签名」：
+    #   A. lfs-cdn  —— 两次 batch（同 oid）拿两个 auth_key 不同的下载 URL
+    #   B. file-cdn —— 同一 Release 资产两次 302，Location 的 auth_key 不同
+    # 每个域经 squid 各下载两次 → 断言第二发是缓存命中、内容 sha256 一致
+    # （test-squid/repro-lfs-storeid.sh）。
+    # opt-in：lfs_store_id=1 才跑（storeId 未开启的集群会红，属预期）。
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.lfs_store_id == '1'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 store_id 缓存键验证
+        env:
+          LFS_STOREID_REPO: ${{ inputs.lfs_storeid_repo }}
+          LFS_STOREID_MAX_MB: ${{ inputs.lfs_storeid_max_mb }}
+          LFS_STOREID_ASSET_URL: ${{ inputs.lfs_storeid_asset_url }}
+        run: |
+          # 退出码 2 = SKIP（前提不成立：无代理/任务域在 NO_PROXY/仓库无 LFS/需鉴权），不判红
+          rc=0
+          bash test-squid/repro-lfs-storeid.sh || rc=$?
+          if [ "$rc" -eq 2 ]; then echo "用例 SKIP（前提不成立）"; exit 0; fi
+          exit "$rc"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-squid-lfs-storeid
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
   git-container-probe:
     name: 容器层 git 路由探针（容器内是否可见 insteadOf）
     # runner 层实测：job 以 uid 1001 / HOME=/home/runner 跑，/root/.gitconfig 读不到
@@ -773,7 +829,7 @@ jobs:
   summary:
     name: 汇总
     timeout-minutes: 10
-    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, apt-byhash, gitcdn-unsynced, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
+    needs: [function, concurrency, vllm, parity, tools, upstream, imagebuild, cabundle, miss-p95, gitcode, stale-index, pip-metadata, apt-byhash, gitcdn-unsynced, lfs-storeid, container-function, container-concurrency, container-vllm, container-tools, container-miss-p95, container-imagebuild, container-cabundle, container-pkg]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -787,7 +843,7 @@ jobs:
         if: always()
         run: |
           echo "## test-squid 汇总" >> "$GITHUB_STEP_SUMMARY"
-          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-apt-byhash test-squid-gitcdn-unsynced \
+          for d in test-squid-function test-squid-concurrency test-squid-vllm test-squid-parity test-squid-upstream test-squid-imagebuild test-squid-cabundle test-squid-tools test-squid-miss-p95 test-squid-gitcode test-squid-stale-index test-squid-pip-metadata test-squid-apt-byhash test-squid-gitcdn-unsynced test-squid-lfs-storeid \
                    test-squid-container-function test-squid-container-concurrency test-squid-container-vllm test-squid-container-tools test-squid-container-miss-p95 test-squid-container-imagebuild test-squid-container-cabundle test-squid-container-pkg; do
             if [ -f "$d/timings.tsv" ] || [ -f "$d/probes.tsv" ]; then
               echo "### $d" >> "$GITHUB_STEP_SUMMARY"
