@@ -32,6 +32,7 @@
 #                  apt-get update 全量回源；chart 0.1.31 / PR #2746 回归守卫）
 #   lfs-storeid —— GitCode LFS/Release CDN 的 store_id 去 query 作缓存键
 #                  （auth_key 每批都变 → 默认键永 MISS；deployment PR #2272 守卫）
+#                  有 CQ_GITCODE_TOKEN 时再做同 release 同名换内容替换实验
 #   summary     —— 拉回各 job 的 timings/probes，输出汇总表
 # =============================================================================
 name: test-squid
@@ -663,6 +664,8 @@ jobs:
           LFS_STOREID_MAX_MB: ${{ inputs.lfs_storeid_max_mb }}
           LFS_STOREID_ASSET_URL: ${{ inputs.lfs_storeid_asset_url }}
           LFS_STOREID_ASSET_URL_ALT: ${{ inputs.lfs_storeid_asset_url_alt }}
+          # 同名替换实验（⑦）：建/删临时仓库与 release 需要写权限；无 secret 时该阶段记 SKIP
+          LFS_STOREID_GITCODE_TOKEN: ${{ secrets.CQ_GITCODE_TOKEN }}
         run: |
           # 退出码 2 = SKIP（前提不成立：无代理/任务域在 NO_PROXY/仓库无 LFS/需鉴权），不判红
           rc=0

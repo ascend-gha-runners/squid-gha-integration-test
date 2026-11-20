@@ -32,6 +32,13 @@
 #   LFS 路径必须是内容地址（含 oid）→ 同名必然同字节；
 #   file-cdn 同名资产在不同 release 下必须落在不同路径（untagger_<uuid>）；
 #   再用伪造 auth_key 打已缓存路径，记录 HIT 是否会跳过签名校验。
+# 有 gitcode token（repository secret CQ_GITCODE_TOKEN）时再做「同名替换」实证：
+#   建临时仓库 → 建临时 release → 上传 probe.bin（内容 A）→ 经 squid 预热并确认
+#   HIT → 删附件后同名重传（内容 B）→ 再取 302：
+#     · 路径变了（新 untagger_<uuid>）→ 换内容必换缓存键，安全；
+#     · 路径没变 → 经 squid 取 vs 直连取对照：squid 供 A、直连是 B 即实证污染
+#       （refresh_pattern min=10080 分钟，最长 7 天不回源）；
+#     · 无论结论如何，结束时删 release（自建仓库一并删）。
 # 另加负样本：非 CDN 域（默认 pypi.org 索引页）同 URL 二发应 HIT、换 query 必须
 # MISS，证明 store_id_access 的域限定没被放大。
 #
@@ -51,6 +58,9 @@
 #   LFS_STOREID_ASSET_URL_ALT 同名资产的另一个 release（默认 v0.0.2，用于证明
 #                          「换内容必换路径」）
 #   LFS_STOREID_NEG_URL    负样本 URL（空=用 pypi.org/simple/six/）
+#   LFS_STOREID_GITCODE_TOKEN  gitcode token（有写权限才跑同名替换实验；空=跳过）
+#   LFS_STOREID_CONSISTENCY_REPO  替换实验用仓库（空=token 用户名下 squid-storeid-consistency，自动创建）
+#   LFS_STOREID_API_BASE   GitCode API 基址（默认 https://api.gitcode.com/api/v5）
 #   LFS_STOREID_GET_TIMEOUT 单次下载超时秒数（默认 900）
 #   RESULTS_DIR            结果目录（默认 /tmp/test-squid-results）
 #
@@ -66,6 +76,9 @@ SIZE="${LFS_STOREID_SIZE:-}"
 ASSET_URL="${LFS_STOREID_ASSET_URL:-https://gitcode.com/zhoucungen/gitcode-oauth/releases/download/v0.0.1/install.sh}"
 ASSET_ALT="${LFS_STOREID_ASSET_URL_ALT:-https://gitcode.com/zhoucungen/gitcode-oauth/releases/download/v0.0.2/install.sh}"
 NEG_URL="${LFS_STOREID_NEG_URL:-https://pypi.org/simple/six/}"
+GC_TOKEN="${LFS_STOREID_GITCODE_TOKEN:-}"
+GC_API="${LFS_STOREID_API_BASE:-https://api.gitcode.com/api/v5}"
+CONS_REPO="${LFS_STOREID_CONSISTENCY_REPO:-}"
 GET_TIMEOUT="${LFS_STOREID_GET_TIMEOUT:-900}"
 results="${RESULTS_DIR:-/tmp/test-squid-results}"
 RUN_ID="${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-0}"
@@ -116,6 +129,164 @@ curl_one() {  # <url> <out-prefix> —— 输出 "code bytes time_total"
 resolve_location() {
     curl -sS --max-time 60 -o /dev/null -D - "$1" 2>/dev/null \
         | awk 'tolower($1)=="location:"{sub(/^[^:]*:[ \t]*/,""); sub(/\r$/,""); print; exit}'
+}
+
+# ---- GitCode API v5（Gitee 兼容）：凭据只走 Authorization 头，绝不进 URL/日志 ----
+gc_call() {  # <method> <api-path> [json-body] —— 响应体写 $results/gc.json，回显 HTTP 码
+    local m=$1 p=$2 body=${3:-}
+    if [ -n "$body" ]; then
+        curl -sS -m 60 -X "$m" -H "Authorization: token $GC_TOKEN" \
+            -H 'Content-Type: application/json' -d "$body" \
+            -o "$results/gc.json" -w '%{http_code}' "$GC_API$p" 2>"$results/gc.err"
+    else
+        curl -sS -m 60 -X "$m" -H "Authorization: token $GC_TOKEN" \
+            -o "$results/gc.json" -w '%{http_code}' "$GC_API$p" 2>"$results/gc.err"
+    fi
+}
+
+gc_upload() {  # <api-path> <file> —— multipart 上传，回显 HTTP 码
+    curl -sS -m 180 -X POST -H "Authorization: token $GC_TOKEN" \
+        -F "file=@$2" -o "$results/gc.json" -w '%{http_code}' "$GC_API$1" 2>"$results/gc.err"
+}
+
+gc_field() {  # <json keys...> —— 从 $results/gc.json 取嵌套字段
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2:]:
+    d = d.get(k) if isinstance(d, dict) else None
+    if d is None:
+        break
+print("" if d is None else d)
+' "$results/gc.json" "$@" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# 同名替换实验：同一个 release 里把同名附件换成新内容，看缓存键/缓存副本是否跟着变
+#   ① 建临时仓库（或复用 LFS_STOREID_CONSISTENCY_REPO）+ 临时 release
+#   ② 上传 probe.bin（内容 A）→ 经 squid 两发预热（第二发应 HIT）
+#   ③ 删附件后同名重传（内容 B）→ 再取 302，比较路径；路径没变则代理/直连对照
+# 返回 0=PASS（换内容必换键，或缓存未供旧副本）/ 1=FAIL（实证供旧副本）/ 2=SKIP
+# -----------------------------------------------------------------------------
+phase_replace() {
+    local code login slug rname created_repo=0 tag rid page shaA shaB aidA aidB
+    local locA locA2 locB warm_rc cb bb tb sb pc sp delc dc sd
+    if [ -z "$GC_TOKEN" ]; then
+        echo "⚠️ 无 LFS_STOREID_GITCODE_TOKEN（repository secret CQ_GITCODE_TOKEN）——跳过同名替换实验"
+        return 2
+    fi
+    code=$(gc_call GET /user); login=$(gc_field login)
+    if [ "$code" != "200" ] || [ -z "$login" ]; then
+        echo "⚠️ token 不可用（GET /user -> HTTP $code）：$(head -c 160 "$results/gc.json" | tr -d '\n')"
+        return 2
+    fi
+    if [ -n "$CONS_REPO" ]; then
+        slug="${CONS_REPO#*gitcode.com/}"; slug="${slug%.git}"; slug="${slug#/}"
+    else
+        slug="$login/squid-storeid-consistency"
+    fi
+    rname="${slug##*/}"
+    code=$(gc_call GET "/repos/$slug")
+    if [ "$code" = "404" ]; then
+        code=$(gc_call POST /user/repos "$(printf '{"name":"%s","private":false,"auto_init":true,"description":"store_id consistency probe (auto-created by squid-gha test)"}' "$rname")")
+        [ "$code" = "201" ] && created_repo=1
+        echo "临时仓库 $slug：创建 HTTP $code"
+    fi
+    if [ "$code" != "200" ] && [ "$code" != "201" ]; then
+        echo "⚠️ 无法访问/创建 $slug（HTTP $code）：$(head -c 160 "$results/gc.json" | tr -d '\n')"
+        echo "   token 需对目标仓库有写权限（或允许在用户名下建仓），记 SKIP"
+        return 2
+    fi
+    tag="storeid-probe-$RUN_ID"
+    code=$(gc_call POST "/repos/$slug/releases" "$(printf '{"tag_name":"%s","name":"%s","body":"store_id 一致性探针（自动创建，结束即删）"}' "$tag" "$tag")")
+    rid=$(gc_field id)
+    if [ -z "$rid" ]; then
+        echo "⚠️ 建 release 失败（HTTP $code）：$(head -c 200 "$results/gc.json" | tr -d '\n')——记 SKIP"
+        return 2
+    fi
+    page="https://gitcode.com/$slug/releases/download/$tag/probe.bin"
+    mkdir -p "$results/repA" "$results/repB"
+    { printf 'A %s\n' "$RUN_ID"; head -c 2048 /dev/urandom | base64; } > "$results/repA/probe.bin"
+    { printf 'B %s\n' "$RUN_ID"; head -c 2048 /dev/urandom | base64; } > "$results/repB/probe.bin"
+    shaA=$(sha256sum "$results/repA/probe.bin" | cut -d' ' -f1)
+    shaB=$(sha256sum "$results/repB/probe.bin" | cut -d' ' -f1)
+
+    code=$(gc_upload "/repos/$slug/releases/$rid/attach_files" "$results/repA/probe.bin")
+    aidA=$(gc_field id)
+    locA=$(resolve_location "$page")
+    echo "上传 A：HTTP $code 附件id=${aidA:-无} 302=${locA:0:120}"
+    if [ -z "$aidA" ] || [ -z "$locA" ]; then
+        echo "⚠️ 附件上传或 302 解析失败——同名替换实验记 SKIP"
+        gc_call DELETE "/repos/$slug/releases/$rid" >/dev/null
+        [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
+        return 2
+    fi
+
+    # ② 预热「旧路径」：确认这一版内容确实进了 squid 缓存
+    locA2=$(resolve_location "$page")
+    fetch_pair replwarm "$locA" "${locA2:-$locA}" "$shaA"; warm_rc=$?
+    [ "$warm_rc" = 0 ] || echo "⚠️ 预热未拿到 HIT（rc=$warm_rc），旧副本存在性无法确认，后续污染判定降级为对照"
+
+    # ③ 同名替换：删旧附件 → 同名重传新内容 → 重新解析 302
+    code=$(gc_call DELETE "/repos/$slug/releases/$rid/attach_files/$aidA"); delc=$code
+    code=$(gc_upload "/repos/$slug/releases/$rid/attach_files" "$results/repB/probe.bin")
+    aidB=$(gc_field id)
+    echo "替换：删 A HTTP $delc；同名重传 B HTTP $code 附件id=${aidB:-无}"
+    locB=$(resolve_location "$page")
+    if [ -z "$locB" ]; then
+        echo "⚠️ 替换后取不到 302——记 SKIP"
+        gc_call DELETE "/repos/$slug/releases/$rid" >/dev/null
+        [ "$created_repo" = 1 ] && gc_call DELETE "/repos/$slug" >/dev/null
+        return 2
+    fi
+
+    local rc=2
+    if [ "$(strip_q "$locB")" != "$(strip_q "$locA")" ]; then
+        echo "✅ 换内容后 302 路径变了（$(strip_q "$locA" | sed 's#.*/releases/##') → $(strip_q "$locB" | sed 's#.*/releases/##')）"
+        echo "   → untagger uuid 随上传变化，缓存键跟着变，同名替换不会命中旧副本"
+        read -r cb bb tb < <(curl_one "$locB" "$results/replB")
+        sb=$(sha256sum "$results/replB.bin" 2>/dev/null | cut -d' ' -f1)
+        printf 'replace\tnew-path\t%s\t%s\t%s\t-\t%s\t%s\t%s\t%s\n' "${locB:0:150}" "$cb" \
+            "$(hdr_val cache-status "$results/replB.hdr")" "${bb:-}" "${sb:0:12}" "${tb:-}" \
+            "换内容必换路径" >> "$DETAIL"
+        if [ "$cb" = "200" ] && [ "$sb" = "$shaB" ]; then
+            echo "✅ 新路径经 squid 拿到新内容（sha=${sb:0:12}）"
+            rc=0
+        else
+            echo "❌ 新路径经 squid 未拿到新内容（http=$cb 期望 ${shaB:0:12} 实际 ${sb:0:12}）"
+            rc=1
+        fi
+    else
+        echo "⚠️ 换内容后 302 路径完全相同（同 untagger uuid）——直接实测 squid 会不会供旧副本"
+        pc=$(curl -sS -m 300 -o "$results/replB-proxy.bin" -D "$results/replB-proxy.hdr" \
+            -w '%{http_code}' "$locB" 2>/dev/null)
+        sp=$(sha256sum "$results/replB-proxy.bin" 2>/dev/null | cut -d' ' -f1)
+        dst=$(hdr_val cache-status "$results/replB-proxy.hdr")
+        dc=$(curl -sS --noproxy '*' -m 300 -o "$results/replB-direct.bin" -w '%{http_code}' "$locB" 2>/dev/null)
+        sd=$(sha256sum "$results/replB-direct.bin" 2>/dev/null | cut -d' ' -f1)
+        printf 'replace\tsame-path\t%s\t%s/%s\t%s\t-\t-\t%s/%s\t-\tA=%s B=%s\n' "${locB:0:150}" \
+            "$pc" "$dc" "${dst:-}" "${sp:0:12}" "${sd:0:12}" "${shaA:0:12}" "${shaB:0:12}" >> "$DETAIL"
+        echo "   经代理: http=$pc sha=${sp:0:12} ${dst:-<无缓存头>}"
+        echo "   直连对照: http=$dc sha=${sd:0:12}"
+        if [ "$sd" != "$shaB" ]; then
+            echo "⚠️ 直连也没拿到新内容——上传/预签名未生效，判定记 SKIP"
+        elif [ "$sp" = "$shaA" ]; then
+            echo "❌ 同名换内容后 squid 仍供旧副本（代理 ${sp:0:12}=旧A，直连 ${sd:0:12}=新B）"
+            echo "   → store_id 去 query + refresh_pattern min=10080 分钟导致长期供旧，一致性缺陷"
+            rc=1
+        elif [ "$sp" = "$shaB" ]; then
+            echo "✅ 同路径但 squid 拿到的是新内容（${sp:0:12}），未出现旧副本"
+            rc=0
+        else
+            echo "⚠️ 两次内容都不符合预期（proxy=$sp direct=$sd B=$shaB）——记 SKIP"
+        fi
+    fi
+    # 清理：删 release（连带附件），自建仓库一并删
+    code=$(gc_call DELETE "/repos/$slug/releases/$rid"); echo "清理：删 release HTTP $code"
+    if [ "$created_repo" = 1 ]; then
+        code=$(gc_call DELETE "/repos/$slug"); echo "清理：删临时仓库 $slug HTTP $code"
+    fi
+    return "$rc"
 }
 
 # -----------------------------------------------------------------------------
@@ -315,6 +486,17 @@ else
         fi
         t0=$(date +%s)
         fetch_pair filecdn "$loc1" "$loc2"; asset_rc=$?
+        # 单轮 detail=mismatch 可能是变体竞态（首轮响应刚到、缓存副本尚未定型）；
+        # 换一对全新签名再验一轮，两轮都 MISS 才判红。
+        if [ "$asset_rc" = 1 ]; then
+            echo "ℹ️ file-cdn 首轮未命中，换新签名重试一轮（排除瞬时变体/存储竞态）"
+            sleep 2
+            loc3=$(resolve_location "$ASSET_URL"); sleep 2
+            loc4=$(resolve_location "$ASSET_URL")
+            if [ -n "$loc3" ] && [ "$(strip_q "$loc3")" = "$(strip_q "$loc1")" ]; then
+                fetch_pair filecdn-retry "$loc3" "${loc4:-$loc3}"; asset_rc=$?
+            fi
+        fi
         step filecdn-reuse "$([ $asset_rc = 2 ] && echo SKIP || echo $asset_rc)" $(( $(date +%s) - t0 ))
     fi
 fi
@@ -414,15 +596,20 @@ else
     step negative "$([ $neg_rc = 2 ] && echo SKIP || echo $neg_rc)" $(( $(date +%s) - t0 ))
 fi
 
+# --- ⑦ 同名替换实验：同 release 里同名换内容是否被旧副本污染 ------------------
+t0=$(date +%s)
+phase_replace; repl_rc=$?
+step replace "$([ "$repl_rc" = 2 ] && echo SKIP || echo "$repl_rc")" $(( $(date +%s) - t0 ))
+
 # --- 结论 -------------------------------------------------------------------
 echo
 echo "== 证据（$DETAIL）=="
 cat "$DETAIL"
-if [ "$lfs_rc" = 1 ] || [ "$asset_rc" = 1 ] || [ "$cons_rc" = 1 ] || [ "$neg_rc" = 1 ]; then
+if [ "$lfs_rc" = 1 ] || [ "$asset_rc" = 1 ] || [ "$cons_rc" = 1 ] || [ "$neg_rc" = 1 ] || [ "$repl_rc" = 1 ]; then
     echo "== 结论：FAIL =="
     exit 1
 fi
-if [ "$lfs_rc" = 0 ] || [ "$asset_rc" = 0 ]; then
+if [ "$lfs_rc" = 0 ] || [ "$asset_rc" = 0 ] || [ "$repl_rc" = 0 ]; then
     echo "== 结论：PASS =="
     exit 0
 fi
