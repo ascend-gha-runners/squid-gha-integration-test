@@ -44,6 +44,7 @@ on:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
       - 'test-squid/repro-gitcdn-latest.sh'
+      - 'test-squid/repro-gitcdn-refspec.sh'
       - '.github/workflows/test-gitcdn.yaml'
 
 permissions:
@@ -86,6 +87,41 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-gitcdn-unsynced
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  # PR30/32 回归：refspec 白名单、按 SHA 回源单飞、失败透传。
+  # 默认目标 gitcode.com/ascend/pytorch（git-cdn-gitcode 后端）。
+  gitcdn-refspec:
+    name: git-cdn refspec / SHA 单飞 / 失败透传
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行 refspec / SHA / 失败透传断言
+        env:
+          GIT_CDN_BASE: http://git-cdn-service.git-cdn-gitcode.svc.cluster.local:8000/
+          REPO: ascend/pytorch
+          RESULTS_DIR: /tmp/test-squid-results
+        run: bash test-squid/repro-gitcdn-refspec.sh
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## test-gitcdn refspec / SHA 单飞 / 失败透传"
+            echo '```'
+            cat /tmp/test-squid-results/gitcdn-refspec/refspec.tsv 2>/dev/null || echo '(无 refspec.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-refspec
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 

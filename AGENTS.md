@@ -127,6 +127,18 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 - 定时轮次不跑 `gitcdn-unsynced` job（避免每 30 分钟造一次临时 ref），该 job 仍
   在 workflow_dispatch / PR 上执行。
 
+### 5.1 PR30/32 回归（test-gitcdn 的 gitcdn-refspec job）
+
+`test-squid/repro-gitcdn-refspec.sh`，默认目标 `gitcode.com/ascend/pytorch`
+（git-cdn-gitcode 后端），三个阶段：
+
+- refspec：`refs/heads/*` 非空、`refs/pull/*` 必须为空（`INCLUDE_REFS` 白名单）
+- SHA 单飞：取非默认分支的 SHA，两路并发 `git fetch --depth 1 <sha>` 都成功；
+  `/metrics` 可达时记录 `git_cdn_fetch_sha_total` 增量，>1 记 WARN
+- 失败透传：不存在的 SHA 必须在 180s 内非零退出且 stderr 有 git 错误（124=判红）
+
+冷缓存需先在 git-cdn Pod 内删除 `/workdir` 下对应仓库目录，脚本本身不清理缓存。
+
 ### 6. GitCode LFS store_id 缓存键（test-squid 的 lfs-storeid = K5，opt-in）
 
 opt-in job（`-f lfs_store_id=1`，需目标 squid 已开 `squid.storeId.enabled`）。
