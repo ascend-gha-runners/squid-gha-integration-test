@@ -132,9 +132,11 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 `test-squid/repro-gitcdn-refspec.sh`，默认目标 `gitcode.com/ascend/pytorch`
 （git-cdn-gitcode 后端），三个阶段：
 
-- refspec：`refs/heads/*` 非空、`refs/pull/*` 必须为空（`INCLUDE_REFS` 白名单）
-- SHA 单飞：取非默认分支的 SHA，两路并发 `git fetch --depth 1 <sha>` 都成功；
-  `/metrics` 可达时记录 `git_cdn_fetch_sha_total` 增量，>1 记 WARN
+- refspec：`refs/heads/*` 可读；`refs/pull/*` 只记录数量，不判红（git-cdn 的
+  `info/refs` 直接代理上游，pull refs 仍会通告）
+- SHA 回源：取 `refs/pull/*/head` 的 PR-only SHA（mirror 不含），两路并发
+  `git fetch --depth 1 <sha>` 都成功；`/metrics` 可达时记录
+  `git_cdn_fetch_sha_total` 增量，>1 记 WARN
 - 失败透传：不存在的 SHA 必须在 180s 内非零退出且 stderr 有 git 错误（124=判红）
 
 冷缓存需先在 git-cdn Pod 内删除 `/workdir` 下对应仓库目录，脚本本身不清理缓存。
