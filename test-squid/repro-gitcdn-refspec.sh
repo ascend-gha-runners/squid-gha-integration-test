@@ -52,10 +52,10 @@ fail=0
 log "git-cdn=$REMOTE"
 
 # ---- 阶段 0：可达性（不可达 → SKIP，不误红）----------------------------------
-code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-    "$REMOTE/info/refs?service=git-upload-pack" 2>/dev/null) || code="000"
-if [ "$code" != "200" ]; then
-    log "⚠️ git-cdn 不可达（GET info/refs=$code）——本集群未部署 git-cdn-gitcode，记 SKIP"
+# 用 git 自身探测：git-cdn 的 info/refs 对 curl 会回 308，git 会跟随重定向。
+if ! GIT_TERMINAL_PROMPT=0 timeout 30 git ls-remote "$REMOTE" HEAD \
+    >"$results/reach.out" 2>"$results/reach.err"; then
+    log "⚠️ git-cdn 不可达（git ls-remote 失败，见 reach.err）——本集群未部署 git-cdn-gitcode，记 SKIP"
     exit 2
 fi
 

@@ -105,7 +105,15 @@ jobs:
           GIT_CDN_BASE: http://git-cdn-service.git-cdn-gitcode.svc.cluster.local:8000/
           REPO: ascend/pytorch
           RESULTS_DIR: /tmp/test-squid-results
-        run: bash test-squid/repro-gitcdn-refspec.sh
+        run: |
+          set +e
+          bash test-squid/repro-gitcdn-refspec.sh
+          rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::notice::git-cdn 不可达，用例 SKIP"
+            exit 0
+          fi
+          exit "$rc"
 
       - name: 写入 Step Summary
         if: always()
