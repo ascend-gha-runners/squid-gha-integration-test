@@ -138,7 +138,10 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
   `git fetch --depth 1 <sha>`；断言 `git_cdn_fetch_sha_total{result="leader"}`
   只 +1（该指标带 result 标签，只数 leader，不能整表求和）。+0 说明该 SHA 已在
   mirror、自动换下一个候选；候选全已缓存记 SKIP（先 purge 再测）；≥2 判红
-- 失败透传：不存在的 SHA 必须在 180s 内非零退出且 stderr 有 git 错误（124=判红）
+- 失败透传：两路并发取同一个不存在的 SHA，两路都要在 180s 内非零退出、stderr
+  有 git 错误，且不能出现 `curl 56` / `chunked-encoded stream`（错误流未收尾，
+  issue #33）；leader/waiter/failed 增量只作证据（同 worker 合并、跨 worker 串行
+  都算现状，不判红）
 
 冷缓存需先在 git-cdn Pod 内删除 `/workdir` 下对应仓库目录，脚本本身不清理缓存。
 

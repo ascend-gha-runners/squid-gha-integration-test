@@ -20,8 +20,9 @@
 #        +0 说明该 SHA 已在 mirror（没触发回源），自动换下一个候选；
 #        ≥2 判红（两路各自回源，单飞失效）。候选全部已缓存时记 SKIP，
 #        提示先 purge 缓存（test-squid/purge-gitcdn-cache.sh）再测。
-#   ③ 失败透传：取一个不存在的 SHA，必须在 180s 内非零退出且 stderr 有 git
-#      错误信息（超时 124 = 回源卡死，判红）
+#   ③ 失败透传：两路并发取同一个不存在的 SHA，两路都必须在 180s 内非零退出、
+#      stderr 有 git 错误，且不能出现 `curl 56` / `chunked-encoded stream`
+#      （错误流未收尾，issue #33）；同时记录 leader/waiter/failed 增量作证据
 #
 # 冷缓存前置：本脚本不清理后端缓存。要测真正的冷启动，需先在 git-cdn Pod 内
 # 删除 /workdir 下对应仓库目录，否则 ① 的 refspec 状态与 ② 的增量都会受既有
@@ -103,17 +104,18 @@ else
     # git_cdn_fetch_sha_total 带 result 标签（leader/waiter/skipped_present/failed），
     # 只有 leader 代表一次真实回源；单飞判定只看 leader 增量，且必须先保证该 SHA
     # 不在 mirror 里，否则增量恒为 0、用例失去意义。
-    metric_leader() {
+    metric_result() {  # metric_result <leader|waiter|skipped_present|failed>
         local body
         body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || return 1
         printf '%s\n' "$body" |
-            awk '$1 ~ /^git_cdn_fetch_sha_total\{/ && /result="leader"/ {s+=$2} END{print s+0}'
+            awk -v r="result=\"$1\"" \
+                '$1 ~ /^git_cdn_fetch_sha_total\{/ && index($0, r) {s+=$2} END{print s+0}'
     }
 
     cold=0
     for sha in "${candidates[@]}"; do
         log "候选 SHA=$sha（refs/pull/*/head）"
-        before=$(metric_leader) || before=""
+        before=$(metric_result leader) || before=""
 
         d1=$(mktemp -d) && d2=$(mktemp -d)
         git -C "$d1" init -q && git -C "$d2" init -q
@@ -168,24 +170,62 @@ else
             "候选 SHA 均已在 mirror（leader +0），未触发回源；先 purge 仓库缓存再测" 0
     fi
 
-    # ---- 阶段 3：不存在的 SHA 必须快速失败 ----------------------------------
+    # ---- 阶段 3：坏 SHA 的并发失败路径（leader 失败 → waiter 不能挂死）--------
+    # 两路并发打同一个不存在的 SHA：leader 走完 0.5+1+2+4+8=15.5s 退避后转
+    # upload-pack 报错；waiter 必须拿到同一结果并同时量级返回，不能各自重新退避，
+    # 也不能出现「已开始的 chunked 流里写第二个 HTTP 500」→ 客户端只见 curl 56
+    # （issue opensourceways/git-cache-http-server#33）。
     bad="0000000000000000000000000000000000000001"
-    d3=$(mktemp -d) && git -C "$d3" init -q
+    b_leader=$(metric_result leader) || b_leader=""
+    b_failed=$(metric_result failed) || b_failed=""
+    b_waiter=$(metric_result waiter) || b_waiter=""
+
+    d3=$(mktemp -d) && d4=$(mktemp -d)
+    git -C "$d3" init -q && git -C "$d4" init -q
     t0=$(now_ms)
     GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$d3" fetch --depth 1 "$REMOTE" "$bad" \
-        >"$results/sha-bad.out" 2>"$results/sha-bad.err"
-    rc=$?
+        >"$results/sha-bad-1.out" 2>"$results/sha-bad-1.err" &
+    p3=$!
+    GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$d4" fetch --depth 1 "$REMOTE" "$bad" \
+        >"$results/sha-bad-2.out" 2>"$results/sha-bad-2.err" &
+    p4=$!
+    wait $p3; rc3=$?
+    wait $p4; rc4=$?
     ms=$(( $(now_ms) - t0 ))
-    if [ $rc -eq 124 ]; then
-        record sha-error FAIL "坏 SHA 180s 超时未返回（回源卡死未透传）" "$ms"
-        fail=1
-    elif [ $rc -ne 0 ] && [ -s "$results/sha-bad.err" ]; then
-        record sha-error PASS "rc=$rc 快速失败，stderr=$(head -n 1 "$results/sha-bad.err" | cut -c1-80)" "$ms"
-    else
-        record sha-error FAIL "rc=$rc 但无 git 错误信息（失败未透传）" "$ms"
-        fail=1
+    a_leader=$(metric_result leader) || a_leader=""
+    a_failed=$(metric_result failed) || a_failed=""
+    a_waiter=$(metric_result waiter) || a_waiter=""
+
+    check_bad() {  # check_bad <第几路> <rc> <stderr 文件>
+        local n=$1 rc=$2 err=$3
+        if [ "$rc" -eq 124 ]; then
+            record sha-error FAIL "第 $n 路 180s 超时未返回（回源卡死未透传）" "$ms"
+            fail=1
+        elif [ "$rc" -eq 0 ]; then
+            record sha-error FAIL "第 $n 路 rc=0（坏 SHA 竟然成功）" "$ms"
+            fail=1
+        elif [ ! -s "$err" ]; then
+            record sha-error FAIL "第 $n 路 rc=$rc 但无 git 错误信息（失败未透传）" "$ms"
+            fail=1
+        elif grep -qiE 'chunked-encoded stream|curl 56' "$err"; then
+            record sha-error FAIL \
+                "第 $n 路 rc=$rc 错误流未正常收尾（$(head -n 1 "$err" | cut -c1-70)）" "$ms"
+            fail=1
+        else
+            record sha-error PASS "第 $n 路 rc=$rc，$(head -n 1 "$err" | cut -c1-70)" "$ms"
+        fi
+    }
+    check_bad 1 "$rc3" "$results/sha-bad-1.err"
+    check_bad 2 "$rc4" "$results/sha-bad-2.err"
+
+    # 失败路径的单飞只留证据不判红：同 worker 内 waiter 复用 leader 的 Future
+    # （leader +1 / waiter +1）；跨 worker 时按 SHA flock 串行、各自退避
+    # （leader +2）。两种都属实现现状，成本差异写进 detail 供人判断。
+    if [ -n "$b_leader" ] && [ -n "$a_leader" ]; then
+        record sha-error-singleflight INFO \
+            "leader +$(( a_leader - b_leader )) / waiter +$(( a_waiter - b_waiter )) / failed +$(( a_failed - b_failed ))（两路并发，总墙钟 ${ms}ms）" 0
     fi
-    rm -rf "$d3"
+    rm -rf "$d3" "$d4"
 fi
 
 if [ "$fail" -ne 0 ]; then
