@@ -134,10 +134,11 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 
 - refspec：`refs/heads/*` 可读；`refs/pull/*` 只记录数量，不判红（git-cdn 的
   `info/refs` 直接代理上游，pull refs 仍会通告）
-- SHA 回源：从 `refs/pull/*/head` 按 PR 号取最近 3 个候选 SHA，两路并发
+- SHA 回源：从 `refs/pull/*/head` 按 PR 号取最近 5 个候选 SHA，两路并发
   `git fetch --depth 1 <sha>`；断言 `git_cdn_fetch_sha_total{result="leader"}`
   只 +1（该指标带 result 标签，只数 leader，不能整表求和）。+0 说明该 SHA 已在
-  mirror、自动换下一个候选；候选全已缓存记 SKIP（先 purge 再测）；≥2 判红
+  mirror、自动换下一个候选；`not our ref` 说明上游本身不支持按该 SHA 回源（已关闭
+  PR 常见），同样换候选不判红；候选都试完仍未触发回源记 SKIP（先 purge 再测）；≥2 判红
 - 失败透传：两路并发取同一个不存在的 SHA，两路都要在 180s 内非零退出、stderr
   有 git 错误，且不能出现 `curl 56` / `chunked-encoded stream`（错误流未收尾，
   issue #33）；leader/waiter/failed 增量只作证据（同 worker 合并、跨 worker 串行

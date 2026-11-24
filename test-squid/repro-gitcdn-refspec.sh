@@ -95,7 +95,7 @@ mapfile -t candidates < <(
     printf '%s\n' "$pulls" |
         awk 'NF==2 {n=$2; sub(/^refs\/pull\//,"",n); sub(/\/head$/,"",n);
                     if (n ~ /^[0-9]+$/) print n, $1}' |
-        sort -k1,1nr | awk '!seen[$2]++ {print $2}' | head -n 3
+        sort -k1,1nr | awk '!seen[$2]++ {print $2}' | head -n 5
 )
 if [ "${#candidates[@]}" -eq 0 ]; then
     record sha-pick SKIP "没有 refs/pull/*/head 可取" 0
@@ -119,7 +119,7 @@ else
         return 1
     }
 
-    cold=0
+    decided=0
     for sha in "${candidates[@]}"; do
         log "候选 SHA=$sha（refs/pull/*/head）"
         before=$(metric_result leader) || before=""
@@ -139,8 +139,16 @@ else
         after=$(metric_result leader) || after=""
 
         if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
+            # `not our ref` = 上游本身不支持按这个 SHA 回源（常见于已关闭/未合并的
+            # PR head），不是 git-cdn 的缺陷；换下一个候选，别判红。
+            if grep -q 'not our ref' "$results/sha-fetch-1.err" "$results/sha-fetch-2.err" 2>/dev/null; then
+                record sha-pick INFO "候选 ${sha:0:9} 上游不可按 SHA 回源（not our ref），换下一个" "$ms"
+                rm -rf "$d1" "$d2"
+                continue
+            fi
             record sha-fetch FAIL "rc1=$rc1 rc2=$rc2（${sha:0:9}，见 sha-fetch-*.err）" "$ms"
             fail=1
+            decided=1
             rm -rf "$d1" "$d2"
             break
         fi
@@ -150,31 +158,32 @@ else
         if [ "$got1" != "$sha" ] || [ "$got2" != "$sha" ]; then
             record sha-fetch FAIL "FETCH_HEAD 不符：${got1:0:9}/${got2:0:9}" "$ms"
             fail=1
+            decided=1
             break
         fi
         record sha-fetch PASS "两路均取到 ${sha:0:9}（${ms}ms）" "$ms"
 
         if [ -z "$before" ] || [ -z "$after" ]; then
             record sha-singleflight WARN "/metrics 不可达，未取到 git_cdn_fetch_sha_total{result=\"leader\"}" 0
-            cold=1  # fetch 本身已成功，不再换候选
+            decided=1  # fetch 本身已成功，不再换候选
             break
         fi
         delta=$(( after - before ))
         if [ "$delta" -eq 1 ]; then
             record sha-singleflight PASS "回源 leader +1（两路并发合并为一次回源）" 0
-            cold=1
+            decided=1
             break
         elif [ "$delta" -ge 2 ]; then
             record sha-singleflight FAIL "回源 leader +$delta（>1，两路各自回源，单飞未生效）" 0
             fail=1
-            cold=1
+            decided=1
             break
         fi
         log "  ${sha:0:9} 已在 mirror（leader +0，未触发回源），换下一个候选"
     done
-    if [ "$cold" -eq 0 ]; then
+    if [ "$decided" -eq 0 ]; then
         record sha-singleflight SKIP \
-            "候选 SHA 均已在 mirror（leader +0），未触发回源；先 purge 仓库缓存再测" 0
+            "候选 SHA 均未触发回源（已在 mirror 或上游不可按 SHA 回源）；先 purge 仓库缓存再测" 0
     fi
 
     # ---- 阶段 3：坏 SHA 的并发失败路径（leader 失败 → waiter 不能挂死）--------
