@@ -145,6 +145,8 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
   都算现状，不判红）
 
 冷缓存需先在 git-cdn Pod 内删除 `/workdir` 下对应仓库目录，脚本本身不清理缓存。
+只删 mirror 不够：`pack_cache` 仍有该请求的 pack 时，fetch 约 29ms 直接命中、
+`leader +0`，脚本会记 SKIP。要验证 `leader +1` 必须同时 `PURGE_PACK_CACHE=1`。
 
 ### 5.2 冷启动前置（G5，`purge-gitcdn-cache.sh`）
 
@@ -164,6 +166,11 @@ PURGE_PACK_CACHE=1 KUBECONFIG=~/.kube/gy-006.yaml bash test-squid/purge-gitcdn-c
 
 清完立即触发 `test-gitcode-clone`（`iterations>=2`）和 `test-gitcdn`
 （`gitcdn-refspec`），否则下一次请求就把缓存重新填热。
+
+实测参考（gy-006，镜像 `fix-cold-start-wants-check-93a5cb5`）：`cann/catlass`
+冷 7.4s → 热 2.5s；`ascend/pytorch`（142MB）两路并发同 SHA 冷启动共 29s
+（clone 21~22s + fetch_sha 3.6~4.3s，两路只 clone 一次）。冷启动后 mirror
+体积无放大，浅克隆按 SHA 不写 `pack_cache`。
 
 ### 6. GitCode LFS store_id 缓存键（test-squid 的 lfs-storeid = K5，opt-in）
 

@@ -90,7 +90,7 @@ summary job 汇总进 GITHUB_STEP_SUMMARY，artifact 一并上传。
 | G2 | gitcode clone 性能（容器层） | `gitcode-clone-bench.sh` | test-gitcode-clone / clone-bench | 默认 | 两次 clone 全绿 + 缓存收益 |
 | G3 | git-cdn 能否为未同步 SHA 回源 | `repro-gitcdn-unsynced-sha.sh` | test-gitcdn / gitcdn-unsynced | 非 schedule 轮次 | 正向取到该 SHA；`not our ref` 判红 |
 | G4 | 按 SHA 回源是否单飞、回源失败是否快速透传（PR #30/#32） | `repro-gitcdn-refspec.sh` | test-gitcdn / gitcdn-refspec | 非 schedule 轮次 | PR-only SHA 两路并发 fetch 全成功，且 `git_cdn_fetch_sha_total{result="leader"}` 只 +1（+0 或 `not our ref` 自动换候选，全试完仍无回源记 SKIP；≥2 判红）；坏 SHA 两路并发均 180s 内非零退出、有 git 错误且无 `curl 56`/chunked 未收尾 |
-| G5 | 清空某仓库缓存后的真冷启动 | `purge-gitcdn-cache.sh` + `gitcode-clone-bench.sh` / `repro-gitcdn-refspec.sh` | test-gitcode-clone / test-gitcdn | 手动（需 kubectl） | 冷启动耗时明显高于热路径；G4 断言全 PASS |
+| G5 | 清空某仓库缓存后的真冷启动 | `purge-gitcdn-cache.sh` + `gitcode-clone-bench.sh` / `repro-gitcdn-refspec.sh` | test-gitcode-clone / test-gitcdn | 手动（需 kubectl，且要 `PURGE_PACK_CACHE=1`，否则 pack_cache 命中不算冷启动） | 冷启动耗时明显高于热路径（实测 catlass 7.4s → 2.5s）；G4 断言全 PASS |
 | B1 | 镜像构建外网面（子模块/cmake 包/vllm 大 pack/OBS 资产） | `run-suite.sh --mode imagebuild` | test-squid / imagebuild、container-imagebuild（B1-c） | 默认 | 四路全通；无 302 即判红 |
 | O1 | 单 runner 出网矩阵（每域 squid vs 直连对照） | workflow 内联 `probe` 函数 | probe-domain / probe | `runner`、`repeat`、`only_domains` | 只出证据 TSV，不判红 |
 | O2 | git-cdn 部分克隆的过滤行为 | workflow 内联探针 | probe-gitcdn-filter / probe | 默认 | 只出证据 TSV，不判红 |
