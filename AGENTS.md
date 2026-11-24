@@ -141,6 +141,25 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 
 冷缓存需先在 git-cdn Pod 内删除 `/workdir` 下对应仓库目录，脚本本身不清理缓存。
 
+### 5.2 冷启动前置（G5，`purge-gitcdn-cache.sh`）
+
+git-cdn 缓存分两层，都在容器内 `/workdir`：
+
+- mirror `/workdir/git/<org>/<repo>.git`：可按仓库精确删除
+- `pack_cache`：按请求哈希分目录，**没有仓库索引**，只能整体清空，会影响所有
+  仓库下次回源
+
+在有 kubectl 权限的机器上（CI runner 没有集群权限）：
+
+```bash
+KUBECONFIG=~/.kube/gy-006.yaml bash test-squid/purge-gitcdn-cache.sh
+# 真正冷启动（连 pack_cache 一起清）：
+PURGE_PACK_CACHE=1 KUBECONFIG=~/.kube/gy-006.yaml bash test-squid/purge-gitcdn-cache.sh
+```
+
+清完立即触发 `test-gitcode-clone`（`iterations>=2`）和 `test-gitcdn`
+（`gitcdn-refspec`），否则下一次请求就把缓存重新填热。
+
 ### 6. GitCode LFS store_id 缓存键（test-squid 的 lfs-storeid = K5，opt-in）
 
 opt-in job（`-f lfs_store_id=1`，需目标 squid 已开 `squid.storeId.enabled`）。
