@@ -106,7 +106,11 @@ else
     # 不在 mirror 里，否则增量恒为 0、用例失去意义。
     metric_result() {  # metric_result <leader|waiter|skipped_present|failed>
         local body
-        body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || return 1
+        # /metrics 偶发被断开（fetch 期间 worker 忙），重试一次避免误记 WARN
+        body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || {
+            sleep 1
+            body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || return 1
+        }
         printf '%s\n' "$body" |
             awk -v r="result=\"$1\"" \
                 '$1 ~ /^git_cdn_fetch_sha_total\{/ && index($0, r) {s+=$2} END{print s+0}'
@@ -182,48 +186,52 @@ else
 
     d3=$(mktemp -d) && d4=$(mktemp -d)
     git -C "$d3" init -q && git -C "$d4" init -q
+    bad_dirs=("$d3" "$d4")
     t0=$(now_ms)
-    GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$d3" fetch --depth 1 "$REMOTE" "$bad" \
-        >"$results/sha-bad-1.out" 2>"$results/sha-bad-1.err" &
-    p3=$!
-    GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$d4" fetch --depth 1 "$REMOTE" "$bad" \
-        >"$results/sha-bad-2.out" 2>"$results/sha-bad-2.err" &
-    p4=$!
-    wait $p3; rc3=$?
-    wait $p4; rc4=$?
-    ms=$(( $(now_ms) - t0 ))
+    for i in 1 2; do
+        (
+            s=$(now_ms)
+            GIT_TERMINAL_PROMPT=0 timeout 180 git -C "${bad_dirs[$(( i - 1 ))]}" fetch --depth 1 "$REMOTE" "$bad" \
+                >"$results/sha-bad-$i.out" 2>"$results/sha-bad-$i.err"
+            echo "$? $(( $(now_ms) - s ))" >"$results/sha-bad-$i.stat"
+        ) &
+    done
+    wait
+    total=$(( $(now_ms) - t0 ))
     a_leader=$(metric_result leader) || a_leader=""
     a_failed=$(metric_result failed) || a_failed=""
     a_waiter=$(metric_result waiter) || a_waiter=""
 
-    check_bad() {  # check_bad <第几路> <rc> <stderr 文件>
-        local n=$1 rc=$2 err=$3
+    check_bad() {  # check_bad <第几路> <rc> <耗时ms> <stderr 文件>
+        local n=$1 rc=$2 rms=$3 err=$4
         if [ "$rc" -eq 124 ]; then
-            record sha-error FAIL "第 $n 路 180s 超时未返回（回源卡死未透传）" "$ms"
+            record sha-error FAIL "第 $n 路 180s 超时未返回（回源卡死未透传）" "$rms"
             fail=1
         elif [ "$rc" -eq 0 ]; then
-            record sha-error FAIL "第 $n 路 rc=0（坏 SHA 竟然成功）" "$ms"
+            record sha-error FAIL "第 $n 路 rc=0（坏 SHA 竟然成功）" "$rms"
             fail=1
         elif [ ! -s "$err" ]; then
-            record sha-error FAIL "第 $n 路 rc=$rc 但无 git 错误信息（失败未透传）" "$ms"
+            record sha-error FAIL "第 $n 路 rc=$rc 但无 git 错误信息（失败未透传）" "$rms"
             fail=1
         elif grep -qiE 'chunked-encoded stream|curl 56' "$err"; then
             record sha-error FAIL \
-                "第 $n 路 rc=$rc 错误流未正常收尾（$(head -n 1 "$err" | cut -c1-70)）" "$ms"
+                "第 $n 路 rc=$rc 错误流未正常收尾（$(head -n 1 "$err" | cut -c1-70)）" "$rms"
             fail=1
         else
-            record sha-error PASS "第 $n 路 rc=$rc，$(head -n 1 "$err" | cut -c1-70)" "$ms"
+            record sha-error PASS "第 $n 路 rc=$rc，$(head -n 1 "$err" | cut -c1-70)" "$rms"
         fi
     }
-    check_bad 1 "$rc3" "$results/sha-bad-1.err"
-    check_bad 2 "$rc4" "$results/sha-bad-2.err"
+    for i in 1 2; do
+        read -r bad_rc bad_ms <"$results/sha-bad-$i.stat"
+        check_bad "$i" "$bad_rc" "$bad_ms" "$results/sha-bad-$i.err"
+    done
 
     # 失败路径的单飞只留证据不判红：同 worker 内 waiter 复用 leader 的 Future
     # （leader +1 / waiter +1）；跨 worker 时按 SHA flock 串行、各自退避
     # （leader +2）。两种都属实现现状，成本差异写进 detail 供人判断。
     if [ -n "$b_leader" ] && [ -n "$a_leader" ]; then
         record sha-error-singleflight INFO \
-            "leader +$(( a_leader - b_leader )) / waiter +$(( a_waiter - b_waiter )) / failed +$(( a_failed - b_failed ))（两路并发，总墙钟 ${ms}ms）" 0
+            "leader +$(( a_leader - b_leader )) / waiter +$(( a_waiter - b_waiter )) / failed +$(( a_failed - b_failed ))（两路总墙钟 ${total}ms）" 0
     fi
     rm -rf "$d3" "$d4"
 fi
