@@ -13,9 +13,13 @@
 # 判定（三个阶段，任一 FAIL → 退出码 1）：
 #   ① refspec：目标仓库 refs/heads/* 可读；refs/pull/* 只记录数量（git-cdn 的
 #      info/refs 由上游代理，仍会通告 pull refs，这是预期行为，不判红）
-#   ② SHA 回源：从 refs/pull/*/head 取一个 PR-only SHA（mirror 不包含），
-#      两路并发 `git fetch --depth 1 <sha>` 都成功；/metrics 可达时记录
-#      git_cdn_fetch_sha_total 增量（>1 记 WARN）
+#   ② SHA 回源：从 refs/pull/*/head 按 PR 号从大到小取最近的候选 SHA，
+#      两路并发 `git fetch --depth 1 <sha>` 都成功；并按
+#      git_cdn_fetch_sha_total{result="leader"} 增量断言单飞：
+#        两路并发只应有 1 个 leader（+1 = PASS）；
+#        +0 说明该 SHA 已在 mirror（没触发回源），自动换下一个候选；
+#        ≥2 判红（两路各自回源，单飞失效）。候选全部已缓存时记 SKIP，
+#        提示先 purge 缓存（test-squid/purge-gitcdn-cache.sh）再测。
 #   ③ 失败透传：取一个不存在的 SHA，必须在 180s 内非零退出且 stderr 有 git
 #      错误信息（超时 124 = 回源卡死，判红）
 #
@@ -85,59 +89,84 @@ else
     record refspec-pulls INFO "refs/pull/*/head $(printf '%s\n' "$pulls" | grep -c . ) 条（上游代理通告）" "$ms"
 fi
 
-# ---- 选一个 PR-only SHA（mirror 不包含，验证按 SHA 回源）----------------------
-sha=$(printf '%s\n' "$pulls" | awk 'NF {print $1; exit}')
-if [ -z "$sha" ]; then
+# ---- 选候选 PR-only SHA（mirror 通常不含；按 PR 号取最近的几个）---------------
+mapfile -t candidates < <(
+    printf '%s\n' "$pulls" |
+        awk 'NF==2 {n=$2; sub(/^refs\/pull\//,"",n); sub(/\/head$/,"",n);
+                    if (n ~ /^[0-9]+$/) print n, $1}' |
+        sort -k1,1nr | awk '!seen[$2]++ {print $2}' | head -n 3
+)
+if [ "${#candidates[@]}" -eq 0 ]; then
     record sha-pick SKIP "没有 refs/pull/*/head 可取" 0
 else
-    log "目标 SHA=$sha（refs/pull/*/head，mirror 不含）"
-
     # ---- 阶段 2：两路并发按 SHA fetch（单飞）--------------------------------
-    metric() {
-        curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null \
-            | awk '/^git_cdn_fetch_sha_total/{s+=$2} END{print s+0}'
+    # git_cdn_fetch_sha_total 带 result 标签（leader/waiter/skipped_present/failed），
+    # 只有 leader 代表一次真实回源；单飞判定只看 leader 增量，且必须先保证该 SHA
+    # 不在 mirror 里，否则增量恒为 0、用例失去意义。
+    metric_leader() {
+        local body
+        body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || return 1
+        printf '%s\n' "$body" |
+            awk '$1 ~ /^git_cdn_fetch_sha_total\{/ && /result="leader"/ {s+=$2} END{print s+0}'
     }
-    before=$(metric)
 
-    d1=$(mktemp -d) && d2=$(mktemp -d)
-    git -C "$d1" init -q && git -C "$d2" init -q
-    t0=$(now_ms)
-    GIT_TERMINAL_PROMPT=0 timeout 600 git -C "$d1" fetch --depth 1 "$REMOTE" "$sha" \
-        >"$results/sha-fetch-1.out" 2>"$results/sha-fetch-1.err" &
-    p1=$!
-    GIT_TERMINAL_PROMPT=0 timeout 600 git -C "$d2" fetch --depth 1 "$REMOTE" "$sha" \
-        >"$results/sha-fetch-2.out" 2>"$results/sha-fetch-2.err" &
-    p2=$!
-    wait $p1; rc1=$?
-    wait $p2; rc2=$?
-    ms=$(( $(now_ms) - t0 ))
-    after=$(metric)
+    cold=0
+    for sha in "${candidates[@]}"; do
+        log "候选 SHA=$sha（refs/pull/*/head）"
+        before=$(metric_leader) || before=""
 
-    if [ $rc1 -eq 0 ] && [ $rc2 -eq 0 ]; then
+        d1=$(mktemp -d) && d2=$(mktemp -d)
+        git -C "$d1" init -q && git -C "$d2" init -q
+        t0=$(now_ms)
+        GIT_TERMINAL_PROMPT=0 timeout 600 git -C "$d1" fetch --depth 1 "$REMOTE" "$sha" \
+            >"$results/sha-fetch-1.out" 2>"$results/sha-fetch-1.err" &
+        p1=$!
+        GIT_TERMINAL_PROMPT=0 timeout 600 git -C "$d2" fetch --depth 1 "$REMOTE" "$sha" \
+            >"$results/sha-fetch-2.out" 2>"$results/sha-fetch-2.err" &
+        p2=$!
+        wait $p1; rc1=$?
+        wait $p2; rc2=$?
+        ms=$(( $(now_ms) - t0 ))
+        after=$(metric_leader) || after=""
+
+        if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
+            record sha-fetch FAIL "rc1=$rc1 rc2=$rc2（${sha:0:9}，见 sha-fetch-*.err）" "$ms"
+            fail=1
+            rm -rf "$d1" "$d2"
+            break
+        fi
         got1=$(git -C "$d1" rev-parse FETCH_HEAD 2>/dev/null)
         got2=$(git -C "$d2" rev-parse FETCH_HEAD 2>/dev/null)
-        if [ "$got1" = "$sha" ] && [ "$got2" = "$sha" ]; then
-            record sha-fetch PASS "两路均取到 ${sha:0:9}（${ms}ms）" "$ms"
-        else
+        rm -rf "$d1" "$d2"
+        if [ "$got1" != "$sha" ] || [ "$got2" != "$sha" ]; then
             record sha-fetch FAIL "FETCH_HEAD 不符：${got1:0:9}/${got2:0:9}" "$ms"
             fail=1
+            break
         fi
-    else
-        record sha-fetch FAIL "rc1=$rc1 rc2=$rc2（见 sha-fetch-*.err）" "$ms"
-        fail=1
-    fi
+        record sha-fetch PASS "两路均取到 ${sha:0:9}（${ms}ms）" "$ms"
 
-    if [ -n "$before" ] && [ -n "$after" ]; then
-        delta=$(( after - before ))
-        if [ "$delta" -gt 1 ]; then
-            record sha-singleflight WARN "git_cdn_fetch_sha_total +$delta（>1，单飞可能未生效）" 0
-        else
-            record sha-singleflight PASS "git_cdn_fetch_sha_total +$delta" 0
+        if [ -z "$before" ] || [ -z "$after" ]; then
+            record sha-singleflight WARN "/metrics 不可达，未取到 git_cdn_fetch_sha_total{result=\"leader\"}" 0
+            cold=1  # fetch 本身已成功，不再换候选
+            break
         fi
-    else
-        record sha-singleflight WARN "/metrics 不可达，未取到 git_cdn_fetch_sha_total" 0
+        delta=$(( after - before ))
+        if [ "$delta" -eq 1 ]; then
+            record sha-singleflight PASS "回源 leader +1（两路并发合并为一次回源）" 0
+            cold=1
+            break
+        elif [ "$delta" -ge 2 ]; then
+            record sha-singleflight FAIL "回源 leader +$delta（>1，两路各自回源，单飞未生效）" 0
+            fail=1
+            cold=1
+            break
+        fi
+        log "  ${sha:0:9} 已在 mirror（leader +0，未触发回源），换下一个候选"
+    done
+    if [ "$cold" -eq 0 ]; then
+        record sha-singleflight SKIP \
+            "候选 SHA 均已在 mirror（leader +0），未触发回源；先 purge 仓库缓存再测" 0
     fi
-    rm -rf "$d1" "$d2"
 
     # ---- 阶段 3：不存在的 SHA 必须快速失败 ----------------------------------
     bad="0000000000000000000000000000000000000001"
