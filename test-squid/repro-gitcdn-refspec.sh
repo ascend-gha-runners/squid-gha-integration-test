@@ -178,10 +178,14 @@ else
     fi
 
     # ---- 阶段 3：坏 SHA 的并发失败路径（leader 失败 → waiter 不能挂死）--------
-    # 两路并发打同一个不存在的 SHA：leader 走完 0.5+1+2+4+8=15.5s 退避后转
-    # upload-pack 报错；waiter 必须拿到同一结果并同时量级返回，不能各自重新退避，
-    # 也不能出现「已开始的 chunked 流里写第二个 HTTP 500」→ 客户端只见 curl 56
-    # （issue opensourceways/git-cache-http-server#33）。
+    # 两路并发打同一个不存在的 SHA。实测 gitcode 对这种 SHA 返回的是
+    #   fatal: remote-curl: bad line length character: <CH.
+    #   fatal: the remote end hung up unexpectedly
+    # 不匹配 is_permanent_fetch_error（只认 not our ref / unadvertised object），
+    # 所以每路都会走完整 0.5+1+2+4+8=15.5s 退避后抛 HTTP 500（failed +1），
+    # 而不是转 upload-pack 回 "not our ref"。
+    # 断言只看客户端：两路都要拿到干净的 git fatal，不能是 curl 56 / chunked
+    # stream 未收尾（issue opensourceways/git-cache-http-server#33）。
     bad="0000000000000000000000000000000000000001"
     b_leader=$(metric_result leader) || b_leader=""
     b_failed=$(metric_result failed) || b_failed=""
