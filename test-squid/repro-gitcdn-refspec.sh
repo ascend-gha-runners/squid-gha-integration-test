@@ -136,7 +136,7 @@ else
         wait $p1; rc1=$?
         wait $p2; rc2=$?
         ms=$(( $(now_ms) - t0 ))
-        after=$(metric_leader) || after=""
+        after=$(metric_result leader) || after=""
 
         if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
             record sha-fetch FAIL "rc1=$rc1 rc2=$rc2（${sha:0:9}，见 sha-fetch-*.err）" "$ms"
