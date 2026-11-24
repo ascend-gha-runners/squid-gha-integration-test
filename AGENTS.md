@@ -127,6 +127,51 @@ gh workflow run test-gitcdn.yaml --ref main -f latest=1 \
 - 定时轮次不跑 `gitcdn-unsynced` job（避免每 30 分钟造一次临时 ref），该 job 仍
   在 workflow_dispatch / PR 上执行。
 
+### 5.1 PR30/32 回归（test-gitcdn 的 gitcdn-refspec job）
+
+`test-squid/repro-gitcdn-refspec.sh`，默认目标 `gitcode.com/ascend/pytorch`
+（git-cdn-gitcode 后端），三个阶段：
+
+- refspec：`refs/heads/*` 可读；`refs/pull/*` 只记录数量，不判红（git-cdn 的
+  `info/refs` 直接代理上游，pull refs 仍会通告）
+- SHA 回源：从 `refs/pull/*/head` 按 PR 号取最近 5 个候选 SHA，两路并发
+  `git fetch --depth 1 <sha>`；断言 `git_cdn_fetch_sha_total{result="leader"}`
+  只 +1（该指标带 result 标签，只数 leader，不能整表求和）。+0 说明该 SHA 已在
+  mirror、自动换下一个候选；`not our ref` 说明上游本身不支持按该 SHA 回源（已关闭
+  PR 常见），同样换候选不判红；候选都试完仍未触发回源记 SKIP（先 purge 再测）；≥2 判红
+- 失败透传：两路并发取同一个不存在的 SHA，两路都要在 180s 内非零退出、stderr
+  有 git 错误，且不能出现 `curl 56` / `chunked-encoded stream`（错误流未收尾，
+  issue #33）；leader/waiter/failed 增量只作证据（同 worker 合并、跨 worker 串行
+  都算现状，不判红）
+
+冷缓存需先在 git-cdn Pod 内删除 `/workdir` 下对应仓库目录，脚本本身不清理缓存。
+只删 mirror 不够：`pack_cache` 仍有该请求的 pack 时，fetch 约 29ms 直接命中、
+`leader +0`，脚本会记 SKIP。要验证 `leader +1` 必须同时 `PURGE_PACK_CACHE=1`。
+
+### 5.2 冷启动前置（G5，`purge-gitcdn-cache.sh`）
+
+git-cdn 缓存分两层，都在容器内 `/workdir`：
+
+- mirror `/workdir/git/<org>/<repo>.git`：可按仓库精确删除
+- `pack_cache`：按请求哈希分目录，**没有仓库索引**，只能整体清空，会影响所有
+  仓库下次回源
+
+在有 kubectl 权限的机器上（CI runner 没有集群权限）：
+
+```bash
+KUBECONFIG=~/.kube/gy-006.yaml bash test-squid/purge-gitcdn-cache.sh
+# 真正冷启动（连 pack_cache 一起清）：
+PURGE_PACK_CACHE=1 KUBECONFIG=~/.kube/gy-006.yaml bash test-squid/purge-gitcdn-cache.sh
+```
+
+清完立即触发 `test-gitcode-clone`（`iterations>=2`）和 `test-gitcdn`
+（`gitcdn-refspec`），否则下一次请求就把缓存重新填热。
+
+实测参考（gy-006，镜像 `fix-cold-start-wants-check-93a5cb5`）：`cann/catlass`
+冷 7.4s → 热 2.5s；`ascend/pytorch`（142MB）两路并发同 SHA 冷启动共 29s
+（clone 21~22s + fetch_sha 3.6~4.3s，两路只 clone 一次）。冷启动后 mirror
+体积无放大，浅克隆按 SHA 不写 `pack_cache`。
+
 ### 6. GitCode LFS store_id 缓存键（test-squid 的 lfs-storeid = K5，opt-in）
 
 opt-in job（`-f lfs_store_id=1`，需目标 squid 已开 `squid.storeId.enabled`）。
