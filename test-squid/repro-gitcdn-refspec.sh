@@ -105,15 +105,18 @@ else
     # 只有 leader 代表一次真实回源；单飞判定只看 leader 增量，且必须先保证该 SHA
     # 不在 mirror 里，否则增量恒为 0、用例失去意义。
     metric_result() {  # metric_result <leader|waiter|skipped_present|failed>
-        local body
-        # /metrics 偶发被断开（fetch 期间 worker 忙），重试一次避免误记 WARN
-        body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || {
-            sleep 1
-            body=$(curl -sS --max-time 10 "${GIT_CDN_BASE%/}/metrics" 2>/dev/null) || return 1
-        }
-        printf '%s\n' "$body" |
-            awk -v r="result=\"$1\"" \
-                '$1 ~ /^git_cdn_fetch_sha_total\{/ && index($0, r) {s+=$2} END{print s+0}'
+        local body n
+        # /metrics 偶发连不上（fetch 刚结束时的窗口），最多试 3 次；失败原因留档
+        for n in 1 2 3; do
+            if body=$(curl -sS --max-time 8 "${GIT_CDN_BASE%/}/metrics" 2>>"$results/metrics.err"); then
+                printf '%s\n' "$body" |
+                    awk -v r="result=\"$1\"" \
+                        '$1 ~ /^git_cdn_fetch_sha_total\{/ && index($0, r) {s+=$2} END{print s+0}'
+                return 0
+            fi
+            [ "$n" -lt 3 ] && sleep 2
+        done
+        return 1
     }
 
     cold=0
