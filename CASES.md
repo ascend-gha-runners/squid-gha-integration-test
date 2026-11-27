@@ -513,7 +513,7 @@ RESULTS=/tmp/apt-byhash bash test-squid/repro-apt-byhash.sh mutable
 | 阶段 | 场景 | 判定 |
 |---|---|---|
 | `<实例>-0-reach` | GET 基址 | 200=PASS；不可达=SKIP（该实例不适用） |
-| `<实例>-1-batch` | POST batch（UA=`git-lfs/...`） | 200 且 objects[0] 有 download action；上游无对象/需鉴权=SKIP；非 200=FAIL |
+| `<实例>-1-batch` | POST batch（UA=`git-lfs/...`） | 仅异常时出行：非 200 / 无 download action=FAIL，上游无对象/需鉴权=SKIP；成功由下一行 `-2-rewrite` 记 PASS |
 | `<实例>-2-rewrite` | href 落点断言 | 必须 `<基址>/<repo>.git/info/lfs/objects/<oid>?_lfs=…&exp=…`；未改写（旧镜像）时 `LFS_STRICT=1` 判红、=0 记 SKIP 并跳过后续 |
 | `<实例>-3-object` | href GET ×2 | 两发 200 且 sha256==oid=PASS；500 常见于 `/workdir` 配额满（已知问题）；时延只留档 |
 | `<实例>-4-notoken` / `-tampered` / `-oidmismatch` | 去掉 `_lfs`/`exp`、篡改 token、换路径里的 oid | 均须 403（验签/绑定生效）；其它码=FAIL |
