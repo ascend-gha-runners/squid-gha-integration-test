@@ -21,8 +21,9 @@
 #   每实例：
 #     ① batch（UA=git-lfs）200，href 指回本实例且带 _lfs/exp → 跨域改写生效
 #     ② href GET 两次：均 200 且 sha256==oid → 缓存内容与 pointer 一致
-#     ③ 无 token / 篡改 token / oid 不符 → 403（可选：过期 token → 403）
-#     ④ 浏览器 UA batch → 308 且 Location 非空
+#     ③ 无 token / 篡改 token / oid 不符 / token 格式非法 / exp 非整数 → 403
+#        （提供 LFS_URL_SECRET 时再补：过期 token、MAC 合法但 repo 不符 → 403）
+#     ④ 浏览器 UA：batch 与对象 GET 均 308 且 Location 非空
 #
 # 判定：
 #   · 任一断言不符 → FAIL；实例不可达 → SKIP；
@@ -44,7 +45,7 @@
 #   LFS_OID / LFS_SIZE                   目标对象（默认 BoatAttack 的 20KB 对象）
 #   LFS_STRICT                           1=未改写判红（默认，gy-006）；0=未改写记 SKIP
 #   LFS_URL_SECRET                       服务端密钥（workflow 取自仓库 secret）；提供时
-#                                        补「过期 token → 403」用例，缺省记 SKIP
+#                                        补「过期 token / repo 不符 → 403」用例，缺省记 SKIP
 #   LFS_TIMEOUT                          单请求超时秒数（默认 300）
 #   RESULTS                              结果目录（默认 $RESULTS_DIR/gitcdn-lfs）
 #
@@ -162,6 +163,47 @@ print(u.urlunsplit((p.scheme, p.netloc, p.path, f"_lfs={tok}.{mac}&exp={exp}", "
 PY
 }
 
+# token 格式非法：无法按 "." 拆出 token.mac（走 bad token 分支，与 MAC 不符不同）
+bad_token_url() {
+    python3 - "$1" <<'PY'
+import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+q = u.parse_qs(p.query)
+q["_lfs"] = ["abc"]
+print(u.urlunsplit((p.scheme, p.netloc, p.path, u.urlencode(q, doseq=True), "")))
+PY
+}
+
+# exp 非整数（验签前的参数校验分支）
+bad_exp_url() {
+    python3 - "$1" <<'PY'
+import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+q = u.parse_qs(p.query)
+q["exp"] = ["abc"]
+print(u.urlunsplit((p.scheme, p.netloc, p.path, u.urlencode(q, doseq=True), "")))
+PY
+}
+
+# repo 绑定：路径仓库换成 decoy，并用同一密钥对 decoy 重算 HMAC（MAC 合法、未过期），
+# 由 payload 里的 repo 与 URL 的 repo 不一致触发 403（区别于 MAC 篡改分支）
+repo_mismatch_url() {  # <href> <repo.git> <decoy.git> <oid>
+    python3 - "$1" "$2" "$3" "$4" "$SECRET" <<'PY'
+import base64, hashlib, hmac, sys, time, urllib.parse as u
+href, repo, decoy, oid, secret = sys.argv[1:6]
+p = u.urlsplit(href)
+q = u.parse_qs(p.query)
+tok = q["_lfs"][0].split(".", 1)[0]
+path = p.path.replace("/%s/info/lfs/objects/" % repo,
+                      "/%s/info/lfs/objects/" % decoy, 1)
+exp = int(time.time()) + 600
+key = hashlib.sha256((secret + ":hmac").encode()).digest()
+msg = f"{decoy}\n{oid}\n{exp}\n{tok}".encode()
+mac = base64.urlsafe_b64encode(hmac.new(key, msg, hashlib.sha256).digest()).decode().rstrip("=")
+print(u.urlunsplit((p.scheme, p.netloc, path, f"_lfs={tok}.{mac}&exp={exp}", "")))
+PY
+}
+
 run_instance() {  # <name> <base> <repo>
     local name=$1 base=$2 repo=$3
     base="${base%/}"
@@ -234,19 +276,26 @@ run_instance() {  # <name> <base> <repo>
         step "$name-3-object" PASS "$sec2" "两发均 200 且 sha256==oid；t1=${sec1}s t2=${sec2}s（预热竞态，时延仅留档）"
     fi
 
-    # ⑤ 负数：无 token / 篡改 token / oid 不符（均应 403；可选过期）
-    local kind url2 got gsec
-    for kind in notoken tampered oidmismatch expired; do
+    # ⑤ 负数：无 token / 篡改 / oid 不符 / token 格式非法 / exp 非整数 → 403；
+    #    提供 secret 时再补：过期 token、MAC 合法但 repo 不符 → 403
+    local kind url2 got gsec decoy="${gitrepo%.git}-decoy.git"
+    for kind in notoken tampered oidmismatch badtoken badexp expired repomismatch; do
         case "$kind" in
             notoken)     url2=$(strip_query "$href") ;;
             tampered)    url2=$(tamper_query "$href") ;;
             oidmismatch) url2=$(swap_oid "$href") ;;
-            expired)
+            badtoken)    url2=$(bad_token_url "$href") ;;
+            badexp)      url2=$(bad_exp_url "$href") ;;
+            expired|repomismatch)
                 if [ -z "$SECRET" ]; then
                     step "$name-4-$kind" SKIP 0 "未提供 LFS_URL_SECRET（仓库 secret 未配置）"
                     continue
                 fi
-                url2=$(expired_url "$href" "$gitrepo" "$OID") ;;
+                if [ "$kind" = "expired" ]; then
+                    url2=$(expired_url "$href" "$gitrepo" "$OID")
+                else
+                    url2=$(repo_mismatch_url "$href" "$gitrepo" "$decoy" "$OID")
+                fi ;;
         esac
         read -r got gsec <<<"$(http "$results/$name-neg-$kind.body" - GET "$url2" -H "User-Agent: $UA")"
         if [ "$got" = "403" ]; then
@@ -273,6 +322,21 @@ run_instance() {  # <name> <base> <repo>
         bad=1
     else
         step "$name-5-browser" FAIL "$sec" "http=$code（预期 308）"
+        bad=1
+    fi
+
+    # ⑦ 浏览器 UA 取对象 → 308 回上游（redirect_browsers 在验签分支之前生效）
+    read -r code sec <<<"$(http "$results/$name-browser-obj.body" "$results/$name-browser-obj.hdr" GET "$href" \
+        -H "User-Agent: $BROWSER_UA")"
+    loc=$(awk 'tolower($1)=="location:"{sub(/^[^:]*:[ \t]*/,""); sub(/\r$/,""); print; exit}' \
+        "$results/$name-browser-obj.hdr" 2>/dev/null)
+    if [ "$code" = "308" ] && [ -n "$loc" ]; then
+        step "$name-5-browser-object" PASS "$sec" "308 → ${loc:0:80}"
+    elif [ "$code" = "308" ]; then
+        step "$name-5-browser-object" FAIL "$sec" "308 但无 Location"
+        bad=1
+    else
+        step "$name-5-browser-object" FAIL "$sec" "http=$code（预期 308）"
         bad=1
     fi
 

@@ -89,7 +89,7 @@ summary job 汇总进 GITHUB_STEP_SUMMARY，artifact 一并上传。
 | G1 | git-cdn 是否跟得上上游最新 commit | `repro-gitcdn-latest.sh` | test-gitcdn / gitcdn-latest | `latest=1` 或定时 | 逐仓库 HEAD 可达且未落后 |
 | G2 | gitcode clone 性能（容器层） | `gitcode-clone-bench.sh` | test-gitcode-clone / clone-bench | 默认 | 两次 clone 全绿 + 缓存收益 |
 | G3 | git-cdn 能否为未同步 SHA 回源 | `repro-gitcdn-unsynced-sha.sh` | test-gitcdn / gitcdn-unsynced | 非 schedule 轮次 | 正向取到该 SHA；`not our ref` 判红 |
-| G6 | git-cdn 跨域 LFS：batch 是否改写为带 `_lfs` 签名的本机地址、对象能否缓存且验签生效 | `repro-gitcdn-lfs.sh` | test-gitcdn / gitcdn-lfs | `lfs_strict=1`（默认） | batch 200 且 href 指回本实例（含 `_lfs`/`exp`）；对象两发 200 且 sha256==oid；无/篡改/换 oid 的 token 均 403；浏览器 UA 308；未改写时 strict=1 判红、=0 记 SKIP |
+| G6 | git-cdn 跨域 LFS：batch 是否改写为带 `_lfs` 签名的本机地址、对象能否缓存且验签生效 | `repro-gitcdn-lfs.sh` | test-gitcdn / gitcdn-lfs | `lfs_strict=1`（默认） | batch 200 且 href 指回本实例（含 `_lfs`/`exp`）；对象两发 200 且 sha256==oid；无/篡改/换 oid/格式非法/过期/repo 不符的 token 均 403；浏览器 UA（batch + 对象）308；未改写时 strict=1 判红、=0 记 SKIP |
 | B1 | 镜像构建外网面（子模块/cmake 包/vllm 大 pack/OBS 资产） | `run-suite.sh --mode imagebuild` | test-squid / imagebuild、container-imagebuild（B1-c） | 默认 | 四路全通；无 302 即判红 |
 | O1 | 单 runner 出网矩阵（每域 squid vs 直连对照） | workflow 内联 `probe` 函数 | probe-domain / probe | `runner`、`repeat`、`only_domains` | 只出证据 TSV，不判红 |
 | O2 | git-cdn 部分克隆的过滤行为 | workflow 内联探针 | probe-gitcdn-filter / probe | 默认 | 只出证据 TSV，不判红 |
@@ -517,8 +517,9 @@ RESULTS=/tmp/apt-byhash bash test-squid/repro-apt-byhash.sh mutable
 | `<实例>-2-rewrite` | href 落点断言 | 必须 `<基址>/<repo>.git/info/lfs/objects/<oid>?_lfs=…&exp=…`；未改写（旧镜像）时 `LFS_STRICT=1` 判红、=0 记 SKIP 并跳过后续 |
 | `<实例>-3-object` | href GET ×2 | 两发 200 且 sha256==oid=PASS；500 常见于 `/workdir` 配额满（已知问题）；时延只留档 |
 | `<实例>-4-notoken` / `-tampered` / `-oidmismatch` | 去掉 `_lfs`/`exp`、篡改 token、换路径里的 oid | 均须 403（验签/绑定生效）；其它码=FAIL |
-| `<实例>-4-expired` | 用 `LFS_URL_SECRET` 重算 `exp=now-10` 的合法 HMAC | 403=PASS；仓库 secret `LFS_URL_SECRET` 未配置时 SKIP |
-| `<实例>-5-browser` | 浏览器 UA POST batch | 308 且 Location 非空=PASS；否则 FAIL |
+| `<实例>-4-badtoken` / `-badexp` | `_lfs=abc`（无法拆 token.mac）、`exp=abc`（非整数） | 均须 403（bad token / 参数校验分支）；其它码=FAIL |
+| `<实例>-4-expired` / `-repomismatch` | 用 `LFS_URL_SECRET` 重算 `exp=now-10`；路径换 decoy 仓库、MAC 按 decoy 重算（MAC 合法且未过期） | 均须 403；仓库 secret `LFS_URL_SECRET` 未配置时 SKIP |
+| `<实例>-5-browser` / `-browser-object` | 浏览器 UA POST batch / GET 对象 href | 均须 308 且 Location 非空；否则 FAIL |
 
 判定：任一阶段 FAIL → 退出码 1；至少一个实例 PASS 且无 FAIL → 0；都不可达/都未启用
 特性 → 2（SKIP，不判红）。`lfs_strict` 默认 1（gy-006 已部署该镜像）；在尚未部署的
