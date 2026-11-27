@@ -17,6 +17,8 @@
 #                      2026-10-31 pip hash 校验事故，META R22）
 #       gitcdn-unsynced —— git-cdn 无法为未同步 SHA 回源（insteadOf→git-cdn 集群，
 #                      2026-11-04 gy-006 checkout 事故；独立脚本 repro-gitcdn-unsynced-sha.sh）
+#       gitcdn-lfs  —— git-cdn 跨域 LFS 缓存（batch 改写 + 对象缓存 + 验签，
+#                      issue #48 / PR #49；独立脚本 repro-gitcdn-lfs.sh）
 #       apt-byhash  —— apt by-hash 索引长缓存（内容寻址不可变对象，deny 内用
 #                      !by_hash 排除例外；chart 0.1.31 / PR #2746，META R24）
 #
@@ -2145,8 +2147,15 @@ elif [ "$MODE" = "gitcdn-unsynced" ]; then
     # 显式传 RESULTS：脚本的证据文件（gitcfg.txt / control.log / target.log）要落在
     # 套件结果目录里才会被 artifact 上传（RESULTS_DIR 未 export 到子进程）
     run_timed gitcdn-unsynced-sha "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-unsynced" bash "$SCRIPT_DIR/repro-gitcdn-unsynced-sha.sh"
+elif [ "$MODE" = "gitcdn-lfs" ]; then
+    # 跨域 LFS（issue #48 / PR #49）：GitHub / GitCode 实例各跑一遍，断言 batch
+    # 改写回本实例、对象两发 sha256==oid、无/篡改/换 oid 的 token 一律 403、
+    # 浏览器 UA 308 回上游。服务属 .svc.cluster.local 直连（在 NO_PROXY 内），
+    # 不经过 squid，故不跑 meta-trace；LFS_STRICT=1（默认）时未改写判红。
+    run_timed env-snapshot        "$LAYER" env-snapshot
+    run_timed gitcdn-lfs          "$LAYER" env RESULTS="$RESULTS_DIR/gitcdn-lfs" bash "$SCRIPT_DIR/repro-gitcdn-lfs.sh"
 else
-    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | apt-byhash）" >&2
+    echo "未知 mode: $MODE（可选 function | concurrency | vllm | parity | upstream | imagebuild | cabundle | tools | pkg | gitcode | stale-index | pip-metadata | gitcdn-unsynced | gitcdn-lfs | apt-byhash）" >&2
     exit 2
 fi
 

@@ -13,6 +13,11 @@ name: test-gitcdn
 #   ③ 经 git-cdn 按真实客户端形态（Basic 凭据）取该 SHA
 #      —— 成功 = git-cdn 回源健康；50s 后 not our ref = 缺陷复现（2026-11-04 事故）
 #
+# 另含「跨域 LFS 缓存」job（gitcdn-lfs，G6）：
+#   GitHub / GitCode 两个实例各断言 batch 改写回本实例（_lfs 签名）、对象两发
+#   sha256==oid、无/篡改/换 oid 的 token 403、浏览器 UA 308
+#   （opensourceways/git-cache-http-server issue #48 / PR #49）。
+#
 # 需要 contents: write（建/删临时 ref）。
 #
 # 另含「最新 commit 滚动校验」job（gitcdn-latest）：
@@ -39,10 +44,16 @@ on:
         required: false
         default: ''
         type: string
+      lfs_strict:
+        description: '1 = 跨域 LFS：batch 未改写（旧镜像）判红；0 = 记 SKIP（其它集群/灰度前）'
+        required: false
+        default: '1'
+        type: string
 
   pull_request:
     paths:
       - 'test-squid/repro-gitcdn-unsynced-sha.sh'
+      - 'test-squid/repro-gitcdn-lfs.sh'
       - 'test-squid/repro-gitcdn-latest.sh'
       - '.github/workflows/test-gitcdn.yaml'
 
@@ -86,6 +97,42 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-gitcdn-unsynced
+          path: /tmp/test-squid-results/
+          if-no-files-found: warn
+
+  # 跨域 LFS 缓存（G6）：batch 改写 + 对象缓存 + token 验签。
+  # 与 unsynced 一样显式打本集群 git-cdn svc（.svc.cluster.local 在 NO_PROXY 内，
+  # 不经过 squid），GitHub / GitCode 两个实例各跑一遍。
+  gitcdn-lfs:
+    name: git-cdn 跨域 LFS 缓存
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ${{ fromJSON(inputs.runner || '["linux-amd64-cpu-2", "gy-006"]') }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 运行跨域 LFS 用例（G6）
+        env:
+          LFS_STRICT: ${{ inputs.lfs_strict || '1' }}
+        run: bash test-squid/run-suite.sh --mode gitcdn-lfs
+
+      - name: 写入 Step Summary
+        if: always()
+        run: |
+          {
+            echo "## test-gitcdn 跨域 LFS 缓存（G6）"
+            echo '```'
+            cat /tmp/test-squid-results/gitcdn-lfs/lfs.tsv 2>/dev/null || echo '(无 lfs.tsv)'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-gitcdn-lfs
           path: /tmp/test-squid-results/
           if-no-files-found: warn
 

@@ -156,6 +156,42 @@ NOT-SELECTED，summary 里逐条列出。判定见 `CASES.md` 的 K5 一行：�
 实测结论（run 44728228545）：同名换内容后 302 落到新的 `untagger_<uuid>` 路径，
 新路径经 squid 拿到新内容 → 缓存键随内容变化，无旧副本污染。
 
+### 7. git-cdn 跨域 LFS 缓存（test-gitcdn 的 gitcdn-lfs = G6）
+
+验证 git-cdn 对 GitHub / GitCode 外部 CDN 的 LFS 缓存（issue #48 / PR #49）：
+batch 改写回本实例（`_lfs` 签名）、对象两发 sha256==oid、无/篡改/换 oid 的 token
+一律 403、浏览器 UA 308。脚本 `test-squid/repro-gitcdn-lfs.sh`，默认随
+test-gitcdn 的 workflow_dispatch / PR 跑（schedule 轮次跳过），显式打本集群 svc，
+不经过 squid。
+
+```bash
+# 默认（gy-006，两个实例：git-cdn 与 git-cdn-gitcode）
+gh workflow run test-gitcdn.yaml --repo ascend-gha-runners/squid-gha-integration-test \
+  --ref main
+
+# 在尚未部署该镜像的集群跑：未改写只记 SKIP，不判红
+gh workflow run test-gitcdn.yaml --ref main -f lfs_strict=0
+
+# 换实例/仓库/对象（手动在 runner 内跑）
+LFS_GITHUB_BASE=http://git-cdn-service.git-cdn.svc.cluster.local:8000 \
+LFS_GITCODE_BASE=http://git-cdn-service.git-cdn-gitcode.svc.cluster.local:8000 \
+bash test-squid/repro-gitcdn-lfs.sh
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `lfs_strict`（workflow input） | `1` | 1 = batch 未改写（旧镜像）判红；0 = 未改写记 SKIP 并跳过后续断言 |
+| `LFS_GITHUB_BASE` / `LFS_GITCODE_BASE` | gy-006 两个 svc | 被测实例基址 |
+| `LFS_GITHUB_REPO` / `LFS_GITCODE_REPO` | `Unity-Technologies/BoatAttack` / `gh_mirrors/bo/BoatAttack` | 含 LFS 对象的目标仓库 |
+| `LFS_OID` / `LFS_SIZE` | BoatAttack 20KB 对象 | 目标对象（默认 oid/size 已在脚本内） |
+| `LFS_URL_SECRET` | 空 | 可选；提供时补「过期 token → 403」用例（workflow 默认不注入） |
+
+结果在 artifact `test-gitcdn-lfs` 的 `gitcdn-lfs/lfs.tsv`（id/phase/status/seconds/note）。
+判定：任一断言不符 → FAIL；实例不可达 / 未启用特性（strict=0）→ SKIP。已知
+`/workdir/lfs` 所在 SFS Turbo 配额满时对象 GET 会 500（`OSError: Quota exceeded`），
+属容量问题，先清理/扩容再重跑。预热在 batch 后异步触发，首访可能已是 HIT，
+时延只留档（命中证据看 Pod 日志 `lfs_hit=True` / `lfs_served`）。
+
 ## 二、前置条件（缺一不可）
 
 1. **runner 注入 squid**：目标 runner set 的 pod 模板必须已注入
