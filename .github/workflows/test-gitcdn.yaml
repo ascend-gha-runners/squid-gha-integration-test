@@ -116,7 +116,14 @@ jobs:
       - name: 运行跨域 LFS 用例（G6）
         env:
           LFS_STRICT: ${{ inputs.lfs_strict || '1' }}
-        run: bash test-squid/run-suite.sh --mode gitcdn-lfs
+          # 过期 token 子用例要按服务端同一密钥重算 HMAC；未配置时脚本记 SKIP
+          LFS_URL_SECRET: ${{ secrets.LFS_URL_SECRET }}
+        run: |
+          rc=0
+          bash test-squid/run-suite.sh --mode gitcdn-lfs || rc=$?
+          echo '--- lfs.tsv ---'
+          cat /tmp/test-squid-results/gitcdn-lfs/lfs.tsv 2>/dev/null || true
+          exit $rc
 
       - name: 写入 Step Summary
         if: always()

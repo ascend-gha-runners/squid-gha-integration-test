@@ -517,7 +517,7 @@ RESULTS=/tmp/apt-byhash bash test-squid/repro-apt-byhash.sh mutable
 | `<实例>-2-rewrite` | href 落点断言 | 必须 `<基址>/<repo>.git/info/lfs/objects/<oid>?_lfs=…&exp=…`；未改写（旧镜像）时 `LFS_STRICT=1` 判红、=0 记 SKIP 并跳过后续 |
 | `<实例>-3-object` | href GET ×2 | 两发 200 且 sha256==oid=PASS；500 常见于 `/workdir` 配额满（已知问题）；时延只留档 |
 | `<实例>-4-notoken` / `-tampered` / `-oidmismatch` | 去掉 `_lfs`/`exp`、篡改 token、换路径里的 oid | 均须 403（验签/绑定生效）；其它码=FAIL |
-| `<实例>-4-expired` | 用 `LFS_URL_SECRET` 重算 `exp=now-10` 的合法 HMAC | 403=PASS；默认 workflow 不注入 secret → SKIP（需人工带 secret 跑） |
+| `<实例>-4-expired` | 用 `LFS_URL_SECRET` 重算 `exp=now-10` 的合法 HMAC | 403=PASS；仓库 secret `LFS_URL_SECRET` 未配置时 SKIP |
 | `<实例>-5-browser` | 浏览器 UA POST batch | 308 且 Location 非空=PASS；否则 FAIL |
 
 判定：任一阶段 FAIL → 退出码 1；至少一个实例 PASS 且无 FAIL → 0；都不可达/都未启用

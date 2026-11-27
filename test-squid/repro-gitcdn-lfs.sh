@@ -43,7 +43,8 @@
 #   LFS_GITHUB_REPO / LFS_GITCODE_REPO   目标仓库（须含 LFS 对象；owner/repo，不带 .git）
 #   LFS_OID / LFS_SIZE                   目标对象（默认 BoatAttack 的 20KB 对象）
 #   LFS_STRICT                           1=未改写判红（默认，gy-006）；0=未改写记 SKIP
-#   LFS_URL_SECRET                       可选；提供时补「过期 token → 403」用例
+#   LFS_URL_SECRET                       服务端密钥（workflow 取自仓库 secret）；提供时
+#                                        补「过期 token → 403」用例，缺省记 SKIP
 #   LFS_TIMEOUT                          单请求超时秒数（默认 300）
 #   RESULTS                              结果目录（默认 $RESULTS_DIR/gitcdn-lfs）
 #
@@ -242,7 +243,7 @@ run_instance() {  # <name> <base> <repo>
             oidmismatch) url2=$(swap_oid "$href") ;;
             expired)
                 if [ -z "$SECRET" ]; then
-                    step "$name-4-$kind" SKIP 0 "未提供 LFS_URL_SECRET（可手动跑；默认 workflow 不注入）"
+                    step "$name-4-$kind" SKIP 0 "未提供 LFS_URL_SECRET（仓库 secret 未配置）"
                     continue
                 fi
                 url2=$(expired_url "$href" "$gitrepo" "$OID") ;;
