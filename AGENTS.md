@@ -185,6 +185,7 @@ bash test-squid/repro-gitcdn-lfs.sh
 | `LFS_GITHUB_REPO` / `LFS_GITCODE_REPO` | `Unity-Technologies/BoatAttack` / `gh_mirrors/bo/BoatAttack` | 含 LFS 对象的目标仓库 |
 | `LFS_OID` / `LFS_SIZE` | BoatAttack 20KB 对象 | 目标对象（默认 oid/size 已在脚本内） |
 | `LFS_URL_SECRET` | 仓库 secret `LFS_URL_SECRET` | 与服务端一致的密钥（gy-006 两实例同值）；提供时补「过期 token → 403」用例，secret 未配置时记 SKIP |
+| `LFS_GITHUB_OID/SIZE`、`LFS_GITCODE_OID/SIZE` | 空（同 `LFS_OID/SIZE`） | 仅覆盖单实例的目标对象；换仓库（如 GitCode 真实 CI 仓库 `Ascend/msmodeling`）时与 repo 成对传（workflow input：`lfs_gitcode_repo/oid/size`） |
 
 结果在 artifact `test-gitcdn-lfs` 的 `gitcdn-lfs/lfs.tsv`（id/phase/status/seconds/note）。
 判定：任一断言不符 → FAIL；实例不可达 / 未启用特性（strict=0）→ SKIP。已知

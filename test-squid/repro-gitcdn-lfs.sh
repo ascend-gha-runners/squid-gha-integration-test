@@ -43,6 +43,8 @@
 #   LFS_GITHUB_BASE / LFS_GITCODE_BASE   两个实例基址
 #   LFS_GITHUB_REPO / LFS_GITCODE_REPO   目标仓库（须含 LFS 对象；owner/repo，不带 .git）
 #   LFS_OID / LFS_SIZE                   目标对象（默认 BoatAttack 的 20KB 对象）
+#   LFS_GITHUB_OID / LFS_GITHUB_SIZE     仅覆盖 GitHub 实例的目标对象（默认同 LFS_OID/SIZE）
+#   LFS_GITCODE_OID / LFS_GITCODE_SIZE   仅覆盖 GitCode 实例的目标对象（默认同上）
 #   LFS_STRICT                           1=未改写判红（默认，gy-006）；0=未改写记 SKIP
 #   LFS_URL_SECRET                       服务端密钥（workflow 取自仓库 secret）；提供时
 #                                        补「过期 token / repo 不符 → 403」用例，缺省记 SKIP
@@ -60,6 +62,11 @@ GH_REPO="${LFS_GITHUB_REPO:-Unity-Technologies/BoatAttack}"
 GC_REPO="${LFS_GITCODE_REPO:-gh_mirrors/bo/BoatAttack}"
 OID="${LFS_OID:-df2fcd2b9b07ae2eadd8c916a19d4296c61eb7089501aa271d0f6997191d6d13}"
 SIZE="${LFS_SIZE:-20249}"
+# 每实例可单独覆盖目标对象（默认都用上面的通用 oid/size）
+GH_OID="${LFS_GITHUB_OID:-$OID}"
+GH_SIZE="${LFS_GITHUB_SIZE:-$SIZE}"
+GC_OID="${LFS_GITCODE_OID:-$OID}"
+GC_SIZE="${LFS_GITCODE_SIZE:-$SIZE}"
 STRICT="${LFS_STRICT:-1}"
 SECRET="${LFS_URL_SECRET:-}"
 TIMEOUT="${LFS_TIMEOUT:-300}"
@@ -204,8 +211,8 @@ print(u.urlunsplit((p.scheme, p.netloc, path, f"_lfs={tok}.{mac}&exp={exp}", "")
 PY
 }
 
-run_instance() {  # <name> <base> <repo>
-    local name=$1 base=$2 repo=$3
+run_instance() {  # <name> <base> <repo> <oid> <size>
+    local name=$1 base=$2 repo=$3 oid=$4 size=$5
     base="${base%/}"
     local gitrepo="$repo.git"
     local bad=0
@@ -222,7 +229,7 @@ run_instance() {  # <name> <base> <repo>
     # ② batch（git-lfs UA）
     local batch_url="$base/$gitrepo/info/lfs/objects/batch"
     local payload
-    payload=$(printf '{"operation":"download","transfers":["basic"],"objects":[{"oid":"%s","size":%s}]}' "$OID" "$SIZE")
+    payload=$(printf '{"operation":"download","transfers":["basic"],"objects":[{"oid":"%s","size":%s}]}' "$oid" "$size")
     read -r code sec <<<"$(http "$results/$name-batch.json" "$results/$name-batch.hdr" POST "$batch_url" \
         -H "User-Agent: $UA" \
         -H 'Accept: application/vnd.git-lfs+json' \
@@ -246,7 +253,7 @@ run_instance() {  # <name> <base> <repo>
 
     # ③ 改写断言：href 必须指回本实例，且带 _lfs/exp
     case "$href" in
-        "$base/$gitrepo/info/lfs/objects/$OID"*"_lfs="*"exp="*)
+        "$base/$gitrepo/info/lfs/objects/$oid"*"_lfs="*"exp="*)
             step "$name-2-rewrite" PASS "$sec" "href→本实例（带 _lfs/exp）" ;;
         *)
             if [ "$STRICT" = "1" ]; then
@@ -269,8 +276,8 @@ run_instance() {  # <name> <base> <repo>
         [ "$code1" = "500" ] && hint="（500 常见于 /workdir 配额满，见文件头注记）"
         step "$name-3-object" FAIL "$sec2" "GET1=$code1 GET2=$code2$hint"
         bad=1
-    elif [ "$sha1" != "$OID" ] || [ "$sha2" != "$OID" ]; then
-        step "$name-3-object" FAIL "$sec2" "sha256 不符 GET1=${sha1:0:12} GET2=${sha2:0:12} expect=${OID:0:12}"
+    elif [ "$sha1" != "$oid" ] || [ "$sha2" != "$oid" ]; then
+        step "$name-3-object" FAIL "$sec2" "sha256 不符 GET1=${sha1:0:12} GET2=${sha2:0:12} expect=${oid:0:12}"
         bad=1
     else
         step "$name-3-object" PASS "$sec2" "两发均 200 且 sha256==oid；t1=${sec1}s t2=${sec2}s（预热竞态，时延仅留档）"
@@ -292,9 +299,9 @@ run_instance() {  # <name> <base> <repo>
                     continue
                 fi
                 if [ "$kind" = "expired" ]; then
-                    url2=$(expired_url "$href" "$gitrepo" "$OID")
+                    url2=$(expired_url "$href" "$gitrepo" "$oid")
                 else
-                    url2=$(repo_mismatch_url "$href" "$gitrepo" "$decoy" "$OID")
+                    url2=$(repo_mismatch_url "$href" "$gitrepo" "$decoy" "$oid")
                 fi ;;
         esac
         read -r got gsec <<<"$(http "$results/$name-neg-$kind.body" - GET "$url2" -H "User-Agent: $UA")"
@@ -345,9 +352,9 @@ run_instance() {  # <name> <base> <repo>
 }
 
 log "== G6 跨域 LFS：GitHub 实例（$GH_REPO @ $GH_BASE）=="
-run_instance github "$GH_BASE" "$GH_REPO"; rc_gh=$?
+run_instance github "$GH_BASE" "$GH_REPO" "$GH_OID" "$GH_SIZE"; rc_gh=$?
 log "== G6 跨域 LFS：GitCode 实例（$GC_REPO @ $GC_BASE）=="
-run_instance gitcode "$GC_BASE" "$GC_REPO"; rc_gc=$?
+run_instance gitcode "$GC_BASE" "$GC_REPO" "$GC_OID" "$GC_SIZE"; rc_gc=$?
 
 log "== 结果（$TSV）=="
 cat "$TSV"

@@ -49,6 +49,21 @@ on:
         required: false
         default: '1'
         type: string
+      lfs_gitcode_repo:
+        description: 'G6 GitCode 实例目标仓库（owner/repo；空 = gh_mirrors/bo/BoatAttack）'
+        required: false
+        default: ''
+        type: string
+      lfs_gitcode_oid:
+        description: 'G6 GitCode 实例目标对象 oid（空 = BoatAttack 默认对象；换仓库时必填）'
+        required: false
+        default: ''
+        type: string
+      lfs_gitcode_size:
+        description: 'G6 GitCode 实例目标对象字节数（与 oid 成对；空 = 默认 20249）'
+        required: false
+        default: ''
+        type: string
 
   pull_request:
     paths:
@@ -116,6 +131,9 @@ jobs:
       - name: 运行跨域 LFS 用例（G6）
         env:
           LFS_STRICT: ${{ inputs.lfs_strict || '1' }}
+          LFS_GITCODE_REPO: ${{ inputs.lfs_gitcode_repo }}
+          LFS_GITCODE_OID: ${{ inputs.lfs_gitcode_oid }}
+          LFS_GITCODE_SIZE: ${{ inputs.lfs_gitcode_size }}
           # 过期 token 子用例要按服务端同一密钥重算 HMAC；未配置时脚本记 SKIP
           LFS_URL_SECRET: ${{ secrets.LFS_URL_SECRET }}
         run: |
